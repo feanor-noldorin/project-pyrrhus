@@ -75,6 +75,19 @@ def main():
             d = root / "public" if layout == "public" else root
             d.mkdir(exist_ok=True)
             (d / "CHANGELOG.md").write_text(CL, encoding="utf-8")
+            # The first published release (only a tagged, never released version below it): no install-over line,
+            # and its fixes are part of what it does, not fixes of an unpublished version.
+            first = root / "first"
+            first.mkdir()
+            (first / "CHANGELOG.md").write_text("# Changelog\n\n## [0.1.1] - 2030-01-01 (pre-release)\n\n### Added\n"
+                                                "- A new thing.\n\n### Fixed\n- A fixed thing.\n\n"
+                                                "## [0.1.0] - 2029-12-31 (tagged, not released)\n\nThe tag marks a build.\n",
+                                                encoding="utf-8")
+            rc, out, err = run("--tag", "v0.1.1", "--root", str(first))
+            fp = out.strip().split("\n\n")
+            check(rc == 0 and len(fp) == 4 and "earlier version" not in out and "Fixed:" not in out
+                  and fp[1] == "New in 0.1.1: A new thing. A fixed thing.",
+                  f"{layout}: the first published release has no install-over line and no Fixed label", (rc, err, fp))
             rc, out, err = run("--tag", "v0.2.0", "--root", t)
             paras = out.strip().split("\n\n")
             check(rc == 0 and len(paras) == 5, f"{layout}: v0.2.0 gives five paragraphs", (rc, err, paras))

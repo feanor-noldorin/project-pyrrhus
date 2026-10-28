@@ -8,7 +8,7 @@ The shape follows Project Helghast's release notes (the Killzone 3 PC port, same
 wording:
   Project Pyrrhus X.Y.Z, a pre-release: partly playable, see docs/RELEASE-CRITERIA.md.
   New in X.Y.Z: <the CHANGELOG entry's items as prose; "Fixed:" before the fixes>
-  If you have an earlier version, install this one over it: ...
+  If you have an earlier version, install this one over it: ...   (only when an earlier version was published)
   See CHANGELOG.md for the full list.
   <the fixed paragraph: the Windows installer and portable zip, what you need, none of it included>
 Links point at the tag's own files. A tag with no CHANGELOG entry, an entry with no items, or an entry that is not a
@@ -68,7 +68,15 @@ def sentence(t, blob=""):
     return t if t.rstrip(")\"'").endswith((".", "!", "?")) else t + "."
 
 
-def notes(version, entry):
+def first_release(version, es):
+    """True when no earlier CHANGELOG entry was published (a dated "(pre-release)" or "(release)" below this version):
+    the first published release has no earlier version to install over or to fix."""
+    key = lambda v: tuple(int(x) for x in v.split("."))
+    return not any(release_version.valid(v) and key(v) < key(version) and e["date"] and e["note"] in ("pre-release", "release")
+                   for v, e in es.items())
+
+
+def notes(version, entry, first=False):
     blob = f"{REPO}/blob/v{version}"
     new = [sentence(t, blob) for s, t in entry["items"] if s in NEW_SECTIONS or not s]
     fixed = [sentence(t, blob) for s, t in entry["items"] if s == "Fixed"]
@@ -76,12 +84,15 @@ def notes(version, entry):
     kind = "a pre-release" if major == 0 else "a release"
     prose = " ".join(new)
     if fixed:
-        prose += (" " if prose else "") + "Fixed: " + " ".join(fixed)
+        # The first published release lists its fixes as part of what it does, not as fixes of an unpublished version.
+        prose += (" " if prose else "") + ("" if first else "Fixed: ") + " ".join(fixed)
+    over = [] if first else [
+        "If you have an earlier version, install this one over it: run the new setup and pick the same folder. The first "
+        "start then translates and builds the game again where this version changes how it is built."]
     return "\n\n".join([
         f"Project Pyrrhus {version}, {kind}: {STATUS}, see [docs/RELEASE-CRITERIA.md]({blob}/docs/RELEASE-CRITERIA.md).",
         f"New in {version}: {prose}",
-        "If you have an earlier version, install this one over it: run the new setup and pick the same folder. The first "
-        "start then translates and builds the game again where this version changes how it is built.",
+        *over,
         f"See [CHANGELOG.md]({blob}/CHANGELOG.md) for the full list.",
         "Windows installer (Project-Pyrrhus-setup.exe, recommended) and portable zip. You need your own Killzone 2 disc "
         "dump (US, BCUS98116), the 1.29 update and a decrypted EBOOT made from your own copy; none of them is included "
@@ -121,7 +132,7 @@ def main(argv=None):
     if not e["items"]:
         print(f"release_notes: the CHANGELOG entry for {version} lists nothing", file=sys.stderr)
         return 1
-    body = notes(version, e)
+    body = notes(version, e, first_release(version, es))
     if a.out:
         out = pathlib.Path(a.out)
         out.parent.mkdir(parents=True, exist_ok=True)
