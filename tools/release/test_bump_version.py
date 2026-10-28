@@ -69,6 +69,23 @@ def make_copies(base):
     return {"public/": priv, "root (export)": pubr}
 
 
+def seed_unreleased(root):
+    """Give the copy's CHANGELOG an [Unreleased] entry with one item: right after a release the real one is empty (or
+    gone), and the notes step then refuses a bump with nothing to list."""
+    cl = bump_version.at(root, "public/CHANGELOG.md")
+    t0 = cl.read_text(encoding="utf-8")
+    m = re.search(r"^## \[Unreleased\][ \t]*\n", t0, re.M)
+    if m:
+        nxt = re.search(r"^## \[", t0[m.end():], re.M)
+        body = t0[m.end():m.end() + nxt.start()] if nxt else t0[m.end():]
+        if not re.search(r"^- ", body, re.M):
+            t0 = t0[:m.end()] + "\n### Added\n\n- A test item.\n" + t0[m.end():]
+    else:
+        at_first = re.search(r"^## \[", t0, re.M).start()
+        t0 = t0[:at_first] + "## [Unreleased]\n\n### Added\n\n- A test item.\n\n" + t0[at_first:]
+    cl.write_text(t0, encoding="utf-8")
+
+
 def snapshot(root):
     return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*")
             if p.is_file() and "__pycache__" not in p.parts}
@@ -115,6 +132,8 @@ def layout_round(name, root):
     check(f"<!-- version -->{rel}<!-- /version -->" in readme and cur not in "".join(
         re.findall(r"<!-- version -->(.*?)<!-- /version -->", readme)), f"{name}: README marker span", readme[:0])
     check(f"<!-- version -->{rel}<!-- /version -->" in building, f"{name}: BUILDING marker span")
+    if at_exists := [p for p in ("public/docs/ROADMAP.md", "docs/ROADMAP.md") if (root / p).is_file()]:
+        check(f"<!-- version -->{rel}<!-- /version -->" in t(at_exists[0]), f"{name}: ROADMAP marker span")
     cl = t("public/CHANGELOG.md")
     if re.search(r"^## \[Unreleased\]", cl0, re.M):
         check(f"## [{new}] - 2030-01-02 (pre-release)\n\n### " in cl and "## [Unreleased]" not in cl
@@ -223,6 +242,7 @@ def main():
     units()
     with tempfile.TemporaryDirectory() as td:
         for name, root in make_copies(pathlib.Path(td)).items():
+            seed_unreleased(root)
             layout_round(name, root)
             chain_round(name, root)
     check(snapshot(REAL / "installer") == real_before, "the real tree was not touched")

@@ -505,6 +505,7 @@ def render(root, problems):
       f"<a href=\"{REPO}/issues\">Issues</a><a href=\"{REPO}/blob/main/CHANGELOG.md\">Changelog</a></div>\n"
       f"<div><h4>Docs</h4><a href=\"{REPO}/blob/main/docs/FEATURES.md\">Features</a>"
       f"<a href=\"{REPO}/blob/main/docs/KNOWN_ISSUES.md\">Known issues</a>"
+      f"<a href=\"{REPO}/blob/main/docs/ROADMAP.md\">Roadmap</a>"
       f"<a href=\"{REPO}/blob/main/docs/BUILDING.md\">Building</a></div>\n"
       f"<div><h4>Play</h4><a href=\"#install\">Install</a><a href=\"#requirements\">Requirements</a>"
       f"<a href=\"{REPO}/blob/main/docs/GETTING-FILES.md\">Getting your files ready</a>"

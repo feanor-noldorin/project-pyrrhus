@@ -730,6 +730,37 @@ begin
   Result := SfoField(DiscSfo(Dump), 'VERSION') = '02.00';
 end;
 
+{ The title ids a folder hint may offer as the disc dump: only the US disc's (the Trilogy's PS3_GAME carries the same
+  id, VERSION 02.00), as firstrun_check.py TITLE_IDS }
+function KnownDiscId(Id: String): Boolean;
+begin
+  Result := Id = 'BCUS98116';
+end;
+
+{ The first subfolder of Dir whose PS3_GAME\PARAM.SFO has one of our title ids (KnownDiscId), else '': other games'
+  dumps on a drive root are not offered (from Project Helghast PR #17; as firstrun_check.py looks_like_disc) }
+function SubDisc(Dir: String): String;
+var
+  FR: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not DirExists(Dir) then Exit;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      More := True;
+      while More and (Result = '') do begin
+        if (FR.Name <> '.') and (FR.Name <> '..') and ((FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           KnownDiscId(SfoField(DiscSfo(AddBackslash(Dir) + FR.Name), 'TITLE_ID')) then
+          Result := AddBackslash(Dir) + FR.Name;
+        More := FindNext(FR);
+      end;
+    finally
+      FindClose(FR);
+    end;
+  end;
+end;
+
 { '' when the folder holds the Killzone 2 US disc (BCUS98116) with its archive, else the message; Id = the title id
   found ('' when none) }
 function DumpProblem(Dir: String; var Id: String): String;
@@ -745,7 +776,7 @@ begin
     { Project Helghast PR #14: say what is there (a drive root given as the dump read as an EBOOT problem), where
       PS3_GAME is when it is one folder down, and an update folder given as the dump (as firstrun_check.py disc_found) }
     Result := Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir) + ')';
-    Sub := SubWith(Dir, 'PS3_GAME\PARAM.SFO');
+    Sub := SubDisc(Dir);
     if Sub <> '' then Result := Result + '; PS3_GAME is one folder down: pick ' + Sub;
     if (FileExists(AddBackslash(Dir) + 'PARAM.SFO') and FileExists(AddBackslash(Dir) + 'USRDIR\EBOOT.BIN')) or
        FileExists(AddBackslash(Dir) + 'USRDIR\added_data_ps3.psarc') then
@@ -933,13 +964,15 @@ begin
   V := EbootVersionOf(Path, How);
   if V <> '' then Log('EBOOT: ' + V + ' (by ' + How + ')') else Log('EBOOT: not a known size; the build checks it');
   if (V <> '') and (V <> '{#EbootTarget}') then begin
-    if UpdateDir <> '' then Usr := AddBackslash(UpdateDir) + 'USRDIR'
+    { the usual place only beside a given update folder: without one (a silent /EBOOT= alone) it was named twice
+      (VM kit pre-flight) }
+    if UpdateDir <> '' then Usr := AddBackslash(UpdateDir) + 'USRDIR' + #13#10 + '(usually dev_hdd0\game\BCUS98116\USRDIR)'
     else Usr := 'dev_hdd0\game\BCUS98116\USRDIR';
     if V = '{#DiscEboot}' then Result := 'This is the disc''s {#DiscEboot} EBOOT.'
     else Result := 'This is the ' + V + ' EBOOT.';
     Result := Result + ' This release needs the EBOOT of the {#EbootTarget} update: EBOOT.elf, the decrypted form ' +
-      'of EBOOT.BIN in the update''s USRDIR folder:' + #13#10 + Usr + #13#10 +
-      '(usually dev_hdd0\game\BCUS98116\USRDIR).' + #13#10 + #13#10 + 'Pick that file, then press Next.';
+      'of EBOOT.BIN in the update''s USRDIR folder:' + #13#10 + Usr + '.' + #13#10 + #13#10 +
+      'Pick that file, then press Next.';
   end;
   EbootTested := Path;
   EbootTestResult := Result;

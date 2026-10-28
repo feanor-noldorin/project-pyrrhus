@@ -4,7 +4,7 @@ All notable changes for players, newest first, in the style of [Keep a Changelog
 port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md). Versions follow
 `vMAJOR.MINOR.PATCH`; every release stays a pre-release until `v1.0.0`.
 
-## [Unreleased]
+## [0.1.2] - 2026-10-28 (pre-release)
 
 ### Added
 - A decrypted disc image (.iso) can be picked instead of a dump folder ("Browse for ISO file" in the setup, or the path in the console). The first run checks the disc inside it, then copies its game files (about 7 GB) into the install folder once; the ISO itself is only read. An encrypted ISO is refused with "this ISO is encrypted; use a decrypted dump".
@@ -17,6 +17,7 @@ port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-
 - The update must carry the same title id as the disc; the setup and the first-run check say so when it does not.
 
 ### Fixed
+- The folder hints of the setup and the first-run check offer only Killzone 2 dumps (other games' dumps on a drive are not named) and name up to three `.iso` files in the folder (or one level down on a drive) beside the folder hints. When no more input comes (a closed console), the first-run check stops with its FAIL lines instead of asking again. The same fixes as Project Helghast PR #17.
 - Installing into a OneDrive folder is refused, as a precaution taken from a problem reported on Project Helghast: OneDrive synced the build's thousands of files while they were written and locked them. The first-run check also stops when the install or build folder is inside OneDrive (O1), or when a game file is only online in OneDrive (O2, before anything is read, so nothing is downloaded); right-click the game folders and choose "Always keep on this device".
 - When the first-run console window is closed with its X, the launcher says so ("its window was closed before it finished; finished steps are kept") instead of showing an error code. It names the first-run log only when the log exists.
 - When the setup or the first run stops, the setup's message box, the launcher's dialog and the portable zip's console say why (the same reason the log has). The next start checks your files first and asks again only for the one that was wrong. The setup's EBOOT page refuses the disc's 1.01 EBOOT and names the update's USRDIR folder, where the 1.29 one is; a silent install with /EBOOT= stops with the same text. Adapted from Project Helghast's fix for the same mix-up (its PR #11).

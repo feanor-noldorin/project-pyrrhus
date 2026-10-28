@@ -12,6 +12,24 @@ Linux; the game renders at 1280x720.
 The game's imagery in these screenshots is © Sony Interactive Entertainment, shown only to document the port (see
 [NOTICE.md](../NOTICE.md)). They come from the developer's own copy of the game.
 
+## 2026-10-28 · The main menu, the display options and the first level (v0.1.2)
+
+![The main menu with the Campaign list open and the NAVIGATE, SELECT, BACK prompts at the bottom right](screenshots/20261028_kz2-main-menu.png)
+
+The main menu with the Campaign list open, with the current button prompts.
+
+![Options, Display: gamma correction, display crosshair, HUD, subtitles and hints, and set to default](screenshots/20261028_kz2-options-display.png)
+
+Options, Display: the display options page.
+
+![Corinth River: the landing, with the red-dot sight and a Press R1 to Fire prompt in front of a ruined pier](screenshots/20261028_kz2-corinth-river-landing.png)
+
+Corinth River just after the landing, weapon in hand, from a scripted pad run (a frame from a recording of the run).
+
+![The dropship in the first level's flight, caught in a flak burst with squad members in the air around it](screenshots/20261028_kz2-corinth-river-flak.png)
+
+The first level's dropship flight under flak, with the squad's dialogue as subtitles (a frame from the same recording).
+
 ## 2026-10-28 · The first level in play
 
 ![Corinth River in first person: the weapon with its red-dot sight, the crosshair and the ammo counter, a fallen squad mate in front of an arched bridge](screenshots/20261028_kz2-corinth-river-in-play.png)

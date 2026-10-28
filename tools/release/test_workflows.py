@@ -14,6 +14,8 @@ tree). Text checks only (standard library, no YAML parser, no network):
     the build and passed to publish;
   - issue-labels.yml: every rule's heading is the first field label of one issue form and every label it may add is
     one the forms use; with node on PATH the rules block itself is run on sample issues;
+  - release-check.yml: a published release or a dispatch only, every permission read-only (its logic is tested by
+    test_release_check.py);
   - dependabot.yml covers github-actions.
 Adapted from Project Helghast's workflow checks (the Killzone 3 PC port, same author, MIT).
 
@@ -137,6 +139,15 @@ def test_release():
           "release.yml: pinned manifest and the ISPP line check before the build")
 
 
+def test_release_check():
+    t = read(os.path.join(WF, "release-check.yml"))
+    on = t[t.index("\non:"):t.index("\npermissions:")]
+    check("release:\n    types: [published]" in on and "workflow_dispatch:" in on and "push:" not in on and
+          "pull_request" not in on, "release-check.yml: runs on a published release or a dispatch only", on)
+    perms = re.findall(r"^\s*(contents|actions|packages|pages|id-token|issues|pull-requests):\s*(\w+)", t, re.M)
+    check(perms and all(v == "read" for _, v in perms), "release-check.yml: every permission is read", perms)
+
+
 def form_fields():
     """-> {form file: (first field label, labels)} for the issue forms."""
     out = {}
@@ -199,12 +210,13 @@ def test_dependabot():
 
 def main():
     files = sorted(glob.glob(os.path.join(WF, "*.yml"))) + [os.path.join(GH, "dependabot.yml")]
-    want = {"ci.yml", "codeql.yml", "pages.yml", "release.yml", "issue-labels.yml"}
+    want = {"ci.yml", "codeql.yml", "pages.yml", "release.yml", "issue-labels.yml", "release-check.yml"}
     have = {os.path.basename(p) for p in files}
     check(want <= have, "workflows present: " + ", ".join(sorted(want)), sorted(have))
     test_common([p for p in files if os.path.isfile(p)])
     test_pages()
     test_release()
+    test_release_check()
     test_issue_labels()
     test_dependabot()
     print(f"\n{'PASS' if not FAILS else 'FAIL'}: {len(FAILS)} failure(s)")

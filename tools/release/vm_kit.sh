@@ -6,7 +6,8 @@
 #                                           installer (ISCC 6.7.3 under Proton, no GPU), portable zip (pack_zip.py)
 #   tools/release/vm_kit.sh stage             work/release/vm-kit/shared/kz2/kit/ + SHA256SUMS.txt, ARTIFACTS.txt;
 #                                           game/ as links to this machine's files (the pre-flight reads them)
-#   tools/release/vm_kit.sh preflight [STEP...]  vm_test.py's steps under Proton in a fresh prefix
+#   tools/release/vm_kit.sh preflight [STEP...]  vm_test.py's steps (default: all, in vm_test.ORDER) under Proton in a
+#                                           fresh prefix
 #                                           (work/release/vm-kit/pre), the embeddable Python as the guest's Python
 #
 # Toolchain: work/release/toolchain-cache filled by tools/release/fetch_toolchain.py (needs the network once; with
@@ -64,7 +65,8 @@ build)
 stage)
   S="$K/shared/kz2"; VER="$(cat "$B/VERSION")"
   rm -rf "$S/kit"; mkdir -p "$S/kit" "$S/game/dump" "$S/game/update" "$S/game/eboot"
-  cp "$B/iscc/Project-Pyrrhus-setup.exe" tools/release/vm_test.py "$S/kit/"
+  # iso_fixture.py: 19-iso builds its synthetic ISO with it (a test helper, never in the payload)
+  cp "$B/iscc/Project-Pyrrhus-setup.exe" tools/release/vm_test.py tools/release/iso_fixture.py "$S/kit/"
   # COMMANDS.md with the guest's path of the shared folder (KZ2_VMKIT_SHARE, e.g. a UNC path; else left as <SHARE>)
   python3 -c 'import sys; t=open(sys.argv[1]).read(); open(sys.argv[2],"w").write(t.replace("<SHARE>", sys.argv[3]))' \
     tools/release/vm_kit/COMMANDS.md "$S/kit/COMMANDS.md" "${KZ2_VMKIT_SHARE:-<SHARE>}"
@@ -91,7 +93,8 @@ preflight)
   if [[ ! -f "$PY/python.exe" ]]; then
     mkdir -p "$PY"; python3 -m zipfile -e "$(ls "$CACHE"/downloads/python/python-*-embed-amd64.zip | head -1)" "$PY"
   fi
-  STEPS=("$@"); (( ${#STEPS[@]} )) || STEPS=(02-verify 03-install 04-layout 05-checks 06-build 07-launch 08-readonly 09-uninstall 10-leftovers)
+  # default: every step in vm_test.ORDER, the order COMMANDS.md gives the tester
+  STEPS=("$@"); (( ${#STEPS[@]} )) || read -r -a STEPS <<< "$(python3 -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import vm_test; print(" ".join(vm_test.ORDER))' "$ROOT/tools/release")"
   # KZ2_VMKIT_FAKEBUILD=DIR (kz2.exe + at3_standalone.dll of a developer build): the step name fake-build before
   # 07-launch links them into the partial build and stamps it (test only), so the launcher's run path is walked
   KZ2_WT_FAKEBUILD="${KZ2_VMKIT_FAKEBUILD:-}" KZ2_WT_NOGPU=1 KZ2_WT_STATE="$K/pre" nix develop --command tools/release/wizard_test.sh vmtest "$K/shared/kz2" "$PY" "${STEPS[@]}"

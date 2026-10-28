@@ -1603,7 +1603,16 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             if "U0" in text or "U1" in text or "U2" in text or "E1" in text:
                 say("")
                 say(UPDATE_HELP)
-            r = ask("Fix the FAIL lines, then Enter = check again, c = change the folders, q = quit: ").strip().lower()
+            try:
+                r = ask("Fix the FAIL lines, then Enter = check again, c = change the folders, q = quit: ").strip().lower()
+            except (EOFError, StopIteration):
+                # input has ended (a closed console, a script out of answers): stop with the FAIL lines above instead of
+                # asking again for ever (from Project Helghast PR #17)
+                say("")
+                say("No more input: stopping with the FAIL lines above.")
+                notes.append("# interactive check stopped: input ended")
+                record_paths(root, dump, upd, elf, {i for i in inputs if i} or {"dump", "update", "eboot"})
+                return False
             if r.startswith("q"):
                 record_paths(root, dump, upd, elf, {i for i in inputs if i} or {"dump", "update", "eboot"})
                 return False

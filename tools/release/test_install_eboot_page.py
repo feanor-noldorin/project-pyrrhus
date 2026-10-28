@@ -66,6 +66,11 @@ check("V <> '{#EbootTarget}'" in ep and "This is the disc''s {#DiscEboot} EBOOT.
       "dev_hdd0\\game\\BCUS98116\\USRDIR" in ep,
       "EbootProblem: another known version refused, names the update's USRDIR and the usual folder")
 check("Result := '';" in ep and "if (V <> '') and" in ep, "EbootProblem: an unknown EBOOT passes")
+# without an update folder (a silent /EBOOT= alone) the usual folder was named twice (VM kit pre-flight, an earlier change):
+# "(usually ...)" only on the branch with an update folder
+usual = [ln for ln in ep.splitlines() if "(usually" in ln]
+check(len(usual) == 1 and usual[0].strip().startswith("if UpdateDir <> '' then"),
+      "EbootProblem: '(usually ...)' only beside a given update folder")
 nb = func("NextButtonClick")
 check("Problem := EbootProblem(EbootPage.Values[0], UpdatePage.Values[0]);" in nb and "MsgBox(Problem, mbError, MB_OK);" in nb,
       "Next on the EBOOT page refuses with the reason")

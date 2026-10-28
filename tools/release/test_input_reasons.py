@@ -154,6 +154,66 @@ def main():
         rc, rs, _ = run(["--dump", e, "--update", f2, "--eboot", elf])
         check("control: the same folders, not drive roots, are searched one level only", rc == 1 and
               "looks like" not in " ".join(rs) and "(2 folders, 0 files)" in rs[0], rs)
+        # Project Helghast PR #17: other games' dumps on a drive root are not candidates; ISOs are named beside
+        # folder hints; a PARAM.SFO inside the update's USRDIR does not block the step up to the update folder
+        g = os.path.join(tmp, "g")
+        for n, tid in (("Katamari", "BCUS98001"), ("GT5", "BCES00569"), ("KZ2EU", "BCES00081")):
+            shutil.copytree(make_dump(os.path.join(tmp, "o" + n), title_id=tid), os.path.join(g, n + "_dump"))
+        shutil.copytree(os.path.join(tmp, "oKatamari", "dump"), os.path.join(g, "KatamariFlat"))
+        kf = os.path.join(g, "KatamariFlat")
+        check("looks_like_disc: another title id is no disc", not fc.looks_like_disc(kf) and fc.has_ps3_game(kf) and
+              fc.disc_title_id(kf) == "BCUS98001", fc.disc_title_id(kf))
+        check("looks_like_disc: every accepted id is a disc, the Trilogy's 02.00 too", all(
+            fc.looks_like_disc(make_dump(os.path.join(tmp, "id" + i), title_id=i)) for i in fc.TITLE_IDS) and
+            fc.looks_like_disc(make_dump(os.path.join(tmp, "tri67"), version=fc.TRILOGY_DISC_VERSION)))
+        check("looks_like_disc: no PARAM.SFO is no disc", not fc.looks_like_disc(e) and fc.disc_title_id(e) == "")
+        fc.is_drive_root = lambda p: os.path.abspath(p) == g
+        try:
+            check("candidates: only other games' dumps give none", fc.candidates(g, 2) == ([], []), fc.candidates(g, 2))
+            shutil.copytree(d, os.path.join(g, "Games", "KZ2"))
+            check("candidates: the Killzone 2 dump among them is the only one",
+                  fc.candidates(g, 2)[0] == [os.path.join(g, "Games", "KZ2")], fc.candidates(g, 2))
+            open(os.path.join(g, "game.iso"), "wb").write(b"x")
+            os.makedirs(os.path.join(g, "Isos"))
+            open(os.path.join(g, "Isos", "kz2.iso"), "wb").write(b"x")
+            rc, rs, _ = run(["--dump", g, "--update", u, "--eboot", elf])
+            isos_root = fc._isos(g)
+        finally:
+            fc.is_drive_root = real_root
+        check("hint: the folder hint and both ISO files named together, no other game", rc == 1 and
+              f"looks like {os.path.join(g, 'Games', 'KZ2')}: pick that folder" in rs[0] and "Katamari" not in rs[0]
+              and "GT5" not in rs[0] and "KZ2EU" not in rs[0] and "game.iso" in rs[0] and
+              os.path.join(g, "Isos", "kz2.iso") in rs[0] and "pick that file" in rs[0], rs)
+        check("_isos: names in the root, full paths one level down", isos_root == ["game.iso",
+              os.path.join(g, "Isos", "kz2.iso")], isos_root)
+        check("control: not a drive root, _isos looks in the folder only", fc._isos(g) == ["game.iso"], fc._isos(g))
+        many = os.path.join(tmp, "many")
+        os.makedirs(many)
+        for i in range(5):
+            open(os.path.join(many, f"d{i}.iso"), "wb").write(b"x")
+        check("_isos: at most 3", len(fc._isos(many)) == 3, fc._isos(many))
+        p2 = os.path.join(tmp, "p2")
+        os.makedirs(os.path.join(p2, "dump"))
+        shutil.copytree(d, os.path.join(p2, "KZ2"))
+        open(os.path.join(p2, "a.iso"), "wb").write(b"x")
+        txt, _ = fc.disc_found(p2)
+        check("hint: an ISO is named beside the folder hint (not a drive root)", "pick that folder" in txt and
+              "the ISO file a.iso: pick that file" in txt, txt)
+        u2 = os.path.join(tmp, "u2")
+        shutil.copytree(u, u2)
+        shutil.copy(os.path.join(u2, "PARAM.SFO"), os.path.join(u2, "USRDIR", "PARAM.SFO"))
+        check("resolve_update: a USRDIR holding a PARAM.SFO still resolves to its parent",
+              fc.resolve_update(os.path.join(u2, "USRDIR")) == u2 and
+              fc.resolve_update(os.path.join(u2, "USRDIR") + os.sep) == u2, fc.resolve_update(os.path.join(u2, "USRDIR")))
+        check("resolve_update: the update folder and other folders are unchanged",
+              fc.resolve_update(u2) == u2 and fc.resolve_update(tmp) == tmp)
+        check("resolve_update: a USRDIR whose parent has no PARAM.SFO is unchanged",
+              fc.resolve_update(os.path.join(tmp, "only_x", "USRDIR")) == os.path.join(tmp, "only_x", "USRDIR"))
+        rc, rs, _ = run(["--dump", d, "--update", os.path.join(u2, "USRDIR"), "--eboot", elf])
+        check("a USRDIR with a PARAM.SFO given as the update passes", rc == 0 and rs == [], rs)
+        rc, rs, _ = run(["--dump", d, "--update", kf, "--eboot", elf])
+        check("another game's dump given as the update: named as a disc dump", rc == 1 and
+              "so it looks like the disc dump, not the update" in rs[1 if rs[0].startswith("Disc") else 0], rs)
 
         # roles swapped or mixed up
         rc, rs, _ = run(["--dump", u, "--update", d, "--eboot", elf])

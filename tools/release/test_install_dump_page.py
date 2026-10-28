@@ -2,7 +2,7 @@
 """Host test (adapted from Project Helghast PR #14, its test_install_dump_page.py, same author,
 MIT): installer/kz2.iss' disc and update pages say what a wrong folder holds. Static checks (no ISCC, no game data):
 - DumpProblem: a folder without PS3_GAME names the path and what it holds (FolderSummary), "PS3_GAME is one folder
-  down: pick X" (SubWith), "It looks like the 1.29 update folder: give it as the update, and the disc dump here" for
+  down: pick X" (SubDisc: our title ids only), "It looks like the 1.29 update folder: give it as the update, and the disc dump here" for
   an update folder (PARAM.SFO + USRDIR\\EBOOT.BIN, or USRDIR\\added_data_ps3.psarc), in that order, before the
   accepted forms; the TITLE_ID, Trilogy and ISO branches are kept;
 - UpdateOK holds the three files of the page's quick check; UpdateProblem names the path, "that is a disc dump" for
@@ -50,8 +50,18 @@ check("'it is empty'" in fs and "' folders and '" in fs and "'there is no such f
 check("FindFirst" in sw and "FileExists(AddBackslash(Dir) + FR.Name + '\\' + Rel)" in sw,
       "SubWith finds the first subfolder holding Rel")
 g = func("DumpProblem")
-check("' holds no PS3_GAME folder (' + FolderSummary(Dir)" in g and "SubWith(Dir, 'PS3_GAME\\PARAM.SFO')" in g and
+check("' holds no PS3_GAME folder (' + FolderSummary(Dir)" in g and "Sub := SubDisc(Dir)" in g and
       "PS3_GAME is one folder down: pick " in g, "DumpProblem names what is there and PS3_GAME one folder down")
+# Project Helghast PR #17: the one-folder-down hint offers only our title ids, never another game's dump
+sd, kd = func("SubDisc"), func("KnownDiscId")
+check("SubWith(Dir, 'PS3_GAME" not in g, "DumpProblem's one-folder-down hint comes from SubDisc, not any PS3_GAME")
+check("FindFirst" in sd and "KnownDiscId(SfoField(DiscSfo(AddBackslash(Dir) + FR.Name), 'TITLE_ID'))" in sd and
+      "FILE_ATTRIBUTE_DIRECTORY" in sd, "SubDisc offers only subfolders whose PS3_GAME has one of our title ids")
+ids = re.findall(r"'([A-Z]{4}\d{5})'", kd)
+check(ids == ["BCUS98116"] and set(ids) == set(fc.TITLE_IDS), f"KnownDiscId accepts only firstrun_check.TITLE_IDS: {ids}")
+check(code.index("function SfoField") < code.index("function DiscSfo") < code.index("function KnownDiscId") <
+      code.index("function SubDisc") < code.index("function DumpProblem"),
+      "SubDisc sits after SfoField, DiscSfo and KnownDiscId, before DumpProblem (Pascal Script order)")
 check("It looks like the 1.29 update folder: give it as the update, and the disc dump here" in g and
       "FileExists(AddBackslash(Dir) + 'USRDIR\\EBOOT.BIN')" in g and
       "FileExists(AddBackslash(Dir) + 'USRDIR\\added_data_ps3.psarc')" in g,

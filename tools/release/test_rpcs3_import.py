@@ -335,6 +335,53 @@ def main():
         check("Disc dump folder" not in out.getvalue(), "interactive: no folder prompts when RPCS3 filled them")
         check(not hasattr(fr, "RPCS3_UPDATE_GUESSES"), "the old guess of RPCS3's folders is gone")
 
+        # input that ends while a FAIL is left (a closed console, a script out of answers): interactive() returns
+        # False with the FAIL lines, never asks again for ever (from Project Helghast PR #17; an alarm guards the
+        # old behaviour)
+        import signal
+        import time
+
+        def fail_check(d, u, e, *target):
+            return 1, "FAIL U3 synthetic: the update's data archive is missing\n"
+        for ending in (EOFError, StopIteration):
+            a = A()
+            a.rpcs3 = str(root2)
+            a.build = os.path.join(tmp, "bld5b")
+            first = iter(["", "n", "n", ""])
+            left = {"n": 0, "fix": 0}
+
+            def ask5b(q, ending=ending, first=first, left=left):
+                left["n"] += 1
+                if q.startswith("Fix the FAIL lines"):
+                    left["fix"] += 1
+                    raise ending
+                if left["n"] > 40:
+                    raise RuntimeError("asked more than 40 questions")
+                return next(first, "")
+            out = io.StringIO()
+            notes5b = []
+            r5b = os.path.join(tmp, "r5b" + ending.__name__)
+            os.makedirs(r5b)
+            if hasattr(signal, "SIGALRM"):
+                signal.signal(signal.SIGALRM, lambda *x: (_ for _ in ()).throw(TimeoutError("interactive() spun")))
+                signal.alarm(10)
+            t0 = time.time()
+            try:
+                go5b = fr.interactive(a, r5b, os.path.join(tmp, "l5b.log"), notes5b, ask=ask5b, out=out,
+                                      check=fail_check, vcheck=lambda c: {})
+            except BaseException as ex:      # noqa: BLE001 (the old code let the ending escape)
+                go5b = ex
+            finally:
+                if hasattr(signal, "SIGALRM"):
+                    signal.alarm(0)
+            check(go5b is False and "FAIL U3" in out.getvalue() and "No more input: stopping with the FAIL lines above."
+                  in out.getvalue() and left["fix"] == 1 and time.time() - t0 < 5 and
+                  "# interactive check stopped: input ended" in notes5b,
+                  f"input ends ({ending.__name__}) while a FAIL is left: returns False with the FAIL lines "
+                  f"({go5b!r}, {left})")
+            check("wrong" in fr.ini_paths(r5b), f"{ending.__name__}: the failed input is asked again next start "
+                  f"({fr.ini_paths(r5b)})")
+
         # save offer after the setup
         a.rpcs3_saves = ri.resolve(str(root2))
         d3 = Path(tmp) / "inst3"

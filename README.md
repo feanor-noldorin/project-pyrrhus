@@ -92,7 +92,7 @@ Online multiplayer, if it comes, will only use a self-hosted server you choose.
 
 ## Getting it
 
-**Pre-release <!-- version -->[v0.1.1](https://github.com/undecuple/project-pyrrhus/releases/tag/v0.1.1)<!-- /version -->:** a Windows installer (recommended) and
+**Pre-release <!-- version -->[v0.1.2](https://github.com/undecuple/project-pyrrhus/releases/tag/v0.1.2)<!-- /version -->:** a Windows installer (recommended) and
 a portable zip, on the [releases page](https://github.com/undecuple/project-pyrrhus/releases) with a `.sha256` file for each and `SHA256SUMS`. They check your
 own disc dump (a folder or a decrypted ISO file), the 1.29 update and the decrypted EBOOT ([what each must
 contain](docs/GETTING-FILES.md)), then
@@ -146,7 +146,8 @@ fact. If you find a statement here that was not verified, please open an issue.
 A playable first level first (frame rate, shader pauses on a first play, hand play), then the rest of the campaign, sound and the
 local-build installer; later PC display
 options, keyboard and mouse, and a stand-in for the campaign's motion-control sections. Gameplay changes stay optional.
-No dates are given: see the [release criteria](docs/RELEASE-CRITERIA.md).
+No dates are given: see the [release criteria](docs/RELEASE-CRITERIA.md). Item by item, with what is done and
+what is planned: [ROADMAP.md](docs/ROADMAP.md).
 
 ## Related project
 

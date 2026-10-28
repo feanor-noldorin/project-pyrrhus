@@ -14,11 +14,13 @@ and the newest log file).
   has not been played from start to finish, and the other missions have not been tried. Checkpoint saves are written
   in the first level; loading a checkpoint back is not checked yet, nor is loading a save copied over from RPCS3 (those
   are copied unchanged, with no promise that they load).
-- **Not released.** There is no installer or portable zip for download yet, so the only way to try the port is to
-  build it yourself ([BUILDING.md](BUILDING.md)). On 2026-10-27 the installer ran in a Windows 10 virtual machine with no GPU (6 cores, 8 GB of memory): the silent install, the
-  check of every installed file, the game-file checks, the first-run build (18.6 minutes with 2 jobs), start-up and
-  uninstall all worked. The game started there but could not open its window, probably because the test ran
-  without a desktop session (not verified), and exited with a message; playing on Windows is still untested. See [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md).
+- **Pre-release, playing on Windows untested.** The installer and portable zip are published as pre-releases on the
+  [releases page](https://github.com/undecuple/project-pyrrhus/releases). On 2026-10-28 the installer ran in a Windows
+  virtual machine with no GPU: the silent install, the check of every installed file, the game-file checks (including
+  a OneDrive folder, wrong and swapped inputs, a drive root, a disc ISO and the disc's own EBOOT), the first-run build
+  (18.6 minutes with 2 jobs), start-up and uninstall all worked. The game started there and stopped when it tried to
+  open its graphics device, because that machine has no GPU. Playing on Windows is still untested. See
+  [RELEASE-CRITERIA.md](RELEASE-CRITERIA.md).
 - **Not yet in the port:** the settings and controls menus, a keyboard-and-mouse scheme, skirmish with bots, online play,
   trophies, a 60 frames-per-second option, and the 5.1/7.1 output below. The main menu now has an "Exit to desktop"
   entry and a Keyboard page that saves key choices to `keybinds.ini`; both were checked in scripted runs only.

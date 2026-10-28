@@ -74,6 +74,9 @@ DISC_VERSION = "01.01"                 # PARAM.SFO VERSION of the US disc we che
 # ASSUMPTION (KZ3's read-only survey of the Trilogy disc, BCUS99075, 2026-10-26; not checked on our own copy): its
 # PS3_GAME is Killzone 2 itself, TITLE_ID BCUS98116 with disc VERSION 02.00. Untested here (re-data 23 compares it).
 TRILOGY_DISC_VERSION = "02.00"
+# The title ids a folder hint may offer as the disc dump (looks_like_disc): only the US disc's. The Trilogy's
+# PS3_GAME carries the same id (VERSION 02.00 above), so it is offered too; other games' dumps never are.
+TITLE_IDS = (TITLE_ID,)
 ONEDRIVE_VARS = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
 # st_file_attributes bits of a OneDrive "files on demand" placeholder (an online-only file)
 ATTR_OFFLINE = 0x1000
@@ -145,7 +148,9 @@ def resolve_dump(path):
 
 
 def resolve_update(path):
-    """A pick of the update's USRDIR -> the update folder (the one with PARAM.SFO); else the path as given."""
+    """A pick of the update's USRDIR -> the update folder (the one with PARAM.SFO); else the path as given. A PARAM.SFO
+    inside USRDIR itself (put there by hand or a tool) does not stop the step up (Project Helghast PR #17 found
+    that bug in its copy; this one never returned early on it, test_input_reasons.py checks both)."""
     if path and _is_name(path, "USRDIR"):
         up = os.path.dirname(os.path.normpath(path))
         if os.path.isfile(os.path.join(up, "PARAM.SFO")):
@@ -669,9 +674,22 @@ def update_marks(d):
     return out
 
 
-def looks_like_disc(d):
-    """A folder holding PS3_GAME/PARAM.SFO (a disc dump)."""
+def disc_title_id(d):
+    """The TITLE_ID of d/PS3_GAME/PARAM.SFO, or "" when there is none or it is unreadable (from Project Helghast
+    PR #17)."""
+    kind = _sfo_kind(os.path.join(d, "PS3_GAME", "PARAM.SFO")) if _is(d, "PS3_GAME", "PARAM.SFO") else None
+    return (kind[0] or "") if kind else ""
+
+
+def has_ps3_game(d):
+    """A folder holding PS3_GAME/PARAM.SFO, of any game."""
     return _is(d, "PS3_GAME", "PARAM.SFO")
+
+
+def looks_like_disc(d):
+    """A folder holding PS3_GAME/PARAM.SFO whose TITLE_ID is an accepted Killzone 2 id (TITLE_IDS): other games'
+    dumps on a drive root are not offered as the disc dump (from Project Helghast PR #17)."""
+    return disc_title_id(d) in TITLE_IDS
 
 
 def looks_like_update(d):
@@ -700,6 +718,8 @@ def candidates(top, depth):
                 sub = os.path.join(d, n)
                 if looks_like_disc(sub):
                     discs.append(sub)
+                elif has_ps3_game(sub):
+                    pass          # another game's dump: never a candidate, and not descended into either
                 elif looks_like_update(sub):
                     updates.append(sub)
                 else:
@@ -725,6 +745,17 @@ def _hint(path, want):
     if second:
         parts.append(f"{INPUT_NAMES[other]} looks like {' or '.join(second)} (give it as the {other})")
     return f"; {path} is a drive root" * root + f"; {where}, " + "; ".join(parts)
+
+
+def _isos(path):
+    """.iso files in path, and one level down when path is a drive root: names for the ones in path, full paths for
+    the ones in a subfolder (at most 3; from Project Helghast PR #17)."""
+    dirs, files = _entries(path)
+    out = [n for n in files if n.lower().endswith(".iso")]
+    if is_drive_root(path):
+        for d in dirs:
+            out += [os.path.join(path, d, n) for n in _entries(os.path.join(path, d))[1] if n.lower().endswith(".iso")]
+    return out[:3]
 
 
 def disc_found(path):
@@ -753,11 +784,14 @@ def disc_found(path):
     if looks_like_ps3_game(path):
         return what + "; it holds a disc PARAM.SFO directly, so it looks like the PS3_GAME folder under another name", True
     hint = _hint(path, "disc")
-    isos = [n for n in files if n.lower().endswith(".iso")]
+    isos = _isos(path)       # named beside the folder hints, not only without them (Project Helghast PR #17)
     if hint:
         what += hint
-    elif isos:
-        what += f"; it holds the ISO file {isos[0]}: pick that file"
+    if isos:
+        what += "; " + ("it holds the ISO file " if len(isos) == 1 else "it holds the ISO files ") + \
+            ", ".join(isos) + ": pick that file"
+    if hint or isos:
+        pass
     elif not dirs and not files:
         what += " (the folder is empty)"
     else:
@@ -773,7 +807,7 @@ def update_found(path):
         return f"{path} is a file, not a folder" + (
             " (an update package, not an installed update)" if path.lower().endswith(".pkg") else ""), True
     dirs, files = _entries(path)
-    if looks_like_disc(path) or _find(dirs, "PS3_GAME"):     # the disc given as the update
+    if has_ps3_game(path) or _find(dirs, "PS3_GAME"):     # the disc (any game's) given as the update
         return (f"{path} holds PS3_GAME, so it looks like the disc dump, not the update: give it as the disc dump, "
                 "and the installed update folder as the 1.29 update"), True
     if looks_like_ps3_game(path):
