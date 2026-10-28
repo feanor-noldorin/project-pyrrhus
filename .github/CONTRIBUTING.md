@@ -3,7 +3,7 @@
 Contributions are welcome: bug reports, fixes, feedback and questions, and ideas for features. Use the issue templates
 (bug report, performance report, feature request, feedback or question) or open a pull request. Pull requests and
 feature requests are welcome. A fix pull request is read by the maintainer; run the host tests and
-`tools/ps3recomp-patched.sh` yourself first (the repository has no automated checks yet). General recompiler fixes go
+`tools/ps3recomp-patched.sh` yourself first (CI runs the same host tests, the patch series and a secret scan on every pull request). General recompiler fixes go
 upstream to ps3recomp (see below). Known problems are listed in [docs/KNOWN_ISSUES.md](../docs/KNOWN_ISSUES.md).
 
 ## Before you start
@@ -39,7 +39,7 @@ Remove your user name and folder paths from logs before attaching them. Security
 ## Making a change
 
 - Build instructions: [docs/BUILDING.md](../docs/BUILDING.md). Port code lives in `port/kz2/`.
-- AI coding tools are fine if you disclose them (see "Before you start") and remain responsible for what you submit.
+- AI coding tools are fine if you disclose them (see "Before you start") and remain responsible for what you submit. Point an AI coding agent at [AGENTS.md](../AGENTS.md) (the same rules, written for agents).
 - Changes to ps3recomp: a new numbered patch in `port/patches/` (`git diff` style against the pinned submodule, in the
   number block of its area); `tools/ps3recomp-patched.sh` applies them all and fails on one that does not apply.
 - Keep the original function addresses in comments (`// @0x00123abc`) and mark guesses `ASSUMPTION:`. New

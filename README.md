@@ -83,6 +83,8 @@ Nothing unless you ask. The port does not start any connection of its own.
   does it download that release's setup and its published checksum from this project's GitHub releases, check the
   file against the checksum, and start it for your install folder.
 
+- **Project website** (`site/`): viewing it loads the Rajdhani font from Google Fonts, which sees your visit. The repository, installer and game do not.
+
 Online multiplayer, if it comes, will only use a self-hosted server you choose.
 
 ## Getting it
@@ -154,7 +156,7 @@ Pull requests and feature requests are welcome. Details: [CONTRIBUTING.md](.gith
 - There is no promise of review time, or that a change will be merged.
 - Never post game files, keys or decrypted binaries, in issues, pull requests or logs.
 - Contributions must be MIT-compatible; no code from GPL projects such as RPCS3.
-- If an AI tool helped write a pull request, say so in it.
+- If an AI tool helped write a pull request, say so in it. AI coding agents: read [AGENTS.md](AGENTS.md) first (the same rules, written for agents).
 
 Security problems: [SECURITY.md](.github/SECURITY.md).
 
