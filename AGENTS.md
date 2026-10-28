@@ -22,7 +22,7 @@ Status: [docs/FEATURES.md](docs/FEATURES.md), [docs/KNOWN_ISSUES.md](docs/KNOWN_
 | Path | What it holds |
 |---|---|
 | `port/kz2/` | the program: `main.cpp`, HLE overrides (`hle_kz2.cpp`, `stubs.cpp`), PPU function overrides (`kz2_ppu_overrides.cpp`, `ppu_overrides.txt`, `ppu_overrides-101.txt`), menu pages and prompts, pad layout, session log, CPU check |
-| `port/patches/` | numbered patches to ps3recomp (see "Hard rules" for the number blocks) |
+| `port/patches/` | numbered patches to ps3recomp (see "Rules for everyone" for the number blocks) |
 | `port/cmake/` | the MinGW-w64 and llvm-mingw toolchain files |
 | `third_party/ps3recomp/` | the recompiler, a pinned submodule (never edited in place) |
 | `tools/` | lift, build and run scripts (`lift.sh`, `build-kz2.sh`, `ps3recomp-patched.sh`, `sandbox.sh`, `proton-test.sh`, `safe_rm.sh`), data tools (`psarc.py`, `elf_info.py`, `disc_info.py`, `core.py`, `rtti_dump.py`) |
@@ -36,7 +36,7 @@ Status: [docs/FEATURES.md](docs/FEATURES.md), [docs/KNOWN_ISSUES.md](docs/KNOWN_
 | `CHANGELOG.md` | what each release contains, newest first |
 | `flake.nix` | the Nix shells (`default`, `re`, `win`) and their pinned inputs |
 
-## Hard rules
+## Rules for everyone
 
 - **No game material, ever.** Never commit, attach, paste, request or link to: files from the disc or the update,
   decrypted binaries (`EBOOT.elf`, SPU images), lifted or decompiled game code (`work/recomp/`, `work/spu/`),
@@ -74,16 +74,11 @@ Status: [docs/FEATURES.md](docs/FEATURES.md), [docs/KNOWN_ISSUES.md](docs/KNOWN_
 
 ## Build and test
 
-Everything comes from the Nix flake; nothing is installed system-wide. Full steps: [docs/BUILDING.md](docs/BUILDING.md).
+Wherever you work: **never write into the game dump**, and **keep the game's files out of the repository**. CI is the
+gate for everyone: `.github/workflows/ci.yml` runs the full list. Build steps: [docs/BUILDING.md](docs/BUILDING.md).
 
-```sh
-nix develop .#re     # analysis and lifting
-nix develop .#win    # Windows x64 cross build (MinGW-w64, CMake, Ninja)
-nix develop          # everything, plus Xvfb and steam-run for Proton runs
-```
-
-- **Before every pull request** run what CI runs (needs no game data, no GPU; see `.github/workflows/ci.yml`):
-  `nix flake check --no-build`, `nix develop .#re --command bash tools/ps3recomp-patched.sh`,
+- **Before every pull request** run what CI runs (needs no game data, no GPU): `nix flake check --no-build`,
+  `nix develop .#re --command bash tools/ps3recomp-patched.sh`,
   `nix develop .#re --command python3 tools/release/fetch_toolchain.py --check --strict`,
   `nix develop .#re --command python3 tools/release/release_version.py --check`, and
   `bash tools/release/ci_host_tests.sh --gh --no-sandbox` (drop `--gh` outside Actions; it runs every line of
@@ -93,16 +88,43 @@ nix develop          # everything, plus Xvfb and steam-run for Proton runs
   passes with the patch; list it in `tools/host-tests.txt`. A test builds from the patched ps3recomp alone, defines
   the runtime globals it needs, and prints SKIP (not FAIL) when it truly needs game data. When a patch changes what an
   old test checks, update that test in the same change.
+- The target is the 1.29 update; the 1.01 disc is the base.
+- Agents without the game can still work on the tools, patches with host tests, docs and the installer; say in the
+  pull request that game runs were not done.
+
+### The maintainers' setup (Linux with Nix; not a requirement)
+
+How the maintainers run things; one way, not a requirement. Everything comes from the Nix flake; nothing is installed system-wide.
+
+```sh
+nix develop .#re     # analysis and lifting
+nix develop .#win    # Windows x64 cross build (MinGW-w64, CMake, Ninja)
+nix develop          # everything, plus Xvfb and steam-run for Proton runs
+```
+
 - **Anything that reads the game** runs inside `tools/sandbox.sh [--gpu] -- CMD` (game and repository read-only,
   only `work/` and `build/` writable, no network). The route is `tools/ps3recomp-patched.sh`, `tools/lift.sh`
   (PPU) and `tools/spu/lift_spu.sh` (SPU), then `tools/build-kz2.sh build/kz2-win`; it caps compiler jobs by free
   memory (a lifted chunk takes up to about 1.5 GB to compile); do not run `cmake --build -jN` on the lifted code.
-  The target is the 1.29 update; the 1.01 disc is the base.
 - **Windows runs** on Linux go through `tools/proton-test.sh` (hidden Xvfb display, audio drivers off); output in
   `work/proton/NAME/app/app_stdout.txt`, a screenshot in `work/shots/NAME.png`. Look at the screenshot before you
   claim anything about the picture.
-- Agents without the game can still work on the tools, patches with host tests, docs and the installer; say in the
-  pull request that game runs were not done.
+
+### Without Nix (for example native Windows)
+
+- **Works with plain Python 3.11 or newer** (standard library only): the release tools and their tests, one file at
+  a time, e.g. `python3 tools/release/test_firstrun.py`. Every `tools/release/test_*.py` passes with plain `python3`
+  on Linux outside Nix; they have not been run on Windows.
+- **The installer script** (`installer/kz2.iss`) needs Inno Setup to compile. That compile has only been run in the
+  maintainers' setup.
+- **Does not work without the flake toolchain:** the lift and the build (`ps3recomp-patched.sh`, `lift.sh`,
+  `build-kz2.sh` are shell scripts that expect the Nix shells). Open the pull request and let CI build and test it, or
+  say in the pull request what was not run. A native Windows build goes through the installer, which brings the
+  patched toolkit and a bundled toolchain (`tools/release/fetch_toolchain.py`, `toolchain.json`; `firstrun.py` is the
+  route it runs). Running `fetch_toolchain.py` and then `firstrun.py --root <checkout>` by hand is not tested from a
+  checkout: `firstrun.py` looks for the patched toolkit in `work/ps3recomp-patched`, which only
+  `tools/ps3recomp-patched.sh` makes.
+- Keep the dump outside the repository and read-only; do not run anything that writes to it.
 
 ## Docs travel with code
 

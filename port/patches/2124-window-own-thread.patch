@@ -1,0 +1,330 @@
+KZ2 patch 2124: the live renderer's window gets a thread of its own, so no renderer wait holds its messages back.
+Symptom (Proton, menu to Corinth River): at the level start the frame thread spent 8.4-9.2 s in one
+pass with no message handled; Windows marks a window that has not taken a message for 5 s as "Not responding", and
+close, focus and size wait. Cause: rsx_null_backend_init creates the window on its caller's thread, the port's frame
+thread, whose rsx_null_backend_pump_messages is the only message loop; the same thread drains the FIFO through the
+live renderer's walker, which at a cold level start waits for 100+ pipeline builds in one drain (ld_apso_await;
+an earlier change's [frame-call] lines measure it). Fix (KZ2_WINDOW_THREAD, default on; 0 = the old window on the caller's
+thread): rsx_null_backend_init starts a window thread that creates the window (and applies the display mode, patch
+2095) and then only takes messages (MsgWaitForMultipleObjects, 50 ms at most), runs the KZ2_TEST_DISPLAY steps and
+the caption. Swap-chain calls stay on the present thread: exclusive fullscreen on/off (rsx_live_draw_set_fullscreen)
+is asked for by the window thread and done by the frame thread at its next rsx_null_backend_pump_messages, which
+posts the result back (RSX_DM_WM_FSDONE); the window thread never waits for the frame thread (SetFullscreenState
+sends messages to the window, so a wait there would deadlock). rsx_dm_apply is split into its swap-chain and window
+halves for that. With the window thread, WM_CLOSE hides the window and sets window_closed (the frame thread shuts
+down at its next pump, as before; DestroyWindow could pull the window from under a Present), and WM_PAINT no longer
+GDI-fills over the live renderer's swap chain. [wpump] lines: the window thread's longest gap between two message
+checks. Also rsx_live_draw_pso_await_totals (the walker's pipeline-build waits so far) for the port's frame-call
+timing. General (upstream candidate, after patch 2095 which it changes).
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -77,6 +77,7 @@
+ void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
+ int  rsx_live_draw_set_fullscreen(int on) { (void)on; return -1; }   /* patch 2095 */
+ int  rsx_live_draw_is_fullscreen(void) { return 0; }
++void rsx_live_draw_pso_await_totals(unsigned long long* n, unsigned long long* us) { *n = 0; *us = 0; }   /* patch 2124 */
+ void rsx_live_draw_set_scaling(int s, int f) { (void)s; (void)f; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+@@ -9591,6 +9592,14 @@
+             (unsigned long long)g_apso.waits, g_apso.tab.count);
+ }
+ 
++/* KZ2 patch 2124: the walker's pipeline-build waits so far (ld_apso_await: count, microseconds), for the port's
++ * frame-thread call timing ([frame-call] lines in port/kz2/main.cpp). Read on the walker's own thread. */
++void rsx_live_draw_pso_await_totals(unsigned long long* n, unsigned long long* us)
++{
++    *n = (unsigned long long)g_apso.awaits;
++    *us = (unsigned long long)g_apso.await_us;
++}
++
+ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
+ {
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -53,6 +53,26 @@
+ 
+ static int s_present_suppressed = 0;
+ 
++/* ---------------------------------------------------------------------------
++ * KZ2 patch 2124: the window's own thread (KZ2_WINDOW_THREAD, default on; 0 = the window on the caller's thread,
++ * pumped by rsx_null_backend_pump_messages as before).
++ * The caller of rsx_null_backend_init is the port's frame thread, which also drains the FIFO through the live
++ * renderer's walker. A drain can take seconds (Killzone 2's level start: the walker waits for 100+ pipeline builds
++ * in one pass, 8.4-9.2 s), and with the window on that thread no message was handled for that long: close, focus and
++ * size waited, and Windows marks a window that has not taken a message for 5 s as not responding. Now a thread of its
++ * own creates the window and does nothing but take its messages (MsgWaitForMultipleObjects, at least every 50 ms), so
++ * no renderer wait reaches it. Everything that touches the live renderer's swap chain stays on the present thread:
++ * exclusive fullscreen on/off (rsx_live_draw_set_fullscreen, which DXGI answers with messages to the window) is asked
++ * for here (s_wt_fs_req) and done by the frame thread at its next rsx_null_backend_pump_messages, which posts the
++ * result back (RSX_DM_WM_FSDONE); the window procedure never waits for the frame thread. WM_CLOSE hides the window and
++ * sets window_closed; the frame thread shuts down at its next pump as before (DestroyWindow would pull the window out
++ * from under a Present in flight). [wpump] lines: the window thread's longest gap between two message checks.
++ * -----------------------------------------------------------------------*/
++static int s_wt_on;                               /* the window lives on its own thread */
++static volatile LONG s_wt_fs_req = -1;            /* (stage << 1) | on for the frame thread, -1 = none */
++#define RSX_DM_WM_FSDONE (WM_APP + 0x97)          /* wParam = stage, lParam = rsx_live_draw_set_fullscreen's result */
++enum { RSX_WT_FS_LEAVE = 1, RSX_WT_FS_ENTER = 2, RSX_WT_FS_RETAKE = 3 };
++
+ #include "rsx_window_size.h"   /* KZ3 patch 2062: window size apart from the guest output */
+ 
+ /* ---------------------------------------------------------------------------
+@@ -110,11 +130,35 @@
+     fflush(stdout);
+ }
+ 
++/* Patch 2124: with the window on its own thread a swap-chain call is the frame thread's (see above). One request is in
++ * flight at a time; a mode chosen meanwhile runs when it is answered (the newest choice wins). */
++static int s_dm_wait = 0, s_dm_wait_m = -1, s_dm_next_m = -1;
++static const char *s_dm_wait_why, *s_dm_next_why;
++static void rsx_wt_fs_ask(int stage, int on)
++{
++    s_dm_wait = stage;
++    InterlockedExchange(&s_wt_fs_req, (LONG)((stage << 1) | (on ? 1 : 0)));
++}
++static void rsx_dm_apply_window(int m, const char* why);
++static void rsx_dm_fs_result(int r, const char* why);
++
+ static void rsx_dm_apply(int m, const char* why)
+ {
+     HWND h = s_state.hwnd;
+     if (!h) return;
+-    if (s_dm_applied == RSX_DM_FULLSCREEN && m != RSX_DM_FULLSCREEN) rsx_live_draw_set_fullscreen(0);
++    if (s_wt_on && s_dm_wait) { s_dm_next_m = m; s_dm_next_why = why; return; }   /* patch 2124 */
++    if (s_dm_applied == RSX_DM_FULLSCREEN && m != RSX_DM_FULLSCREEN) {
++        if (s_wt_on) { s_dm_wait_m = m; s_dm_wait_why = why; rsx_wt_fs_ask(RSX_WT_FS_LEAVE, 0); return; }
++        rsx_live_draw_set_fullscreen(0);
++    }
++    rsx_dm_apply_window(m, why);
++}
++
++/* The window half of a mode change (style, placement), then exclusive fullscreen when m asks for it. */
++static void rsx_dm_apply_window(int m, const char* why)
++{
++    HWND h = s_state.hwnd;
++    if (!h) return;
+     if (m == RSX_DM_WINDOWED) {
+         s_dm_pending = -1;
+         if (s_dm_saved) {
+@@ -144,25 +188,55 @@
+                          mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+         }
+         if (m == RSX_DM_FULLSCREEN) {
+-            const int r = rsx_live_draw_set_fullscreen(1);
+-            if (r < 0 && s_present_suppressed) {           /* live draw not up yet: retry at the next pump */
+-                s_dm_pending = RSX_DM_FULLSCREEN;
++            if (s_wt_on) {                                 /* patch 2124: the frame thread takes it; see FSDONE */
+                 s_dm_applied = RSX_DM_BORDERLESS;
+-                rsx_dm_log_client("exclusive fullscreen waits for the swap chain");
++                s_dm_wait_why = why;
++                rsx_wt_fs_ask(RSX_WT_FS_ENTER, 1);
+                 return;
+             }
+-            s_dm_pending = -1;
+-            if (r <= 0) {
+-                m = rsx_dm_exclusive_refused(&s_dm);
+-                printf("[display] exclusive fullscreen refused (%s): borderless for this session\n",
+-                       r < 0 ? "no live-draw swap chain" : "SetFullscreenState failed");
+-            }
++            rsx_dm_fs_result(rsx_live_draw_set_fullscreen(1), why);
++            return;
+         }
+     }
+     s_dm_applied = m;
+     rsx_dm_log_client(why);
+ }
+ 
++/* The rest of a change to exclusive fullscreen, once rsx_live_draw_set_fullscreen(1) answered r. */
++static void rsx_dm_fs_result(int r, const char* why)
++{
++    int m = RSX_DM_FULLSCREEN;
++    if (r < 0 && s_present_suppressed) {           /* live draw not up yet: retry at the next pump */
++        s_dm_pending = RSX_DM_FULLSCREEN;
++        s_dm_applied = RSX_DM_BORDERLESS;
++        rsx_dm_log_client("exclusive fullscreen waits for the swap chain");
++        return;
++    }
++    s_dm_pending = -1;
++    if (r <= 0) {
++        m = rsx_dm_exclusive_refused(&s_dm);
++        printf("[display] exclusive fullscreen refused (%s): borderless for this session\n",
++               r < 0 ? "no live-draw swap chain" : "SetFullscreenState failed");
++    }
++    s_dm_applied = m;
++    rsx_dm_log_client(why);
++}
++
++/* Patch 2124: the frame thread's answer to a swap-chain request, on the window's thread. */
++static void rsx_dm_fs_done(int stage, int r)
++{
++    const char* why = s_dm_wait_why;
++    s_dm_wait = 0;
++    if (stage == RSX_WT_FS_LEAVE) rsx_dm_apply_window(s_dm_wait_m, why);
++    else if (stage == RSX_WT_FS_ENTER) rsx_dm_fs_result(r, why);
++    else if (r > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
++    if (!s_dm_wait && s_dm_next_m >= 0) {
++        const int m = s_dm_next_m;
++        s_dm_next_m = -1;
++        rsx_dm_apply(m, s_dm_next_why);
++    }
++}
++
+ static void rsx_dm_choose(int m, const char* why)    /* a player's choice: apply, then save */
+ {
+     rsx_dm_apply(rsx_dm_set(&s_dm, m), why);
+@@ -217,8 +291,10 @@
+         *res = 0;
+         return 1;
+     }
++    if (msg == RSX_DM_WM_FSDONE) { rsx_dm_fs_done((int)wp, (int)lp); *res = 0; return 1; }   /* patch 2124 */
+     if (msg == WM_ACTIVATEAPP && wp && s_dm_applied == RSX_DM_FULLSCREEN && !rsx_live_draw_is_fullscreen()) {
+-        if (rsx_live_draw_set_fullscreen(1) > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
++        if (s_wt_on) { if (!s_dm_wait) rsx_wt_fs_ask(RSX_WT_FS_RETAKE, 1); }   /* patch 2124 */
++        else if (rsx_live_draw_set_fullscreen(1) > 0) rsx_dm_log_client("exclusive fullscreen taken back on activation");
+     }
+     return 0;
+ }
+@@ -371,6 +447,7 @@
+     switch (msg) {
+     case WM_CLOSE:
+         s_state.window_closed = 1;
++        if (s_wt_on) { ShowWindow(hwnd, SW_HIDE); return 0; }   /* patch 2124: the frame thread shuts down */
+         DestroyWindow(hwnd);
+         return 0;
+ 
+@@ -381,6 +458,9 @@
+     case WM_PAINT: {
+         PAINTSTRUCT ps;
+         HDC hdc = BeginPaint(hwnd, &ps);
++        /* patch 2124: the live renderer's swap chain owns the picture; no GDI fill over it (with the window on its own
++         * thread a WM_PAINT is now handled while the renderer is busy) */
++        if (s_wt_on && s_present_suppressed) { EndPaint(hwnd, &ps); return 0; }
+ 
+         /* Fill with current clear color */
+         HBRUSH brush = CreateSolidBrush(s_state.clear_color);
+@@ -540,7 +620,7 @@
+  * Public API
+  * -----------------------------------------------------------------------*/
+ 
+-int rsx_null_backend_init(u32 width, u32 height, const char* title)
++static int null_create_window(u32 width, u32 height, const char* title)
+ {
+     memset(&s_state, 0, sizeof(s_state));
+     s_state.width = width;
+@@ -603,6 +683,76 @@
+     return 0;
+ }
+ 
++/* Patch 2124: the window's own thread (see the block at the top). */
++static void rsx_null_title_tick(void);
++static struct { u32 w, h; const char* title; int rc; HANDLE ready; } s_wt_args;
++
++static void rsx_wt_gap_note(double gap_ms, LARGE_INTEGER now, LARGE_INTEGER qf)
++{
++    static LARGE_INTEGER s_win;
++    static double s_max;
++    static unsigned s_n, s_long, s_lines;
++    if (!s_win.QuadPart) s_win = now;
++    s_n++;
++    if (gap_ms > s_max) s_max = gap_ms;
++    if (gap_ms > 250.0) {
++        s_long++;
++        if (s_lines++ < 20) fprintf(stderr, "[wpump] window thread: gap %.0f ms between message checks\n", gap_ms);
++    }
++    const double win = (double)(now.QuadPart - s_win.QuadPart) / (double)qf.QuadPart;
++    if (win >= 10.0) {
++        fprintf(stderr, "[wpump] window thread: last %.1f s: %u message checks, longest gap %.0f ms, %u gap(s) over 250 ms\n",
++                win, s_n, s_max, s_long);
++        s_win = now; s_n = s_long = 0; s_max = 0.0;
++    }
++}
++
++static DWORD WINAPI rsx_window_thread(LPVOID p)
++{
++    (void)p;
++    s_wt_args.rc = null_create_window(s_wt_args.w, s_wt_args.h, s_wt_args.title);
++    SetEvent(s_wt_args.ready);
++    if (s_wt_args.rc != 0) return 0;
++    LARGE_INTEGER qf, last, now;
++    QueryPerformanceFrequency(&qf);
++    QueryPerformanceCounter(&last);
++    for (;;) {
++        MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
++        QueryPerformanceCounter(&now);
++        rsx_wt_gap_note((double)(now.QuadPart - last.QuadPart) * 1e3 / (double)qf.QuadPart, now, qf);
++        MSG msg;
++        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
++            if (msg.message == WM_QUIT) { s_state.window_closed = 1; return 0; }
++            TranslateMessage(&msg);
++            DispatchMessageA(&msg);
++        }
++        if (s_dm_pending == RSX_DM_FULLSCREEN && !s_dm_wait) rsx_dm_apply(RSX_DM_FULLSCREEN, "start");
++        rsx_dm_script_step();
++        rsx_null_title_tick();
++        QueryPerformanceCounter(&last);
++    }
++}
++
++int rsx_null_backend_init(u32 width, u32 height, const char* title)
++{
++    const char* e = getenv("KZ2_WINDOW_THREAD");
++    s_wt_on = !(e && e[0] == '0');
++    printf("[RSX null] window %s\n", s_wt_on ? "on its own thread (KZ2_WINDOW_THREAD=0 = on the frame thread)"
++                                              : "on the frame thread (KZ2_WINDOW_THREAD=0)");
++    if (!s_wt_on) return null_create_window(width, height, title);
++    s_wt_args.w = width; s_wt_args.h = height; s_wt_args.title = title; s_wt_args.rc = -1;
++    s_wt_args.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
++    HANDLE th = s_wt_args.ready ? CreateThread(NULL, 1u << 20, rsx_window_thread, NULL, 0, NULL) : NULL;
++    if (!th) {
++        printf("[RSX null] window thread not started (%lu): window on the frame thread\n", GetLastError());
++        s_wt_on = 0;
++        return null_create_window(width, height, title);
++    }
++    WaitForSingleObject(s_wt_args.ready, INFINITE);
++    CloseHandle(th);
++    return s_wt_args.rc;
++}
++
+ void rsx_null_backend_shutdown(void)
+ {
+     if (s_state.hwnd) {
+@@ -618,6 +768,14 @@
+ int rsx_null_backend_pump_messages(void)
+ {
+     MSG msg;
++    if (s_wt_on) {   /* patch 2124: no messages here; the swap-chain request the window thread left, if any */
++        const LONG q = InterlockedExchange(&s_wt_fs_req, -1);
++        if (q >= 0) {
++            const int r = rsx_live_draw_set_fullscreen((int)(q & 1));
++            PostMessageA(s_state.hwnd, RSX_DM_WM_FSDONE, (WPARAM)(q >> 1), (LPARAM)r);
++        }
++        return *(volatile int*)&s_state.window_closed ? -1 : 0;
++    }
+     if (s_dm_pending == RSX_DM_FULLSCREEN) rsx_dm_apply(RSX_DM_FULLSCREEN, "start");   /* patch 2095 */
+     rsx_dm_script_step();
+     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+@@ -626,6 +784,12 @@
+         TranslateMessage(&msg);
+         DispatchMessageA(&msg);
+     }
++    rsx_null_title_tick();
++    return s_state.window_closed ? -1 : 0;
++}
++
++static void rsx_null_title_tick(void)
++{
+     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
+      * live-draw frame, window size. Here on the window's own thread, so the
+      * WM_SETTEXT never blocks the renderer. */
+@@ -645,7 +809,6 @@
+         s_state.title_frames = s_state.frame_count;
+         s_state.title_time = now;
+     }
+-    return s_state.window_closed ? -1 : 0;
+ }
+ 
+ /* Ported from caner (canersaka) Yakuza-Dead-Souls-EX: the live NV4097->D3D12

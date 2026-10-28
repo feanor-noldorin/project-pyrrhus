@@ -5,6 +5,7 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; O="$ROOT/work/spu"; mkdir -p "$O"
 P="${KZ2_PATCHED_DIR:-$ROOT/${KZ2_OUT:-work}/ps3recomp-patched}"
+[[ -f "$P/runtime/spu/spu_context.h" ]] || { echo "SKIP: no patched toolkit at $P (run tools/ps3recomp-patched.sh)"; exit 0; }
 rm -f "$O/t_fastcg"
 gcc -std=gnu17 -O2 -msse4.1 ${FASTCG_ISA:-} -w -ffp-contract=off -fno-strict-aliasing -I "$P/runtime/spu" -I "$P/include" -I "$P/runtime" \
     -o "$O/t_fastcg" "$ROOT/tools/spu/test_spu_fastcg.c" -lm 2>&1 | grep -m5 error

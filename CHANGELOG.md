@@ -24,6 +24,7 @@ port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-
 - The game window's messages (input and window events) are now handled on every frame tick, the same fix as Project Helghast 0.1.4. In our tests a 3.7-second stretch with no messages handled, during a busy catch-up, is gone.
 - The game's disk cache is rebuilt once when the installed build changes, so the first start after an update loads a little slower. This is a precaution taken from Project Helghast 0.1.4, where a cache left by an older build ended a level with error 20000; it has not been seen on Killzone 2.
 - Files the game opens to create or append to are now opened the way the console does (the toolkit read three of the open flags with the wrong values). In our tests no visible change yet: the opens seen at start are read-only.
+- The game window keeps responding while the game builds its graphics pipelines on the first start of a level, which can take several seconds with an empty shader cache: the window now has its own thread, so Windows no longer marks it as not responding. In our tests the longest stretch without an answer went from 7.9 s to 0.05 s; the first start of a level is still slower than later ones.
 
 ## [0.1.1] - 2026-10-28 (pre-release)
 

@@ -12,18 +12,37 @@ nix develop .#re --command python3 tools/release/test_version_check.py
 nix develop .#re --command python3 tools/release/test_fetch_toolchain.py
 nix develop .#re --command python3 tools/release/test_website.py
 nix develop .#re --command python3 tools/release/test_stage_sdl3.py
+nix develop --command tools/sandbox.sh -- tools/spu/test_spurs_kern.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_xr.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_fastcg.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_cg72.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_hop.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_rmask.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_fmaodd.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_lscold.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_shufh.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_spu_ls_gate.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_mfc_slots.sh
 nix develop .#re --command tools/sandbox.sh -- python3 tools/spu/test_ib_guess.py
+nix develop .#win --command tools/sandbox.sh -- tools/spu/test_spu_rm_layout.sh
 nix develop .#re --command python3 tools/release/test_spu_step.py
 nix develop .#re --command python3 tools/release/test_rpcs3_import.py
 nix develop .#re --command tools/sandbox.sh -- python3 tools/spu/test_getenv_once.py
+nix develop --command tools/sandbox.sh -- tools/spu/test_task_ids.sh
+nix develop --command tools/sandbox.sh -- tools/spu/test_putllc_ppu.sh
 nix develop .#re --command python3 tools/release/test_vm_test.py
 nix develop .#re --command python3 tools/release/test_release_version.py
 nix develop .#re --command python3 tools/release/test_iss_ispp.py
 nix develop .#re --command python3 tools/release/test_workflows.py
 nix develop .#re --command python3 tools/release/test_version_agree.py
 nix develop .#re --command python3 tools/release/test_install_rules.py
+nix develop --command tools/sandbox.sh -- tools/runtime/test_split_file.sh
 nix develop .#re --command python3 tools/release/test_bump_version.py
 nix develop .#re --command python3 tools/release/test_release_notes.py
+nix develop --command tools/sandbox.sh -- tools/runtime/test_fios_stamp.sh
+nix develop --command tools/sandbox.sh -- tools/runtime/test_pump_tick.sh
 nix develop .#re --command python3 tools/release/test_uninstall_covers.py
 nix develop .#re --command python3 tools/release/test_iso9660.py
 nix develop .#re --command python3 tools/release/test_recomp_card.py
+nix develop --command tools/sandbox.sh -- tools/runtime/test_sys_fs_flags.sh
+nix develop --command tools/sandbox.sh -- tools/runtime/test_window_thread.sh

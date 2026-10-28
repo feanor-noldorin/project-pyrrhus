@@ -17,6 +17,7 @@ f = s[s.index("static DWORD WINAPI frame_clock(LPVOID)"):]
 inner = f[f.index("fired < 240) {"):f.index("next_tick += 16;")]
 ok = "kz2_pump_tick_on()" in inner and "kz2_rsx_pump()" in inner and "kz2_pump_note(fired + 1)" in inner
 outer = f[f.index("if (fired >= 240)"):]
-ok = ok and re.search(r"kz2_rsx_pump\(\) != 0\) \{.*?\n\s*\}\n\s*kz2_pump_note\(fired\);", outer, re.S) is not None
+# (the pump call is timed, `const int pr = kz2_rsx_pump(); ... if (pr != 0) {`)
+ok = ok and re.search(r"kz2_rsx_pump\(\);.*?if \(pr != 0\) \{.*?\n\s*\}\n\s*kz2_pump_note\(fired\);", outer, re.S) is not None
 print("PASS: wiring" if ok else "[FAIL] frame_clock does not pump inside the catch-up loop"); sys.exit(0 if ok else 1)
 PY

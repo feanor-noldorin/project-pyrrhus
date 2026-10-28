@@ -385,7 +385,10 @@ static void kz2_no_renderer_exit(void)
  * runs on for up to 240 ticks without returning to the pump. The window's messages (WM_CLOSE, focus, size, the
  * keyboard page's capture) then wait seconds, and Windows marks a window that has not pumped for 5 s as not responding.
  * KZ3's player saw it as mouse look holding still then jumping. KZ2_PUMP_TICK=0 = the old pump (outer loop only).
- * kz2_pump_note: the longest gap between two pumps, a line per gap over 250 ms (first 20) and a summary every 10 s. */
+ * kz2_pump_note: the longest gap between two pumps, a line per gap over 250 ms (first 20) and a summary every 10 s.
+ * Since an earlier change the live renderer's window has a thread of its own (patch 2124, KZ2_WINDOW_THREAD=0 = off):
+ * kz2_rsx_pump then only hands over a swap-chain request and reads window_closed, so a [pump] gap is the length of a
+ * frame-thread pass, and the window's own message gaps are the [wpump] lines. */
 static int kz2_pump_tick_on(void)
 {
     static int on = -1;
@@ -422,6 +425,44 @@ static void kz2_pump_note(int fired)
     }
 }
 
+/* Frame-thread call timing: each present, FIFO drain and pump call of frame_clock is timed; a call
+ * over 250 ms gets a [frame-call] line (first 40) with the live renderer's pipeline-build waits inside it
+ * (rsx_live_draw_pso_await_totals, patch 2124), and every 10 s a summary names the longest call of each kind. An earlier change
+ * saw single passes of 8.4-9.2 s at the Corinth River start; this says which call it was and what it waited on. */
+extern "C" void rsx_live_draw_pso_await_totals(unsigned long long* n, unsigned long long* us);
+enum { KZ2_FC_PRESENT, KZ2_FC_DRAIN, KZ2_FC_PUMP, KZ2_FC_N };
+static const char* const kz2_fc_name[KZ2_FC_N] = {"present", "drain", "pump"};
+struct Kz2FcMark { LARGE_INTEGER t0; unsigned long long aw, awus; };
+static inline void kz2_fc_begin(Kz2FcMark& m)
+{
+    rsx_live_draw_pso_await_totals(&m.aw, &m.awus);
+    QueryPerformanceCounter(&m.t0);
+}
+static void kz2_fc_end(int kind, const Kz2FcMark& m)
+{
+    static LARGE_INTEGER s_qf, s_win;
+    static double s_max[KZ2_FC_N];
+    static unsigned s_lines;
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    if (!s_qf.QuadPart) { QueryPerformanceFrequency(&s_qf); s_win = t1; }
+    const double ms = (double)(t1.QuadPart - m.t0.QuadPart) * 1e3 / (double)s_qf.QuadPart;
+    if (ms > s_max[kind]) s_max[kind] = ms;
+    if (ms > 250.0 && s_lines++ < 40) {
+        unsigned long long aw, awus;
+        rsx_live_draw_pso_await_totals(&aw, &awus);
+        fprintf(stderr, "[frame-call] %s took %.0f ms (flip=%u); pipeline builds the walker waited for in it: %llu, %.0f ms\n",
+                kz2_fc_name[kind], ms, cellGcm_flip_request_count(), aw - m.aw, (double)(awus - m.awus) / 1e3);
+    }
+    const double win = (double)(t1.QuadPart - s_win.QuadPart) / (double)s_qf.QuadPart;
+    if (win >= 10.0) {
+        fprintf(stderr, "[frame-call] last %.1f s: longest present %.0f ms, drain %.0f ms, pump %.0f ms\n", win,
+                s_max[KZ2_FC_PRESENT], s_max[KZ2_FC_DRAIN], s_max[KZ2_FC_PUMP]);
+        s_win = t1;
+        for (double& v : s_max) v = 0.0;
+    }
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     kz2_log_set_thread_label("frame");
@@ -453,16 +494,19 @@ static DWORD WINAPI frame_clock(LPVOID)
              * after the drain races the guest's next-frame writes and shows a
              * mixed one. */
             if (rsx_ok && cellGcm_take_flip_pending()) {
-                present_guest_frame();
+                { Kz2FcMark fc; kz2_fc_begin(fc); present_guest_frame(); kz2_fc_end(KZ2_FC_PRESENT, fc); }
                 last_flip = cellGcm_flip_request_count();
             }
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
+            if (rsx_ok) { Kz2FcMark fc; kz2_fc_begin(fc); cellGcm_rsx_process_fifo(); kz2_fc_end(KZ2_FC_DRAIN, fc); }
             /* pump on every tick too, so a catch-up pass does not hold the window's messages back */
             if (rsx_ok && kz2_pump_tick_on()) {
-                if (kz2_rsx_pump() != 0) {
+                Kz2FcMark fcp; kz2_fc_begin(fcp);
+                const int pr = kz2_rsx_pump();
+                kz2_fc_end(KZ2_FC_PUMP, fcp);
+                if (pr != 0) {
                     kz2_exit_on_window_close();   /* does not return */
                     rsx_ok = 0;
                 }
@@ -479,12 +523,15 @@ static DWORD WINAPI frame_clock(LPVOID)
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                present_guest_frame();
+                { Kz2FcMark fc; kz2_fc_begin(fc); present_guest_frame(); kz2_fc_end(KZ2_FC_PRESENT, fc); }
                 last_flip = cellGcm_flip_request_count();
             }
-            cellGcm_rsx_process_fifo();
+            { Kz2FcMark fc; kz2_fc_begin(fc); cellGcm_rsx_process_fifo(); kz2_fc_end(KZ2_FC_DRAIN, fc); }
 
-            if (kz2_rsx_pump() != 0) {
+            Kz2FcMark fcp; kz2_fc_begin(fcp);
+            const int pr = kz2_rsx_pump();
+            kz2_fc_end(KZ2_FC_PUMP, fcp);
+            if (pr != 0) {
                 kz2_exit_on_window_close();   /* does not return */
                 rsx_ok = 0;
                 continue;
@@ -498,7 +545,7 @@ static DWORD WINAPI frame_clock(LPVOID)
                 /* Consume the pending flip too, or the next pass presents the same
                  * flip again (3,904 presents for 2,483 flips). */
                 cellGcm_take_flip_pending();
-                present_guest_frame();
+                { Kz2FcMark fc; kz2_fc_begin(fc); present_guest_frame(); kz2_fc_end(KZ2_FC_PRESENT, fc); }
                 last_flip = fc;
             } else if (fc == 0) {
                 kz2_rsx_present();
