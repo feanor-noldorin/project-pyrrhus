@@ -7,8 +7,11 @@
 
 **Killzone 2: Unofficial PC Port (static recompilation)**
 
+[![CI](https://github.com/undecuple/project-pyrrhus/actions/workflows/ci.yml/badge.svg)](https://github.com/undecuple/project-pyrrhus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Status: partly playable](https://img.shields.io/badge/status-partly%20playable-orange)
+[![Release](https://img.shields.io/github/v/release/undecuple/project-pyrrhus?include_prereleases&label=release)](https://github.com/undecuple/project-pyrrhus/releases)
+[![Downloads](https://img.shields.io/github/downloads/undecuple/project-pyrrhus/total)](https://github.com/undecuple/project-pyrrhus/releases)
 ![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 ![Direct3D 12](https://img.shields.io/badge/graphics-Direct3D%2012-555)
 
@@ -91,9 +94,12 @@ Online multiplayer, if it comes, will only use a self-hosted server you choose.
 
 **Pre-release <!-- version -->[v0.1.1](https://github.com/undecuple/project-pyrrhus/releases/tag/v0.1.1)<!-- /version -->:** a Windows installer (recommended) and
 a portable zip, on the [releases page](https://github.com/undecuple/project-pyrrhus/releases) with a `.sha256` file for each and `SHA256SUMS`. They check your
-own disc dump, the 1.29 update and the decrypted EBOOT ([what each must contain](docs/GETTING-FILES.md)), then
+own disc dump (a folder or a decrypted ISO file), the 1.29 update and the decrypted EBOOT ([what each must
+contain](docs/GETTING-FILES.md)), then
 translate and build the game's code on your own machine with a bundled compiler. No game code, assets or keys are ever
-shipped or downloaded. You can also build the port yourself (below). It is partly playable: the first level can be
+shipped or downloaded. Do not install into a OneDrive folder (a precaution from a problem reported on Project Helghast: OneDrive would sync the build's thousands of files
+while they are written), and keep your game files on this device (in OneDrive: "Always keep on this device"); the
+setup refuses both. You can also build the port yourself (below). It is partly playable: the first level can be
 played with a pad (a scripted run gives about 23 frames per second, the PS3 30; hand play is not measured), and the
 rest of the campaign has not been tried. What changed in each
 version: [CHANGELOG.md](CHANGELOG.md).
@@ -146,7 +152,8 @@ No dates are given: see the [release criteria](docs/RELEASE-CRITERIA.md).
 
 **[Project Helghast](https://github.com/undecuple/project-helghast)**: Killzone 3 (PS3) ported to PC the same way.
 Project Pyrrhus uses its method and reuses its general runtime work (ps3recomp fixes, renderer, SPU job system),
-adapted to Killzone 2. Most patches in `port/patches/` come from there; the rest are Killzone 2's own.
+adapted to Killzone 2. Most patches in `port/patches/` come from there; the rest are Killzone 2's own. Its builds are
+pre-releases on its [releases page](https://github.com/undecuple/project-helghast/releases), as this project's are.
 
 ## Contributing
 
