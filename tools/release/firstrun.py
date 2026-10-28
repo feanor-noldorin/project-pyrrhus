@@ -26,7 +26,8 @@ builder, done-marker). Standard library only, Python 3.11+, Windows and Linux.
                The payload's toolchain/cmake, toolchain/ninja and (Windows) toolchain/python are used when present.
   --log-dir    folder the setup.exe / zip was started from (Inno passes {src}); not writable -> the temp folder
   --log-name   default Project-Pyrrhus-setup.log; an earlier log of the same name is renamed with its start time
-  --status-file  also keep the LOG line and the latest PROGRESS/RESULT line in this file (for the Inno wizard)
+  --status-file  also keep the LOG line and the latest PROGRESS/RESULT line in this file (for the Inno wizard and the
+                 launcher); after RESULT ok=0 the REASON lines follow (from Project Helghast PR #11)
   --stop-file    stop when this file appears (the wizard's Stop button): the running tool's process tree ends,
                  its step leaves no marker, RESULT step=cancelled, exit 130; the next start resumes there
   --dry-run    print the plan (steps, weights, done or pending, commands) and the log location; runs and writes nothing
@@ -39,11 +40,19 @@ builder, done-marker). Standard library only, Python 3.11+, Windows and Linux.
   --check-first  with --interactive and --dump/--update (the folders the installer wizard wrote to kz2-install.ini
                [paths]): check them first and ask for folders only after a FAIL or when c is pressed; the wizard's
                other answers (version check, pad layout, prompts, display) are kept, not asked again
+  After a FAIL (from Project Helghast PR #11): when only E1 fails on an existing file (another
+  known EBOOT version, such as the disc's 1.01 one) the EBOOT alone is asked again, offering the update's
+  USRDIR/EBOOT.elf; on c only the inputs of the failed codes are asked (INPUT_OF; O1/O2 = all three). A failed check
+  the player quits, and a failed check step of the build, write the answers and the failed inputs to kz2-install.ini
+  [paths] (dump, update, eboot, wrong): the next start checks them first (the launcher's --check-first, or
+  --interactive with no folder arguments) and the questions after the check are asked only when the ini has no
+  answers yet. Input labels for the reasons go in fail_reason (a hook for Project Helghast's issue #10 work).
 
 Machine-readable lines on stdout, for the Inno wizard's output page and the zip's console:
   LOG path=<file>
   PROGRESS step=N/M name=<step> done=X total=Y elapsed=S pct=P      (P = whole pipeline, weights applied)
-  RESULT ok=1|0 step=<failed step or -> elapsed=S
+  REASON <text>                        (before RESULT ok=0, one per reason: the failing check's own message)
+  RESULT ok=1|0 step=<failed step, quit or -> elapsed=S   (quit: --interactive ended at q after a failed check)
 The compile step's done/total come from Ninja's "[x/y]" status lines. Every other line is the step's own output.
 
 Resume: each finished step writes <build>/.firstrun/<NN>-<name>.done (JSON: the inputs fingerprint, duration). A
@@ -81,6 +90,33 @@ DEFAULT_LOG_NAME = "Project-Pyrrhus-setup.log"
 MARKER_DIR = ".firstrun"
 KEEP_LOG_COPIES = 5                      # the install's logs\ keeps the last five
 NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
+REASON_MAX = 400       # characters of one REASON line (a message box line, not a log dump)
+# Which input a check code is about (firstrun_check's codes): the console asks again only for these after a FAIL.
+# O1/O2 (OneDrive) are about no single input: the console then asks for all three.
+INPUT_OF = {"D0": "dump", "D1": "dump", "D2": "dump", "D3": "dump", "I1": "dump", "I2": "dump", "A1": "dump",
+            "U0": "update", "U1": "update", "U2": "update", "U3": "update", "E1": "eboot", "H1": "eboot"}
+
+
+def fail_reason(check):
+    """The on-screen reason for one failed check (a dict with code, level, message), the same text the log has.
+    Hook: input labels (which input, the path, what was found there; Project Helghast's issue #10 work, to be brought
+    over by the maintainer) go here, so the wizard's box, the launcher's dialog and the console all get them."""
+    return check.get("message", "")
+
+
+def check_reasons(checks):
+    """The FAIL checks' reasons, in the check's order."""
+    return [fail_reason(c) for c in checks if c.get("level") == "FAIL"]
+
+
+def text_checks(text):
+    """firstrun_check's text lines ("FAIL D1: message") -> the dicts of --json, for check_reasons and INPUT_OF."""
+    out = []
+    for ln in text.splitlines():
+        m = re.match(r"^(OK|WARN|FAIL|INFO)\s+([A-Z]\d+):\s?(.*)$", ln)
+        if m:
+            out.append({"level": m.group(1), "code": m.group(2), "message": m.group(3)})
+    return out
 
 # Lift constants per EBOOT version (tools/lift.sh). The tree decides which one (tree_eboot_ver): its runtime glue
 # (port/kz2) is written for one EBOOT's addresses, so a lift of another EBOOT would build but not boot.
@@ -885,6 +921,8 @@ class Runner:
     def __init__(self, ctx, steps, log, out=sys.stdout, status_file=None):
         self.ctx, self.steps, self.log, self.out = ctx, steps, log, out
         self.status_file, self.status_head = status_file, ""
+        self.reasons = []      # why the build stopped: REASON lines after RESULT ok=0 (the wizard's and launcher's box)
+        self.fail_inputs = None   # the check step's FAIL inputs (INPUT_OF) when it stopped there; main records them
         self.t0 = time.monotonic()
         tot = sum(s.weight for s in steps) or 1.0
         self.frac = [s.weight / tot for s in steps]
@@ -915,8 +953,10 @@ class Runner:
             self.status_head = line
         tmp = self.status_file + ".tmp"
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(tmp)), exist_ok=True)
+            tail = "".join(f"REASON {r}\n" for r in self.reasons) if line.startswith("RESULT ok=0") else ""
             with open(tmp, "w", encoding="utf-8") as f:
-                f.write(self.status_head + "\n" + (line if line != self.status_head else "") + "\n")
+                f.write(self.status_head + "\n" + (line if line != self.status_head else "") + "\n" + tail)
             os.replace(tmp, self.status_file)
         except OSError:
             pass
@@ -1000,8 +1040,7 @@ class Runner:
                 try:
                     cmds = step.commands(ctx)
                 except StepFailed as e:     # a missing lift table, future-dated files: the plain message, no marker
-                    self.emit(str(e))
-                    return self.result(False, step.name)
+                    return self.failed(step.name, str(e))
                 units = 1000 if step.name == "check" else (len(cmds) or 1)   # check: permille (the archive hash)
                 iso_copy = step.name == "check" and bool(ctx.iso) and ctx.dump == ctx.iso   # 10 = checked, then the copy
                 ctx.say = self.emit
@@ -1016,21 +1055,19 @@ class Runner:
                         break
                     if rc != 0:
                         self.emit(f"step {step.name} failed: exit {rc}")
-                        return self.result(False, step.name)
+                        return self.failed(step.name, *self.why_failed(step, out, rc))
                     if step.name == "check":
                         self.take_check(out)
                         bad = self.version_mismatch()
                         if bad:
-                            self.emit(bad)
-                            return self.result(False, step.name)
+                            return self.failed(step.name, bad)
                     if not step.ninja:
                         self.progress(i, (10 if iso_copy else 1000) if step.name == "check" else k + 1, units)
                 if step.after and not failed:
                     try:
                         step.after(ctx)
                     except StepFailed as e:     # the ISO copy (space, truncated, encrypted) or its A1: no marker
-                        self.emit(str(e))
-                        return self.result(False, step.name)
+                        return self.failed(step.name, str(e))
                 if not cmds or step.ninja or failed:
                     self.progress(i, 1, 1)
                 if failed:
@@ -1077,6 +1114,35 @@ class Runner:
             return ""
         return (f"the decrypted EBOOT is the {got} one, this release is built for the {want} EBOOT: "
                 f"choose the {want} EBOOT.elf (the port cannot decrypt it; it needs your own decrypted one)")
+
+    def why_failed(self, step, out, rc):
+        """The reason lines of a failed command (Project Helghast PR #11: the wizard showed only where the log is).
+        The check step: firstrun_check's FAIL messages, as the log has them; another step: its last error line, else
+        its last line."""
+        if step.name == "check":
+            try:
+                j = json.loads("\n".join(ln for ln in out if not ln.startswith("ARCHIVE-HASH ")))
+                fails = check_reasons(j.get("checks", []))
+                if fails:
+                    self.fail_inputs = {INPUT_OF.get(c.get("code")) for c in j.get("checks", [])
+                                        if c.get("level") == "FAIL"}
+                    return fails
+            except (ValueError, AttributeError, KeyError, TypeError):
+                pass
+        lines = [ln.strip() for ln in out if ln.strip()]
+        last = next((ln for ln in reversed(lines) if re.search(r"\berror\b", ln, re.I)), lines[-1] if lines else "")
+        head = f"the step \"{step.label}\" failed (exit {rc})"
+        return [head + (f": {last[:REASON_MAX]}" if last else "")]
+
+    def failed(self, step, *reasons):
+        """End with RESULT ok=0 and say why: each reason goes to the log as a plain line and, as REASON <text>, to stdout
+        and the status file, so the wizard's box, the launcher's dialog and the console show it."""
+        self.reasons = [" ".join(str(r).split())[:REASON_MAX] for r in reasons if str(r).strip()]
+        for r in self.reasons:
+            if self.log:
+                self.log.write(r)
+            self.emit(f"REASON {r}", to_log=False)
+        return self.result(False, step)
 
     def result(self, ok, step):
         self.emit(f"RESULT ok={int(ok)} step={step} elapsed={int(time.monotonic() - self.t0)}")
@@ -1129,6 +1195,8 @@ UPDATE_HELP = """The 1.29 update is required. Install it on your PS3 (then copy 
 or install the 1.29 update in RPCS3 (see its documentation). The port cannot decrypt the EBOOT: it needs
 a decrypted EBOOT.elf, made from your own copy, in the update's USRDIR folder. This project ships no decryption tools
 or instructions."""
+EBOOT_AGAIN = ("The EBOOT must be the {want} update's one, not the disc's: EBOOT.elf, the decrypted form of EBOOT.BIN in "
+               "the update's USRDIR folder ({usrdir}), made from your own copy.")
 def _rpcs3():
     sys.path.insert(0, HERE)
     import rpcs3_import
@@ -1303,18 +1371,63 @@ def write_install_ini(root, portable, check_updates, layout="original", prompts=
     return p
 
 
-def _check_files(dump, update, eboot):
-    """Run firstrun_check in-process; -> (exit code, its text lines)."""
+def ini_paths(root):
+    """kz2-install.ini [paths] (dump, update, eboot, wrong), written by the wizard (kz2.iss WritePaths) or by
+    record_paths after a failed check; {} without a dump and an update."""
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(root, "kz2-install.ini"), encoding="utf-8")
+    g = {k: cp.get("paths", k, fallback="").strip() for k in ("dump", "update", "eboot", "wrong")}
+    return g if g["dump"] and g["update"] else {}
+
+
+def record_paths(root, dump, update, eboot, wrong=()):
+    """After a failed check the player quit: the answers go to kz2-install.ini [paths] (the folders-once keys the
+    wizard writes) with `wrong` = the inputs the FAIL lines were about, so the next start (the launcher's
+    --check-first, or the zip's run.cmd) checks them first and asks again only for those."""
+    import configparser
+    cp = configparser.ConfigParser()
+    p = os.path.join(root, "kz2-install.ini")
+    cp.read(p, encoding="utf-8")
+    if not cp.has_section("paths"):
+        cp.add_section("paths")
+    for k, v in (("dump", dump), ("update", update), ("eboot", eboot), ("wrong", ",".join(sorted(wrong)))):
+        cp.set("paths", k, v or "")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            cp.write(f)
+    except OSError:
+        pass
+
+
+def answered(root):
+    """True when kz2-install.ini already holds the wizard's (or an earlier console run's) answers to the later questions."""
+    import configparser
+    cp = configparser.ConfigParser()
+    cp.read(os.path.join(root, "kz2-install.ini"), encoding="utf-8")
+    return cp.has_option("controls", "layout")
+
+
+def _check_files(dump, update, eboot, target="1.29"):
+    """Run firstrun_check in-process for the tree's EBOOT version; -> (exit code, its text lines)."""
     import contextlib
     import io
     sys.path.insert(0, HERE)
     import firstrun_check
     buf = io.StringIO()
     # A1 (the disc archive's SHA-256) is left to the build's check step, which caches it and shows a bar
-    args = ["--dump", dump, "--skip-archive-hash"] + (["--update", update] if update else []) + (["--eboot", eboot] if eboot else [])
+    args = ["--dump", dump, "--skip-archive-hash", "--target", target] + (["--update", update] if update else []) + \
+        (["--eboot", eboot] if eboot else [])
     with contextlib.redirect_stdout(buf):
         rc = firstrun_check.main(args)
     return rc, buf.getvalue()
+
+
+def _same_file(a, b):
+    try:
+        return bool(a and b) and os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def _version_check(current):
@@ -1367,6 +1480,27 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
                 continue
             say(f"  not found: {r or '(empty)'}" + ("" if need_dir else " (no such file)"))
 
+    def pick_eboot(default):
+        """After an E1 FAIL on an existing file: the EBOOT file or its folder; "" = check the same one again, "c" =
+        change the folders, None = quit (from Project Helghast PR #11)."""
+        while True:
+            r = ask(f"Decrypted EBOOT of the {target} update" + (f" [{default}]" if default else "") +
+                    " (the file or its folder; Enter = check again, c = change the folders, q = quit): ").strip().strip('"')
+            if r.lower() in ("q", "c"):
+                return None if r.lower() == "q" else "c"
+            r = os.path.expanduser(r or default)
+            if not r:
+                return ""
+            if os.path.isfile(r):
+                return os.path.abspath(r)
+            hit = next((os.path.join(r, n) for n in ("EBOOT.elf", os.path.join("USRDIR", "EBOOT.elf"))
+                        if os.path.isdir(r) and os.path.isfile(os.path.join(r, n))), "")
+            if hit:
+                say(f"  using {os.path.abspath(hit)}")
+                return os.path.abspath(hit)
+            say(f"  not found: {r}")
+
+    target = EBOOT_VERS[Ctx(root=root, build=root).ver]["check"]
     prev = {}
     try:
         with open(os.path.join(os.path.abspath(a.build or os.path.join(root, "build")), "paths.json"),
@@ -1381,6 +1515,15 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
     # --check-first: the folders the installer wizard wrote to kz2-install.ini [paths] (launch.py passes them) are
     # checked before any question; the prompts come back only after a FAIL and c (from Project Helghast v0.1.3)
     given = bool(getattr(a, "check_first", False) and a.dump and a.update)
+    saved = ini_paths(root) if not (prev or a.dump or a.update or a.eboot) else {}
+    wrong = None    # after a FAIL and c: only the inputs the failed checks were about (INPUT_OF); None = all three
+    if saved and saved.get("wrong"):
+        # an earlier start stopped at a failed check (record_paths): check its answers first; the zip's run.cmd and a
+        # launcher without the wizard's folders get here (the launcher passes them with --check-first otherwise)
+        a.dump, a.update, a.eboot = saved["dump"], saved["update"], saved["eboot"]
+        given = True
+        notes.append("# answers of the last start (kz2-install.ini [paths]): checked first; it failed on "
+                     + saved["wrong"])
     if given:
         dump, upd = os.path.abspath(a.dump), os.path.abspath(a.update)
         elf = os.path.abspath(a.eboot) if a.eboot else ""
@@ -1394,38 +1537,68 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
         say("")
     while True:
         if not got and not skip:   # from RPCS3 or setup: the paths are filled in; a failed check falls back to asking
-            dump = folder("Disc dump: the folder holding PS3_GAME, or a decrypted .iso file", dump,
-                          resolve=_fc().resolve_dump, iso=True)
-            upd = folder("1.29 update folder (dev_hdd0/game/BCUS98116)", upd, resolve=_fc().resolve_update)
-            auto = os.path.join(upd, "USRDIR", "EBOOT.elf")
-            elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
-                (auto if os.path.isfile(auto) else "")
-            elf = folder("Decrypted EBOOT: the EBOOT.elf file or the folder holding it (Enter = the path in brackets, "
-                         "or find it)", elf, need_dir=False, inside=("EBOOT.elf", "USRDIR/EBOOT.elf"))
-            if _rpcs3().encrypted_eboot(elf):
-                say("  " + _rpcs3().HELP_ENCRYPTED)
+            if wrong is None or "dump" in wrong:
+                dump = folder("Disc dump: the folder holding PS3_GAME, or a decrypted .iso file", dump,
+                              resolve=_fc().resolve_dump, iso=True)
+            if wrong is None or "update" in wrong:
+                upd = folder("1.29 update folder (dev_hdd0/game/BCUS98116)", upd, resolve=_fc().resolve_update)
+            if wrong is None or "eboot" in wrong:
+                auto = os.path.join(upd, "USRDIR", "EBOOT.elf")
+                elf = elf or (prev.get("eboot", "") if prev.get("update") == upd else "") or \
+                    (auto if os.path.isfile(auto) else "")
+                elf = folder("Decrypted EBOOT: the EBOOT.elf file or the folder holding it (Enter = the path in brackets, "
+                             "or find it)", elf, need_dir=False, inside=("EBOOT.elf", "USRDIR/EBOOT.elf"))
+                if _rpcs3().encrypted_eboot(elf):
+                    say("  " + _rpcs3().HELP_ENCRYPTED)
         got = None
         while True:
-            rc, text = check(dump, upd, elf)
+            rc, text = check(dump, upd, elf, target)
             say(text.rstrip())
             notes.append("# interactive check")
             notes.extend(text.rstrip().splitlines())
+            a.fail_reasons = []
             if rc == 0:
                 break
+            checks = text_checks(text)
+            a.fail_reasons = check_reasons(checks)      # for the launcher's dialog when the player quits here
+            codes = {c["code"] for c in checks if c["level"] == "FAIL"}
+            inputs = {INPUT_OF.get(c) for c in codes}
+            if codes == {"E1"} and elf and os.path.isfile(elf):
+                # only the chosen EBOOT is wrong (another version, e.g. the disc's 1.01 one): ask for it again, not
+                # for the folders (from Project Helghast PR #11; no EBOOT at all keeps the question below)
+                say("")
+                say(EBOOT_AGAIN.format(want=target, usrdir=os.path.join(upd, "USRDIR") if upd else "USRDIR"))
+                auto = os.path.join(upd, "USRDIR", "EBOOT.elf") if upd else ""
+                new = pick_eboot(auto if auto and os.path.isfile(auto) and not _same_file(auto, elf) else "")
+                notes.append("# EBOOT asked again after E1")
+                if new is None:
+                    record_paths(root, dump, upd, elf, {"eboot"})
+                    return False
+                if new == "c":
+                    skip, wrong = False, {"eboot"}
+                    break
+                elf = new or elf
+                continue
             if "U0" in text or "U1" in text or "U2" in text or "E1" in text:
                 say("")
                 say(UPDATE_HELP)
             r = ask("Fix the FAIL lines, then Enter = check again, c = change the folders, q = quit: ").strip().lower()
             if r.startswith("q"):
+                record_paths(root, dump, upd, elf, {i for i in inputs if i} or {"dump", "update", "eboot"})
                 return False
             if r.startswith("c"):
-                skip = False       # change the folders: the prompts come back, starting from these answers
+                # change the folders: the prompts come back for the inputs that failed, starting from these answers
+                skip, wrong = False, (inputs if inputs and None not in inputs else None)
+                if wrong:
+                    notes.append("# asked again: " + ", ".join(sorted(wrong)))
                 break
         if rc == 0:
             break
     a.dump, a.update, a.eboot = dump, upd, elf
+    if ini_paths(root).get("wrong"):
+        record_paths(root, dump, upd, elf)     # they pass now: the next start has nothing to ask again
     say("")
-    if given:   # the wizard already asked the rest and wrote kz2-install.ini; the launcher asked "Build it now?"
+    if given and answered(root):   # the wizard already asked the rest and wrote kz2-install.ini; the launcher asked "Build it now?"
         notes.append("# setup's answers kept (kz2-install.ini)")
         return True
     online = False
@@ -1465,6 +1638,7 @@ class ConsoleBar:
         self.labels = {s.name: s.label for s in (steps or STEPS)}
         self.tty = out.isatty() if tty is None else tty
         self.shown_pct = -10.0
+        self.reasons = []
 
     def write(self, s):
         self.buf += s
@@ -1480,6 +1654,8 @@ class ConsoleBar:
         kv = dict(x.split("=", 1) for x in ln.split()[1:] if "=" in x)
         if ln.startswith("LOG "):
             self.out.write(f"Log: {kv.get('path', '')}\n")
+        elif ln.startswith("REASON "):
+            self.reasons.append(ln[len("REASON "):])
         elif ln.startswith("PROGRESS "):
             pct, name = float(kv.get("pct", 0)), kv.get("name", "")
             el = int(kv.get("elapsed", 0))
@@ -1501,9 +1677,13 @@ class ConsoleBar:
                 self.out.write(f"{end}Done in {el // 60}:{el % 60:02d}: the port is built.\n")
             elif kv.get("step") == "cancelled":
                 self.out.write(f"{end}Stopped. Run it again to resume where it stopped.\n")
+            elif kv.get("step") == "quit":      # the check's FAIL lines are on screen already
+                self.out.write(f"{end}Nothing was built. The next start checks your game files again.\n")
             else:
-                self.out.write(f"{end}The build stopped at step '{kv.get('step')}'. The log has the details; attach "
-                               "it to an issue: https://github.com/undecuple/project-pyrrhus/issues\n")
+                why = "".join(f"  {r}\n" for r in self.reasons)
+                self.out.write(f"{end}The build stopped at step '{kv.get('step')}'" + (f":\n{why}" if why else ".\n")
+                               + "The log has the details; attach it to an issue: "
+                               "https://github.com/undecuple/project-pyrrhus/issues\n")
         self.out.flush()
 
 
@@ -1578,6 +1758,8 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
         log.write(line)
     if quit_early:
         log.write("# the player quit before the build")
+        if getattr(a, "fail_reasons", None):   # quit at a failed check: the launcher's dialog says why
+            r.failed("quit", *a.fail_reasons)
         log.close()
         return 1
     if os.name != "nt":
@@ -1585,8 +1767,12 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     try:
         rc = r.run()
     except Exception as e:   # always end with a RESULT line: the Inno wizard waits for one
-        r.emit(f"internal error: {e!r}")
-        rc = r.result(False, "internal")
+        rc = r.failed("internal", f"internal error: {e!r}")
+    if rc == 1 and r.fail_inputs is not None:
+        # the check step failed: the next start (launcher --check-first, the zip's run.cmd) checks these answers first
+        # and asks again only for the failed inputs (record_paths)
+        record_paths(root, ctx.iso or ctx.dump, ctx.update, a.eboot and ctx.eboot,
+                     {i for i in r.fail_inputs if i} or {"dump", "update", "eboot"})
     if rc == 0 and a.interactive and getattr(a, "rpcs3_saves", None):   # optional, asked separately, after the setup
         try:
             import launch

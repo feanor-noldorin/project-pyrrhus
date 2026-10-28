@@ -25,6 +25,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import firstrun as fr  # noqa: E402
@@ -561,6 +562,41 @@ def main():
         ui = FakeUI([True])
         la.main(["--root", root, "--repair"], ui=ui, run=lambda a, **k: calls.append(a) or 0, environ=env)
         check(calls and "--interactive" in calls[0] and "not built" in ui.asked[0], "10 never built -> first build")
+
+        # 11 (after Project Helghast PR #11): the dialog after a failed first run shows firstrun.py's
+        # REASON lines from its status file (logs/firstrun-status.txt, passed with --status-file); a stale file is not used
+        check(calls and calls[0][calls[0].index("--status-file") + 1] == os.path.join(root, la.FIRSTRUN_STATUS),
+              f"11 the first-run command passes the status file {calls[:1]}")
+        why = "this EBOOT is the disc's 1.01 one (16,381,928 bytes); this release needs the EBOOT of the 1.29 update"
+
+        def failing(step, reasons):
+            def run11(argv, **kw):
+                sf = argv[argv.index("--status-file") + 1]
+                os.makedirs(os.path.dirname(sf), exist_ok=True)
+                with open(sf, "w", encoding="utf-8") as f:
+                    f.write("LOG path=x\n" + f"RESULT ok=0 step={step} elapsed=1\n" +
+                            "".join(f"REASON {r}\n" for r in reasons))
+                return 1
+            return run11
+        ui = FakeUI([True])
+        rc = la.main(["--root", root], ui=ui, run=failing("check", [why]), environ=env)
+        check(rc == 1 and ui.infos and why in ui.infos[-1] and "asks again only for" in ui.infos[-1]
+              and ui.infos[-1].index(why) < ui.infos[-1].index("log"), f"11 the reason in the dialog, before the log: {ui.infos}")
+        ui = FakeUI([True])
+        la.main(["--root", root], ui=ui, run=failing("quit", [why]), environ=env)
+        check(ui.infos and ui.infos[-1].startswith("Your game files did not pass the check") and why in ui.infos[-1],
+              f"11 quit at a failed check: its own first line {ui.infos}")
+        ui = FakeUI([True])
+        la.main(["--root", root], ui=ui, run=failing("compile", ['the step "Compiling" failed (exit 1): a.c:1: error: x']),
+                environ=env)
+        check(ui.infos and "error: x" in ui.infos[-1] and "asks again" not in ui.infos[-1],
+              f"11 a compile failure: the reason, no ask-again line {ui.infos}")
+        st = os.path.join(root, la.FIRSTRUN_STATUS)
+        os.utime(st, (time.time() - 3600, time.time() - 3600))
+        ui = FakeUI([True])
+        la.main(["--root", root], ui=ui, run=lambda a, **k: 1, environ=env)
+        check(ui.infos and "error: x" not in ui.infos[-1] and "(code 1)" in ui.infos[-1],
+              f"11 control: an older status file is not shown {ui.infos}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("test_launch:", "FAIL" if FAILS else "PASS")

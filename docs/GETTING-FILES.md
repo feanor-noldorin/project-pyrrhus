@@ -8,11 +8,16 @@ update and adding the game there, see RPCS3's documentation.
 
 ## The three inputs
 
-| Input | What to pick in the setup | The folder or file must contain | Quick self-check |
-|---|---|---|---|
-| Disc dump | The folder that holds `PS3_GAME`, or a decrypted `.iso` file | `PS3_GAME/PARAM.SFO`, `PS3_GAME/USRDIR/EBOOT.BIN` and the game archive `PS3_GAME/USRDIR/data_ps3.psarc` (about 6.5 GiB), or its parts `data_ps3.psarc.66600`, `.66601`, ... with no gap | Open the folder: you see `PS3_GAME`, and inside it `PARAM.SFO` and `USRDIR` |
-| 1.29 update | The update folder (on a PS3 or in RPCS3 it is `dev_hdd0/game/BCUS98116`) | `PARAM.SFO`, `USRDIR/EBOOT.BIN`, `USRDIR/added_data_ps3.psarc` and the folder `USRDIR/patch_data_ps3` | `PARAM.SFO` sits next to `USRDIR`; its `APP_VER` is 01.29 |
-| Decrypted 1.29 EBOOT | The file `EBOOT.elf`, or the folder that holds it | A 64-bit PowerPC ELF file, not the encrypted `EBOOT.BIN` | The file starts with the letters `ELF`; an encrypted file starts with `SCE`. The 1.29 one is 16,455,144 bytes |
+| Input | What to pick in the setup | The folder or file must contain | It does not hold | Quick self-check |
+|---|---|---|---|---|
+| Disc dump | The folder that holds `PS3_GAME`, or a decrypted `.iso` file | `PS3_GAME/PARAM.SFO`, `PS3_GAME/USRDIR/EBOOT.BIN` and the game archive `PS3_GAME/USRDIR/data_ps3.psarc` (D3; about 6.5 GiB), or its parts `data_ps3.psarc.66600`, `.66601`, ... with no gap | The update's files | Open the folder: you see `PS3_GAME`, and inside it `PARAM.SFO` and `USRDIR` |
+| 1.29 update | The update folder (on a PS3 or in RPCS3 it is `dev_hdd0/game/BCUS98116`) | `PARAM.SFO` (U1) and `USRDIR/EBOOT.BIN` (U2). Also the update's own archive `USRDIR/added_data_ps3.psarc` and its folder `USRDIR/patch_data_ps3` (U3: the check only warns without them, the setup's update page asks for the archive) | The disc archive `data_ps3.psarc`: that one is only on the disc. Do not copy it into the update folder | `PARAM.SFO` sits next to `USRDIR`; its `APP_VER` is 01.29 |
+| Decrypted 1.29 EBOOT | The file `EBOOT.elf`, or the folder that holds it. It is made from the 1.29 update's `USRDIR/EBOOT.BIN` (in the update folder, for example `dev_hdd0/game/BCUS98116/USRDIR`), not from the disc's `PS3_GAME/USRDIR/EBOOT.BIN` | A 64-bit PowerPC ELF file, not the encrypted `EBOOT.BIN` (E1) | The disc's EBOOT, which is version 1.01: the setup's EBOOT page refuses it and names the update's `USRDIR` folder, and the first-run check stops on it (E1) | The file starts with the letters `ELF`; an encrypted file starts with `SCE`. The 1.29 one is 16,455,144 bytes, the disc's 1.01 one 16,381,928 |
+
+**Pick the folder or the file itself, not the drive that holds it.** If drive `E:` holds `Killzone 2.iso`, pick
+`E:\Killzone 2.iso`; `E:\` alone is a dump only when `PS3_GAME` sits right on that drive. The update is the
+`BCUS98116` folder, not the drive or the `dev_hdd0` folder above it. A drive picked by mistake fails D1 to D3 for the
+disc, or U1 and U2 for the update, even when the files on it are fine.
 
 When `USRDIR/EBOOT.elf` is already inside the update folder, the setup offers it as the EBOOT. When you give a folder
 instead of the file, the setup looks for `EBOOT.elf` in it and in its `USRDIR` folder, and says where it looked when it
@@ -21,7 +26,11 @@ the EBOOT itself, and this project gives no decryption tools or instructions.
 
 You give these once. The setup writes them into the install folder's `kz2-install.ini`. If you did not tick "Build
 now", or a check failed, the first start of the game shows the check in a console window and starts from the folders
-you gave in the setup; it asks for folders again only when you choose to change them.
+you gave in the setup. When the check fails, the setup's message box, the dialog of `Project Pyrrhus.exe` and the portable zip's
+console show the reason (the same text as the log). On the next start the check runs first. When only the EBOOT is
+wrong (E1), it asks for the EBOOT again and offers the update's `USRDIR/EBOOT.elf` when there is one. Otherwise, when
+you choose to change the folders, it asks only for the inputs whose checks failed (the disc for D, I and A codes, the
+update for U codes).
 
 ## Accepted layouts
 
@@ -46,8 +55,9 @@ you gave in the setup; it asks for folders again only when you choose to change 
   written and locks them. The setup refuses such a folder, and the first-run check refuses an install or build folder
   inside OneDrive (O1). Game files inside OneDrive are fine when they are on this device; files that are only online
   are refused before anything is read (O2): right-click the folder and choose "Always keep on this device" first.
-- **EBOOT version.** The port is built on the 1.29 EBOOT. The disc's own 1.01 EBOOT is recognised and refused with a
-  note.
+- **EBOOT version.** The port is built on the 1.29 EBOOT. The disc's own 1.01 EBOOT is recognised by its size and
+  refused: on the setup's EBOOT page (a silent install with `/EBOOT=` stops with the same text) and by the first-run
+  check (E1). The message names the update's `USRDIR` folder, where the 1.29 one is.
 
 ## What the first-run check can print
 
@@ -70,7 +80,7 @@ A `WARN` lets it go on. The full log is next to the installer (or in the install
 | U1 | OK / WARN / FAIL | FAIL: the update's `PARAM.SFO` is missing, unreadable, not BCUS98116 or not the disc's title id. WARN: its version is not 01.29 | Pick the 1.29 update folder |
 | U2 | OK / FAIL | `USRDIR/EBOOT.BIN` is missing in the update folder | Pick the folder that holds `PARAM.SFO` and `USRDIR` |
 | U3 | OK / WARN | `USRDIR/added_data_ps3.psarc` is missing or does not start with `PSAR`, or the `USRDIR/patch_data_ps3` folder is missing: the update's data would be missing | Use a complete update folder |
-| E1 | OK / WARN / FAIL | FAIL: no decrypted `EBOOT.elf` was found, or it is not a 64-bit PowerPC ELF. WARN: it is the disc's 1.01 EBOOT, another version, or an unknown size | Pick the decrypted EBOOT of the 1.29 update |
+| E1 | OK / WARN / FAIL | FAIL: no decrypted `EBOOT.elf` was found, it is not a 64-bit PowerPC ELF, or it is the disc's 1.01 EBOOT (or another known version). WARN: an unknown size | Pick the decrypted EBOOT of the 1.29 update, from the update's `USRDIR` folder |
 | H1 | OK / WARN | The EBOOT is compared with the known 1.29 one. A WARN means it differs or could not be compared | The build may still work if it is a 1.29 EBOOT; if the build fails, check the file |
 
 The build can also stop later with a plain message (no code):

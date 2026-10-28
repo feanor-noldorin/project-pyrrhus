@@ -91,6 +91,10 @@
 #define LauncherExe "Project Pyrrhus.exe"
 #define FileBase "Project-Pyrrhus"
 #define SetupBase "Project-Pyrrhus-setup"
+; the EBOOT version this release is built for (firstrun.py EBOOT_VERS, tools/lift.sh VER default 129) and the disc's
+; own one (firstrun_check.py EBOOT_ELF_SIZES); the sizes and hashes stay in eboot_sha256.json
+#define EbootTarget "1.29"
+#define DiscEboot "1.01"
 
 [Setup]
 AppId={{5C5D4C2E-8AE0-4446-BEC0-560BC45B6E20}
@@ -193,6 +197,8 @@ Source: "{#Payload}\kz2-setup\release\version_check.py"; DestDir: "{tmp}\vcheck"
 ; The manual EBOOT page asks rpcs3_import.py whether the picked file is still encrypted (before anything is installed)
 Source: "{#Payload}\kz2-setup\release\rpcs3_import.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
 Source: "{#Payload}\kz2-setup\release\rpcs3_locate.py"; DestDir: "{tmp}\vcheck"; Flags: dontcopy
+; The EBOOT page's version test reads firstrun_check's own table of known EBOOTs (size, SHA-256), not a copy of it
+Source: "{#Payload}\kz2-setup\release\eboot_sha256.json"; Flags: dontcopy
 ; run.cmd is the portable zip's entry point (firstrun.py --interactive); the installed copy uses the launcher
 Source: "{#Payload}\*"; DestDir: "{app}"; Excludes: "run.cmd"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; The wildcard above leaves out dot files (ISCC under Wine sees them as hidden; VM kit pre-flight): the toolkit's
@@ -324,6 +330,10 @@ var
   CheckBtn, ReleaseBtn: TNewButton;
   CheckLbl: TNewStaticText;
   ReleaseURL: String;
+  { why the build stopped: firstrun.py's REASON lines after RESULT ok=0 in the status file (from Project Helghast PR #11) }
+  BuildReason, BuildFailStep: String;
+  { the EBOOT page's version test, once per picked file (hashing 16 MB on every page change would stall the wizard) }
+  EbootTested, EbootTestResult, EbootTableText: String;
 
 function LogName: String;
 begin
@@ -416,15 +426,25 @@ end;
 procedure ShowBuildError;
 var
   R: Integer;
+  Why, Again: String;
 begin
   { Shown while the build page is still up (its header, not "Installing", behind it). Three labels
-    for Yes/No/Cancel: the third is "Close" (KZ3 wizard test). }
+    for Yes/No/Cancel: the third is "Close" (KZ3 wizard test). The failing step's own reason comes first, the same
+    text as the log (from Project Helghast PR #11: the box said only where the log is). }
+  Why := '';
+  if BuildReason <> '' then Why := BuildReason + #13#10 + #13#10;
+  if BuildFailStep = 'check' then
+    Again := 'Fix this, then start {#AppName} again: it checks your game files first and asks again only for the ' +
+      'ones that are wrong. To report it, attach this log on the issues page; it holds no personal folders and ' +
+      'nothing of the game.'
+  else
+    Again := 'Start {#AppName} again: it resumes where it stopped. To report it, attach this log on the issues ' +
+      'page; it holds no personal folders and nothing of the game.';
   repeat
     R := TaskDialogMsgBox('The build did not finish.',
       { A path has no spaces to wrap at: it ran past the dialog's edge (KZ3 wizard test); "Open log" opens it }
-      'The log is at:' + #13#10 + MinimizePathName(InstallLogPath(''), WizardForm.Font, ScaleX(380)) + #13#10 + #13#10 +
-      'Start Project Pyrrhus again: it resumes where it stopped. To report it, attach this log on the issues ' +
-      'page; it holds no personal folders and nothing of the game.',
+      Why + 'The log is at:' + #13#10 + MinimizePathName(InstallLogPath(''), WizardForm.Font, ScaleX(380)) + #13#10#13#10 +
+      Again,
       mbError, MB_YESNOCANCEL, ['Open log', 'Report a problem', 'Close'], 0);
     if R = IDYES then OpenURL(InstallLogPath(''))
     else if R = IDNO then OpenURL('{#ProjectURL}/issues');
@@ -554,12 +574,6 @@ end;
 
 { Before any file is written, for the wizard and for silent installs with /DIR= alike (a silent install never clicks
   Next on the folder page) }
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  Result := InstallDirProblem(ExpandConstant('{app}'));
-  if Result <> '' then Log('install folder refused: ' + Result);
-end;
-
 { Dump and update pages (adapted from Project Helghast v0.1.2): a pick one or two levels too deep is stepped
   up, and the disc's TITLE_ID is read from PARAM.SFO and named. Quick checks only; firstrun_check.py (D1-D3, U1-U3,
   E1) runs as the build's first step and repeats them. }
@@ -707,6 +721,138 @@ begin
       '(dev_hdd0\game\' + DiscId + ').';
 end;
 
+{ eboot_sha256.json (firstrun_check.py's table, extracted from the setup on first use): per known EBOOT version
+  an object with its size and sha256. '' when it cannot be read (then no EBOOT is refused). From Project Helghast PR #11. }
+function EbootTable: String;
+var
+  A: AnsiString;
+begin
+  if EbootTableText = '' then begin
+    try
+      ExtractTemporaryFile('eboot_sha256.json');
+      if LoadStringFromFile(ExpandConstant('{tmp}\eboot_sha256.json'), A) then EbootTableText := String(A);
+    except
+      Log('EBOOT table: not readable (' + GetExceptionMessage + '); the EBOOT page checks only that the file exists');
+    end;
+    if EbootTableText = '' then EbootTableText := '-';
+  end;
+  Result := EbootTableText;
+  if Result = '-' then Result := '';
+end;
+
+{ The digits after '"Key": ' in Text ('' if none) }
+function JsonNumber(Text, Key: String): String;
+var
+  P, I: Integer;
+begin
+  Result := '';
+  P := Pos('"' + Key + '": ', Text);
+  if P = 0 then Exit;
+  I := P + Length(Key) + 4;
+  while (I <= Length(Text)) and (Text[I] >= '0') and (Text[I] <= '9') do begin
+    Result := Result + Text[I];
+    I := I + 1;
+  end;
+end;
+
+{ The string after '"Key": "' in Text, up to the next quote ('' if none) }
+function JsonString(Text, Key: String): String;
+var
+  P: Integer;
+begin
+  Result := '';
+  P := Pos('"' + Key + '": "', Text);
+  if P = 0 then Exit;
+  Result := Copy(Text, P + Length(Key) + 5, MaxInt);
+  P := Pos('"', Result);
+  if P > 0 then Result := Copy(Result, 1, P - 1) else Result := '';
+end;
+
+{ The known version of the EBOOT at Path by its size, the way firstrun_check E1 tells it (EBOOT_ELF_SIZES, the same
+  sizes as the table); How says whether the SHA-256 matches the table's too (H1). '' = not a known EBOOT. }
+function EbootVersionOf(Path: String; var How: String): String;
+var
+  T, R, K, S, V, Want, Got: String;
+  P, Q, E: Integer;
+  Size: Int64;
+begin
+  Result := '';
+  How := '';
+  T := EbootTable;
+  if (T = '') or not FileSize64(Path, Size) then Exit;
+  R := T;
+  P := Pos('": ' + #123, R);
+  while P > 0 do begin
+    K := Copy(R, 1, P - 1);
+    Q := Length(K);
+    while (Q > 0) and (K[Q] <> '"') do Q := Q - 1;
+    V := Copy(K, Q + 1, MaxInt);
+    S := Copy(R, P, MaxInt);
+    E := Pos('}', S);
+    if E > 0 then S := Copy(S, 1, E);
+    if (JsonNumber(S, 'size') <> '') and (StrToInt64Def(JsonNumber(S, 'size'), -1) = Size) then begin
+      Result := V;
+      Want := Lowercase(JsonString(S, 'sha256'));
+      try
+        Got := Lowercase(GetSHA256OfFile(Path));
+      except
+        Got := '';
+      end;
+      if (Want <> '') and (Got = Want) then How := 'size and SHA-256' else How := 'size only, SHA-256 ' + Got;
+      Exit;
+    end;
+    R := Copy(R, P + 4, MaxInt);
+    P := Pos('": ' + #123, R);
+  end;
+end;
+
+{ '' when the EBOOT may be used; else why not: a known EBOOT of another version than this release's, such as the
+  disc's own one (from Project Helghast PR #11, its issue #8: the page took the disc's EBOOT and the build stopped
+  later, with the reason only in the log). UpdateDir names the update's USRDIR in the message. An unknown EBOOT
+  passes, as before (the build's first step checks it). Tested once per file name. }
+function EbootProblem(Path, UpdateDir: String): String;
+var
+  V, How, Usr: String;
+begin
+  if CompareText(Path, EbootTested) = 0 then begin
+    Result := EbootTestResult;
+    Exit;
+  end;
+  Result := '';
+  V := EbootVersionOf(Path, How);
+  if V <> '' then Log('EBOOT: ' + V + ' (by ' + How + ')') else Log('EBOOT: not a known size; the build checks it');
+  if (V <> '') and (V <> '{#EbootTarget}') then begin
+    if UpdateDir <> '' then Usr := AddBackslash(UpdateDir) + 'USRDIR'
+    else Usr := 'dev_hdd0\game\BCUS98116\USRDIR';
+    if V = '{#DiscEboot}' then Result := 'This is the disc''s {#DiscEboot} EBOOT.'
+    else Result := 'This is the ' + V + ' EBOOT.';
+    Result := Result + ' This release needs the EBOOT of the {#EbootTarget} update: EBOOT.elf, the decrypted form ' +
+      'of EBOOT.BIN in the update''s USRDIR folder:' + #13#10 + Usr + #13#10 +
+      '(usually dev_hdd0\game\BCUS98116\USRDIR).' + #13#10 + #13#10 + 'Pick that file, then press Next.';
+  end;
+  EbootTested := Path;
+  EbootTestResult := Result;
+end;
+
+{ The install folder (OneDrive and the like), and for a silent install a known EBOOT of another version given with
+  /EBOOT= (the same text as the EBOOT page): Setup ends with exit code 7 and nothing is installed. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  E: String;
+begin
+  Result := InstallDirProblem(ExpandConstant('{app}'));
+  if Result <> '' then Log('install folder refused: ' + Result);
+  E := ExpandConstant('{param:EBOOT|}');
+  if (Result = '') and WizardSilent and (E <> '') and FileExists(E) then begin
+    if EbootProblem(E, ResolveUpdate(ExpandConstant('{param:UPDATE|}'))) <> '' then begin
+      Result := 'Silent install stopped: ' + E + ': ' +
+        EbootProblem(E, ResolveUpdate(ExpandConstant('{param:UPDATE|}')));
+      { one line in the log next to setup.exe }
+      SaveStringToFile(InstallLogPath(''), Result + #13#10, True);
+    end;
+  end;
+end;
+
 { "Browse for ISO file...": the folder page's own Browse picks folders only }
 procedure DumpIsoClick(Sender: TObject);
 var
@@ -782,9 +928,10 @@ begin
     'PS3: copy dev_hdd0\game\BCUS98116 from the console.', False, '');
   UpdatePage.Add('1.29 update folder (BCUS98116):');
   EbootPage := CreateInputFilePage(UpdatePage.ID, 'Decrypted EBOOT',
-    'The 1.29 EBOOT, decrypted.',
-    'The port cannot decrypt it. It needs a decrypted EBOOT.elf, made from your own copy, in the update''s USRDIR folder. ' +
-    'This project ships no decryption tools or instructions.');
+    'The 1.29 update''s EBOOT, decrypted.',
+    'The port cannot decrypt it. It needs EBOOT.elf, the decrypted form of EBOOT.BIN in the 1.29 update''s USRDIR ' +
+    'folder (dev_hdd0\game\BCUS98116\USRDIR), made from your own copy. Not the disc''s PS3_GAME\USRDIR\EBOOT: ' +
+    'that one is 1.01, and this release needs the 1.29 one. This project ships no decryption tools or instructions.');
   EbootPage.Add('EBOOT.elf:', 'ELF files (*.elf)|*.elf|All files|*.*', '.elf');
   { Install over an earlier version: the folders picked last time (RegisterPreviousData) }
   { RPCS3 is offered first when its usual folder exists here (display only; rpcs3_import.py does the real search) }
@@ -1036,6 +1183,12 @@ begin
       MsgBox('No decrypted EBOOT here. The port cannot decrypt it. It needs a decrypted EBOOT.elf, made from ' +
         'your own copy, in that folder.', mbError, MB_OK);
       Result := False;
+    end else begin
+      Problem := EbootProblem(EbootPage.Values[0], UpdatePage.Values[0]);
+      if Problem <> '' then begin
+        MsgBox(Problem, mbError, MB_OK);
+        Result := False;
+      end;
     end;
   end;
 end;
@@ -1209,7 +1362,7 @@ var
   Page: TOutputProgressWizardPage;
   Py, Script, Status, Params, L, Name, Pct: String;
   Lines: TArrayOfString;
-  RC, Elapsed, P: Integer;
+  RC, Elapsed, P, I: Integer;
   Finished: Boolean;
 begin
   DumpDir := DumpPage.Values[0];
@@ -1291,6 +1444,14 @@ begin
           Finished := True;
           BuildOK := Field(L, 'ok') = '1';
           BuildStopped := Field(L, 'step') = 'cancelled';
+          BuildFailStep := Field(L, 'step');
+          { firstrun.py writes the RESULT line and its REASON lines in one replace of the file }
+          BuildReason := '';
+          for I := 2 to GetArrayLength(Lines) - 1 do
+            if Pos('REASON ', Lines[I]) = 1 then begin
+              if BuildReason <> '' then BuildReason := BuildReason + #13#10;
+              BuildReason := BuildReason + Copy(Lines[I], 8, MaxInt);
+            end;
         end else if Pos('PROGRESS ', L) = 1 then begin
           Name := Field(L, 'name');
           Elapsed := StrToIntDef(Field(L, 'elapsed'), 0);
@@ -1311,6 +1472,7 @@ begin
       Page.SetText('Build stopped', 'Start Project Pyrrhus to resume it.')
     else if not BuildOK then begin
       Page.SetText('The build did not finish', 'The install log says why.');
+      if BuildReason <> '' then Log('build stopped at ' + BuildFailStep + ': ' + BuildReason);
       if WizardSilent then Log('build: did not finish; the install log says why')
       else ShowBuildError;
     end;

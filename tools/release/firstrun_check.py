@@ -15,7 +15,9 @@ file sizes and the hashes (H1: the decrypted EBOOT; A1: the disc archive, unless
   --update  the installed 1.29 update folder, where a PS3 or RPCS3 keeps it: .../dev_hdd0/game/BCUS98116 (the update
             installs under the disc's own title id; holds PARAM.SFO and USRDIR/EBOOT.BIN)
   --eboot   the decrypted EBOOT (an ELF); default: <update>/USRDIR/EBOOT.elf, else <dump>/PS3_GAME/USRDIR/EBOOT.elf
-            (next to EBOOT.BIN), else an EBOOT.BIN that is already an ELF
+            (next to EBOOT.BIN), else an EBOOT.BIN that is already an ELF. E1 FAILs on a known EBOOT of another
+            version than --target (the disc's 1.01 one on the 1.29 build: the message names the update's USRDIR
+            folder; from Project Helghast PR #11); an unknown size only warns
   --hashes  expected EBOOT SHA-256 per version; default eboot_sha256.json next to this script. H1 checks
             the ELF's SHA-256 against it: a mismatch is a WARN with the size and both hashes (never a FAIL: the build
             only needs a 1.29 EBOOT that lifts); an empty value means "unknown yet" and also only warns.
@@ -519,7 +521,7 @@ def check_update(r, upd, disc_id=None):
         r.warn("U3", f"1.29 update: no USRDIR/{UPDATE_PATCH_DIR}/ (the update's patch files)")
 
 
-def check_eboot_elf(r, elf, target="1.29"):
+def check_eboot_elf(r, elf, target="1.29", update=None):
     if not os.path.isfile(elf):
         r.fail("E1", f"no decrypted EBOOT at {elf}: the port cannot decrypt it; it needs a decrypted EBOOT.elf, made from your own copy, there")
         return
@@ -538,12 +540,21 @@ def check_eboot_elf(r, elf, target="1.29"):
     if ver == target:
         r.ok("E1", f"decrypted EBOOT is the {ver} one ({size:,} bytes)")
     elif ver == "1.01":
-        r.warn("E1", f"decrypted EBOOT is the disc v1.01 one ({size:,} bytes); the port is built on {target}: "
-                     "install the 1.29 update and use its decrypted EBOOT.elf")
+        # a FAIL since an earlier change (as Project Helghast PR #11 did for its issue #8): as a WARN it passed the
+        # console's check and the build then stopped at firstrun's version test, so a restart reused the same EBOOT
+        r.fail("E1", f"this EBOOT is the disc's 1.01 one ({size:,} bytes); this release needs the EBOOT of the "
+                     f"{target} update: EBOOT.elf, the decrypted form of EBOOT.BIN in the update's USRDIR folder "
+                     f"({update_usrdir(update)}), not the disc's")
     elif ver:
-        r.warn("E1", f"decrypted EBOOT is the {ver} one ({size:,} bytes); this build is for the {target} EBOOT")
+        r.fail("E1", f"this EBOOT is the {ver} one ({size:,} bytes); this build is for the {target} EBOOT")
     else:
         r.warn("E1", f"decrypted EBOOT has an unknown size ({size:,} bytes): not 1.01 or 1.29; the lift fixups may not apply")
+
+
+def update_usrdir(update):
+    """Where the update's EBOOT lies, for the E1 message: <update>/USRDIR, else the usual console/RPCS3 place (the
+    update installs under the disc's own title id)."""
+    return os.path.join(update, "USRDIR") if update else os.path.join("dev_hdd0", "game", TITLE_ID, "USRDIR")
 
 
 def file_sha256(path):
@@ -666,7 +677,7 @@ def main(argv=None):
             cand += [os.path.join(a.dump, "PS3_GAME", "USRDIR", n) for n in ("EBOOT.elf", "EBOOT.BIN")]
         cand = cand or [os.path.join(os.path.dirname(os.path.abspath(a.dump)), "EBOOT.elf")]
         elf = next((c for c in cand if os.path.isfile(c) and head(c, 4) == ELF_MAGIC), cand[0])
-    check_eboot_elf(r, elf, a.target)
+    check_eboot_elf(r, elf, a.target, a.update)
     check_eboot_hash(r, elf, a.hashes)
     return finish(r, a)
 

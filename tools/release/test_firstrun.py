@@ -11,7 +11,9 @@ time, fallback to the temp folder; home-folder redaction; the install's logs/ co
 nothing and lists every step; the RAM -> jobs rule; cleaning stays inside the build folder; --interactive (portable
 zip): re-asks a missing folder, finds the EBOOT, runs the real check on synthetic fixtures, writes kz2-install.ini,
 shows a console bar instead of raw lines and logs the answers; a failed check shows the update help and offers
-check again / quit; the opt-in version check is asked first and logged; the console bar's compile count.
+check again / quit; the opt-in version check is asked first and logged; the console bar's compile count; a failed
+step's REASON lines (status file, stdout, console bar; case 17) and the disc's 1.01 EBOOT asked again on its own, the
+quit reasons for the launcher (case 18).
 """
 import hashlib
 import io
@@ -391,6 +393,25 @@ def main():
         go = fr.interactive(a12, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
                             check=lambda *x: (1, "FAIL D1: x\n"))
         check(go is False, "12 quit after a failed check")
+        # the quit records the answers and the failed input in kz2-install.ini [paths]; the next
+        # start with no arguments checks them first and asks only for that input
+        sp = fr.ini_paths(root12)
+        check(sp.get("dump") == d12 and sp.get("update") == u12 and sp.get("wrong") == "dump", f"12 [paths] recorded {sp}")
+        asked12r, res12r = [], iter([(1, "FAIL D1: x\n"), (0, "OK   D1: x\n")])
+        answers = iter(["c", d12])
+        go = fr.interactive(types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"),
+                                                  portable=False), root12, "x.log", [],
+                            ask=lambda q: (asked12r.append(q), next(answers))[1], out=io.StringIO(),
+                            check=lambda *x: next(res12r))
+        check(go is True and len(asked12r) == 2 and "Fix the FAIL" in asked12r[0] and asked12r[1].startswith("Disc dump")
+              and fr.ini_paths(root12).get("wrong") == "",
+              f"12 next start: checked first, c asks only the disc, the pass clears 'wrong': {asked12r}")
+        import configparser
+        cp12 = configparser.ConfigParser()
+        cp12.read(os.path.join(root12, "kz2-install.ini"), encoding="utf-8")
+        cp12.remove_section("paths")
+        with open(os.path.join(root12, "kz2-install.ini"), "w", encoding="utf-8") as f:
+            cp12.write(f)
         # 12d. folder answers one level too deep are stepped up (PS3_GAME/USRDIR, the update's USRDIR), and the EBOOT
         # question takes the folder holding EBOOT.elf, saying where it looked (adapted from Project Helghast v0.1.2 and v0.1.4)
         empty12 = os.path.join(t12, "empty")
@@ -399,7 +420,7 @@ def main():
         a12d = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t12, "b"), portable=False)
         answers = iter([os.path.join(d12, "PS3_GAME", "USRDIR"), os.path.join(u12, "USRDIR"), empty12, u12, "q"])
         fr.interactive(a12d, root12, "x.log", [], ask=lambda q: next(answers), out=o12d,
-                       check=lambda *x: (got.append(x), (1, "FAIL D1: x\n"))[1])
+                       check=lambda *x: (got.append(x[:3]), (1, "FAIL D1: x\n"))[1])
         o = o12d.getvalue()
         check(got == [(os.path.abspath(d12), os.path.abspath(u12), os.path.abspath(os.path.join(u12, "USRDIR", "EBOOT.elf")))]
               and "is a folder without EBOOT.elf or " in o and o.count("using ") == 3, f"12d folder answers: {got} {o[-400:]!r}")
@@ -414,20 +435,34 @@ def main():
         def chk12b(*x):
             seen.append(x)
             return next(res)
-        ini_before = open(os.path.join(root12, "kz2-install.ini")).read()
+        def ini_answers():     # the ini without [paths] (a pass clears its 'wrong' key)
+            t = open(os.path.join(root12, "kz2-install.ini")).read()
+            return re.sub(r"\[paths\][^\[]*", "", t)
+        ini_before = ini_answers()
         answers = iter([""])     # Enter = check again
         go = fr.interactive(a12b, root12, "x.log", notes12b, ask=lambda q: (asked.append(q), next(answers))[1],
                             out=io.StringIO(), check=chk12b)
         check(go is True and len(seen) == 2 and seen[0][:2] == (os.path.abspath(d12), os.path.abspath(u12))
               and len(asked) == 1 and any("checked first" in n for n in notes12b)
-              and open(os.path.join(root12, "kz2-install.ini")).read() == ini_before,
+              and ini_answers() == ini_before,
               f"12b check-first checks the given folders first, asks only after the FAIL, keeps the ini: {asked}")
-        answers = iter(["c", d12, u12, ""])
+        # c after a FAIL brings back only the prompt of the input that failed: U2 = the update
+        answers = iter(["c", u12, ""])
         asked.clear()
         res = iter([(1, "FAIL U2: x\n"), (0, "OK\n")])
         fr.interactive(a12b, root12, "x.log", [], ask=lambda q: (asked.append(q), next(answers))[1], out=io.StringIO(),
                        check=chk12b)
-        check(any("Disc dump" in q for q in asked), "12b c = change the folders brings the folder prompts back")
+        check(any("update folder" in q for q in asked) and not any("Disc dump" in q or "Decrypted EBOOT" in q
+                                                                    for q in asked),
+              f"12b c after a U2 FAIL asks only for the update folder: {asked}")
+        # control: an O1 FAIL (no single input) brings all three prompts back
+        answers = iter(["c", d12, u12, "", ""])
+        asked.clear()
+        res = iter([(1, "FAIL O1: x\n"), (0, "OK\n")])
+        fr.interactive(a12b, root12, "x.log", [], ask=lambda q: (asked.append(q), next(answers))[1], out=io.StringIO(),
+                       check=chk12b)
+        check(any("Disc dump" in q for q in asked) and any("update folder" in q for q in asked),
+              f"12b control: c after an O1 FAIL asks for all the folders: {asked}")
         o12c = io.StringIO()
         rc = fr.main(["--interactive", "--check-first", "--dump", d12, "--update", u12, "--root", root12,
                       "--log-dir", dl12, "--jobs", "1", "--log-name", "kz2-check-first.log"], steps=steps, out=o12c,
@@ -633,8 +668,95 @@ def main():
         answers = iter([os.path.join(t16, "nope.iso"), iso16, u12, "", "q"])
         a16 = types.SimpleNamespace(dump="", update="", eboot="", build=os.path.join(t16, "b"), portable=False)
         go = fr.interactive(a16, root12, "x.log", [], ask=lambda q: next(answers), out=io.StringIO(),
-                            check=lambda dd, uu, ee: (picked.append(dd), (1, "FAIL D1: x\n"))[1])
+                            check=lambda dd, uu, ee, *t: (picked.append(dd), (1, "FAIL D1: x\n"))[1])
         check(go is False and picked == [iso16], f"16 the console accepts a decrypted .iso as the dump: {picked}")
+
+        # 17 (from Project Helghast PR #11): a failed step says why. REASON lines before RESULT ok=0,
+        # in the status file after the RESULT line (the wizard's box, the launcher's dialog) and in the console bar;
+        # a run that passes has none.
+        why = "this EBOOT is the disc's 1.01 one (16,381,928 bytes); this release needs the EBOOT of the 1.29 update"
+        rep17 = json.dumps({"ok": False, "facts": {}, "checks": [
+            {"level": "OK", "code": "D1", "message": "disc fine"},
+            {"level": "FAIL", "code": "E1", "message": why},
+            {"level": "FAIL", "code": "U2", "message": "1.29 update: no USRDIR/EBOOT.BIN"}]})
+        chk17 = [fr.Step("check", "Checking the game files", 1,
+                         lambda c: [py(f"import sys; print({rep17!r}); sys.exit(1)")], always=True)]
+        sf17 = os.path.join(tmp, "st17", "status17.txt")     # its folder does not exist yet (the launcher's logs\)
+        rc, out = run(tmp, chk17, "--build", os.path.join(tmp, "b17"), "--status-file", sf17)
+        st = open(sf17).read().splitlines()
+        check(rc == 1 and st[1].startswith("RESULT ok=0 step=check") and st[2:] == [f"REASON {why}",
+              "REASON 1.29 update: no USRDIR/EBOOT.BIN"], f"17 status file: RESULT then the FAIL messages {st}")
+        lines = out.splitlines()
+        res17 = next(i for i, ln in enumerate(lines) if ln.startswith("RESULT "))
+        check(lines[res17 - 2:res17] == [f"REASON {why}", "REASON 1.29 update: no USRDIR/EBOOT.BIN"],
+              f"17 REASON lines right before RESULT: {lines[res17 - 3:res17 + 1]}")
+        ini17 = open(os.path.join(tmp, "root", "kz2-install.ini")).read()
+        check("wrong = eboot,update" in ini17 and f"dump = {os.path.join(tmp, 'dump')}" in ini17,
+              f"17 the check step's failed inputs recorded for the next start: {ini17!r}")
+        dl = os.path.join(tmp, "dl")
+        lg17 = next((open(os.path.join(dl, n)).read() for n in sorted(os.listdir(dl))
+                     if n.endswith(".log") and why in open(os.path.join(dl, n)).read()), "")
+        check("REASON " not in lg17 and why in lg17, "17 the log has the reason text, without the REASON tag")
+        cmp17 = [fr.Step("compile", "Compiling", 1, lambda c: [py("import sys; print('a.c:1: error: boom'); "
+                                                                     "print('ninja: build stopped'); sys.exit(1)")])]
+        rc, out = run(tmp, cmp17, "--build", os.path.join(tmp, "b17c"), "--status-file", sf17)
+        st = open(sf17).read().splitlines()
+        check(rc == 1 and st[2:] == ['REASON the step "Compiling" failed (exit 1): a.c:1: error: boom'],
+              f"17 a compile failure carries its error line: {st}")
+
+        def boom17(c):
+            raise fr.StepFailed("the 1.29 PPU override table is missing from this install")
+        rc, out = run(tmp, [fr.Step("lift", "Lifting", 1, boom17)], "--build", os.path.join(tmp, "b17l"),
+                      "--status-file", sf17)
+        st = open(sf17).read().splitlines()
+        check(rc == 1 and st[2:] == ["REASON the 1.29 PPU override table is missing from this install"],
+              f"17 StepFailed text is the reason: {st}")
+        rc, out = run(tmp, steps, "--build", os.path.join(tmp, "b17ok"), "--status-file", sf17)
+        check(rc == 0 and "REASON" not in out and "REASON" not in open(sf17).read(), "17 control: no REASON on success")
+        bar = io.StringIO()
+        fr.ConsoleBar(bar, chk17, tty=False).write(f"REASON {why}\nRESULT ok=0 step=check elapsed=3\n")
+        check("stopped at step 'check':\n  " + why in bar.getvalue(), f"17 console bar shows the reason: {bar.getvalue()!r}")
+        bar = io.StringIO()
+        fr.ConsoleBar(bar, chk17, tty=False).write("RESULT ok=0 step=check elapsed=3\n")
+        check("stopped at step 'check'.\n" in bar.getvalue(), "17 control: no reason, the old sentence")
+        check(fr.check_reasons(fr.text_checks("OK   D1: a\nFAIL D3: no archive\nWARN U3: x\nFAIL E1: old one\n"))
+              == ["no archive", "old one"], "17 text_checks + check_reasons: the FAIL messages in order")
+
+        # 18: --check-first with the disc's 1.01 EBOOT (the real firstrun_check): E1 fails at once and the console
+        # asks for the EBOOT again, not the folders; the 1.29 one offered there passes. A q at a failed check leaves
+        # REASON lines and RESULT step=quit in the status file (the launcher's dialog).
+        t18 = os.path.join(tmp, "t18")
+        d18, u18 = tfc.make_dump(t18), tfc.make_update(t18)
+        old18 = os.path.join(t18, "disc", "EBOOT.elf")
+        tfc.write_elf(old18, 16_381_928)
+        good18 = os.path.join(u18, "USRDIR", "EBOOT.elf")
+        a18 = types.SimpleNamespace(dump=d18, update=u18, eboot=old18, build=os.path.join(t18, "b"), portable=False,
+                                    check_first=True)
+        asked18 = []
+        answers = iter([""])     # Enter = the update's EBOOT.elf offered in brackets
+        o18 = io.StringIO()
+        go = fr.interactive(a18, root12, "x.log", [], ask=lambda q: (asked18.append(q), next(answers))[1], out=o18)
+        o = o18.getvalue()
+        check("FAIL E1" in o and "disc's 1.01 one" in o and "not the disc's" in o, f"18 E1 FAIL shown: {o[-500:]!r}")
+        check(asked18 and asked18[0].startswith("Decrypted EBOOT of the 1.29 update [" + good18 + "]")
+              and not any("Disc dump" in q or "update folder" in q for q in asked18),
+              f"18 the EBOOT is asked again first, with the update's one offered: {asked18[:2]}")
+        check(go is True and a18.eboot == good18 and "OK   E1" in o, f"18 the new EBOOT passes: {a18.eboot}")
+        asked18.clear()
+        answers = iter(["q"])
+        fr.interactive(types.SimpleNamespace(**{**vars(a18), "eboot": good18}), root12, "x.log", [],
+                       ask=lambda q: (asked18.append(q), next(answers))[1], out=io.StringIO(),
+                       check=lambda *x: (1, "FAIL D1: x\n"))
+        check(asked18 and "Fix the FAIL lines" in asked18[0], f"18 control: other FAILs keep the folder question {asked18}")
+        sf18 = os.path.join(t18, "status.txt")
+        o18 = io.StringIO()
+        rc = fr.main(["--interactive", "--check-first", "--dump", d18, "--update", u18, "--eboot", old18, "--root", root12,
+                      "--log-dir", dl12, "--jobs", "1", "--log-name", "kz2-quit.log", "--status-file", sf18],
+                     steps=steps, out=o18, ask=lambda q: "q")
+        st = open(sf18).read().splitlines()
+        check(rc == 1 and st[1].startswith("RESULT ok=0 step=quit") and len(st) == 3 and st[2].startswith("REASON ")
+              and "disc's 1.01 one" in st[2], f"18 quit at a failed check: the reasons in the status file {st}")
+        check("Nothing was built" in o18.getvalue(), f"18 quit: the console's last line {o18.getvalue()[-200:]!r}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("test_firstrun:", "PASS" if not FAILS else f"FAIL ({len(FAILS)})")

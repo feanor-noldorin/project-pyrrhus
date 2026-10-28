@@ -44,6 +44,9 @@ install), then firstrun.py --bar with the recorded paths: the check step always 
 hash), and every later step whose inputs fingerprint changed runs again (the others are kept; ninja recompiles what
 changed). Never built or inputs gone = the same questions as a normal start. Ends with a message; does not start the game.
 
+A first run or rebuild that ends with rc != 0: the dialog shows firstrun.py's REASON lines from
+<root>/logs/firstrun-status.txt (--status-file; only when this run wrote it), then where the log is (failure_text).
+
 launcher.log (<root>/logs): one "start: <action>" line and one "version: X.Y.Z (build stamp: ...)" line per start.
 
 --print: show the decision, the command, the working folder and the variables it sets, as JSON; starts nothing.
@@ -55,6 +58,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -71,6 +75,9 @@ ISSUES_URL = "https://github.com/undecuple/project-pyrrhus/issues"
 REPORT = f"\n\nTo report a problem, attach this log on the issues page: {ISSUES_URL}"
 GAME_VARS = ("KZ2_PAD_LAYOUT", "KZ2_PROMPTS", "KZ2_DISPLAY", "PS3_VFS_ROOT", "KZ2_UPDATE_DIR", "PS3_HDD0_ROOT", "PS3_EDAT_CACHE",
              "VKD3D_SHADER_CACHE_PATH")
+# firstrun.py --status-file: its last RESULT line and, after RESULT ok=0, the REASON lines (why it stopped), shown in
+# the launcher's dialog (after Project Helghast PR #11 did the same for its setup's box)
+FIRSTRUN_STATUS = os.path.join("logs", "firstrun-status.txt")
 VKD3D_CACHE = os.path.join("cache", "vkd3d")   # under the data folder (per user; the uninstaller's cache line removes it)
 
 
@@ -282,7 +289,8 @@ def firstrun_cmd(root, action, paths, portable, python):
     """The build command for an action other than run. A first build with the installer's folders in kz2-install.ini
     [paths] starts from them (checks them first; the console asks only after a FAIL or on c; from Project Helghast v0.1.3);
     without them, and for missing-inputs (the recorded folders are gone), the console asks."""
-    a = [python, os.path.join(HERE, "firstrun.py"), "--root", root, "--log-dir", root, "--log-name", FIRSTRUN_LOG]
+    a = [python, os.path.join(HERE, "firstrun.py"), "--root", root, "--log-dir", root, "--log-name", FIRSTRUN_LOG,
+         "--status-file", os.path.join(root, FIRSTRUN_STATUS)]
     given = setup_paths(root) if (action == "first-build" and not paths) else {}
     if given:
         a += ["--interactive", "--check-first", "--dump", given["dump"], "--update", given["update"]]
@@ -343,11 +351,12 @@ def repair(root, action, reason, paths, ini, ui, run):
     if not ui.ask(q):
         return 0
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    since = time.time()
     rc = run(firstrun_cmd(root, "rebuild" if action not in ("first-build", "missing-inputs") else action, paths,
                           ini["portable"], console_python()), creationflags=flags)
     after, _ = decide(root)
     if rc != 0 or after != "run":
-        ui.info(f"{did_not_finish(rc, 'The check or the build did not finish')}. {log_note(root)}")
+        ui.info(failure_text(root, rc, "The check or the build did not finish", since))
         return rc or 1
     ui.info(f"Verified: {checked} install files intact, your game files pass the checks and the port is up to date.")
     return 0
@@ -529,6 +538,38 @@ def log_note(root):
     return "No log was written yet: it starts with the first check."
 
 
+def stop_reasons(root, since):
+    """(step, [reasons]) from firstrun.py's status file when this run wrote it (not older than `since`, a time.time()
+    taken before the run), else ("", [])."""
+    p = os.path.join(root, FIRSTRUN_STATUS)
+    try:
+        if os.path.getmtime(p) < since - 2:
+            return "", []
+        with open(p, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return "", []
+    res = next((ln for ln in lines if ln.startswith("RESULT ok=0 ")), "")
+    step = dict(x.split("=", 1) for x in res.split()[1:] if "=" in x).get("step", "")
+    return step, [ln[len("REASON "):] for ln in lines if ln.startswith("REASON ")]
+
+
+def failure_text(root, rc, what, since):
+    """The dialog after a first-run or rebuild child ended with rc != 0: the reason firstrun.py gave (the same text as
+    its log), then where the log is. A failed or quit check says that the next start asks again for what was wrong."""
+    step, why = stop_reasons(root, since)
+    if step == "quit":
+        head = "Your game files did not pass the check, so nothing was built"
+    else:
+        head = did_not_finish(rc, what)
+    if not why:
+        return f"{head}. {log_note(root)}"
+    body = "\n".join(f"- {r}" for r in why)
+    again = ("\n\nFix this, then open Project Pyrrhus again: it checks your game files first and asks again only for "
+             "the ones that are wrong." if step in ("check", "quit") else "")
+    return f"{head}:\n\n{body}{again}\n\n{log_note(root)}"
+
+
 def spawn(argv, **kw):
     return subprocess.Popen(argv, **kw)
 
@@ -629,9 +670,10 @@ def main(argv=None, ui=None, run=run_wait, start=spawn, today=None, environ=None
         if not ui.ask(f"{reason}.\n\n{QUESTION[action]}"):
             return 0
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        since = time.time()
         rc = run(firstrun_cmd(root, action, paths, ini["portable"], console_python()), creationflags=flags)
         if rc != 0:
-            ui.info(f"{did_not_finish(rc, 'The build did not finish')}. {log_note(root)}")
+            ui.info(failure_text(root, rc, "The build did not finish", since))
             return rc
         ini = read_ini(root)   # --interactive may have written portable/check_updates
         action, reason = decide(root)
