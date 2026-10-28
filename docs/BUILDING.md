@@ -6,11 +6,11 @@ downloaded.
 
 There are two ways to get a build:
 
-- **The installer or portable zip (Windows): not released yet.** It checks your disc dump and the 1.29 update, then
-  lifts and compiles the game's code on your machine with a bundled compiler, behind one progress bar, with a full
-  log. The scripts and the installer definition are in this repository (`installer/`, `tools/release/`) and are tested
-  without the game; no setup program has been published. Releases will appear on the
-  [releases page](https://github.com/undecuple/project-pyrrhus/releases).
+- **The installer or portable zip (Windows), pre-release <!-- version -->[v0.1.1](https://github.com/undecuple/project-pyrrhus/releases/tag/v0.1.1)<!-- /version -->.**
+  It checks your disc dump and the 1.29 update, then lifts and compiles the game's code on your machine with a bundled
+  compiler, behind one progress bar, with a full log. Download it from the
+  [releases page](https://github.com/undecuple/project-pyrrhus/releases). The scripts and the installer definition are in this repository (`installer/`,
+  `tools/release/`) and are tested without the game.
 - **A developer build from source with Nix**, described below. It is how the port is developed and tested today, on
   Linux (see [Status](#status-of-the-linux-build)). macOS and Windows (inside WSL2) use the same commands but have not been tried (see
   [Building on macOS](#building-on-macos) and [Building on Windows](#building-on-windows)).
@@ -180,8 +180,8 @@ under Proton on Linux.
    flakes enabled, give WSL2 at least 16 GB of memory in `%UserProfile%\.wslconfig`, keep the repository in the
    Linux file system (not under `/mnt/c`), link your dump from `/mnt/...` as in step 1, and run the Steps 1 to 4. Then
    copy the result to a Windows folder as in route 1. No one has run this on WSL2.
-3. **The installer or portable zip:** when released, it does the lift and the build on Windows without WSL2 or Nix.
-   Not released yet.
+3. **The installer or portable zip:** it does the lift and the build on Windows without WSL2 or Nix (see the top of
+   this page).
 
 If you try either route, open an issue with your Windows version, GPU and driver, how far it got, and the log.
 

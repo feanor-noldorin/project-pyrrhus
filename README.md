@@ -46,9 +46,9 @@ Games.
 ## Status
 
 <p align="center">
-  <a href="docs/SCREENSHOTS.md"><img src="docs/screenshots/20261020_kz2-corinth-river-walkway.png" width="720"
-       alt="Killzone 2 running in the port: a soldier at the railing of a lit walkway in the first level"></a><br>
-  <sub>The port on 2026-10-20: a walkway in the first level, about 14 frames per second. More, by milestone: <a href="docs/SCREENSHOTS.md">screenshots</a>.</sub>
+  <a href="docs/SCREENSHOTS.md"><img src="docs/screenshots/20261028_kz2-corinth-river-in-play.png" width="720"
+       alt="Killzone 2 running in the port: the first level in first person, with the weapon, crosshair and ammo counter"></a><br>
+  <sub>The port on 2026-10-28: the first level in play. More, by milestone: <a href="docs/SCREENSHOTS.md">screenshots</a>.</sub>
 </p>
 
 As of 2026-10-27, on Windows x64, tested under Proton on Linux; the installer and first-run build also ran on Windows 10 in a virtual machine (no play there).
@@ -87,15 +87,17 @@ Online multiplayer, if it comes, will only use a self-hosted server you choose.
 
 ## Getting it
 
-**Nothing is released yet.** The port will be distributed as source code plus an installer (and a portable zip) that
-checks your own disc dump and the 1.29 update, then translates and builds the game's code on your own machine with a
-bundled compiler. No game code, assets or keys are ever shipped or downloaded. Until a release is published, the only
-way to try the port is to build it yourself (below). It is partly playable: the first level can be played with a pad
-(a scripted run gives about 23 frames per second, the PS3 30; hand play is not measured), and the rest of the
-campaign has not been tried.
+**Pre-release <!-- version -->[v0.1.1](https://github.com/undecuple/project-pyrrhus/releases/tag/v0.1.1)<!-- /version -->:** a Windows installer (recommended) and
+a portable zip, on the [releases page](https://github.com/undecuple/project-pyrrhus/releases) with a `.sha256` file for each and `SHA256SUMS`. They check your
+own disc dump, the 1.29 update and the decrypted EBOOT ([what each must contain](docs/GETTING-FILES.md)), then
+translate and build the game's code on your own machine with a bundled compiler. No game code, assets or keys are ever
+shipped or downloaded. You can also build the port yourself (below). It is partly playable: the first level can be
+played with a pad (a scripted run gives about 23 frames per second, the PS3 30; hand play is not measured), and the
+rest of the campaign has not been tried. What changed in each
+version: [CHANGELOG.md](CHANGELOG.md).
 
 A first release that calls itself playable waits for the conditions in [docs/RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md).
-Earlier builds are labelled preview or work in progress. There is no release date.
+Until then every release is a pre-release. There is no date for it.
 
 ## Requirements
 

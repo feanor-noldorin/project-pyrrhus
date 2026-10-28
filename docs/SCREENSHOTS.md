@@ -2,14 +2,23 @@
 
 Screenshots of the port running, one per milestone, newest first, picked from the dated screenshots taken during
 development. Each image carries a bar with the commit of the build it was taken on, what it shows and the project
-link; the top-left box gives the frame rate over the last 10 seconds before the shot, from the run's own frame log.
-Each frame rate is that build's own, so early screenshots show early speeds.
+link; up to 2026-10-20 a top-left box gives the frame rate over the last 10 seconds before the shot, from the run's
+own frame log. Each frame rate is that build's own, so early screenshots show early speeds; later screenshots carry
+no frame rate (see the README's Status for the measured numbers).
 
 **Test machine:** Intel Core i7-12700KF, NVIDIA GeForce RTX 4060, the Windows x64 build run under GE-Proton11-7 on
 Linux; the game renders at 1280x720.
 
 The game's imagery in these screenshots is © Sony Interactive Entertainment, shown only to document the port (see
 [NOTICE.md](../NOTICE.md)). They come from the developer's own copy of the game.
+
+## 2026-10-28 · The first level in play
+
+![Corinth River in first person: the weapon with its red-dot sight, the crosshair and the ammo counter, a fallen squad mate in front of an arched bridge](screenshots/20261028_kz2-corinth-river-in-play.png)
+
+The first level (Corinth River) in play from a scripted pad run, a few minutes in: the player's weapon, the crosshair
+and the ammo counter are drawn, and the level runs with its effects (sparks and smoke). This frame is taken from a
+recording of the run.
 
 ## 2026-10-20 · The first level at about 14 frames per second
 

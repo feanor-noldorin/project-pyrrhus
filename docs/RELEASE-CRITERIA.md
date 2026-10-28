@@ -1,13 +1,30 @@
 # Release criteria
 
-Project Pyrrhus has no release and no release date. The first release that calls itself **playable** waits for every
-point below; earlier builds are labelled preview or work in progress and say what is missing. This list, not a date,
-is what a release is measured against. Booting to a title screen, or to a black level, does not count.
+Project Pyrrhus has no playable release and no release date. Versions below 1.0.0 are previews: **v0.x = preview**,
+published as GitHub pre-releases, each saying what is missing ([CHANGELOG.md](../CHANGELOG.md),
+[known issues](KNOWN_ISSUES.md)). **v1.0.0 = the whole campaign playable start to finish at about the game's own 30
+frames per second.** The first release that calls itself **playable** waits for every point of the second list.
+Booting to a title screen, or to a black level, does not count. This list, not a date, is what a release is measured
+against.
+
+## Gates for a v0.x tag (preview)
+
+1. **CI green** on the commit that is tagged.
+2. **The release workflow builds** the installer and the portable zip from that commit.
+3. **Installer and portable zip tested in a Windows VM:** install, the first-run checks, the file layout, uninstall.
+4. **Known issues listed** in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+5. **SHA256SUMS** published beside the assets.
+6. **One version string** in the exe, the launcher, the installer and `CITATION.cff` (checked by
+   `tools/release/test_version_agree.py`).
+7. **Tags are never moved**; a fix is a new tag.
+8. **Published as a pre-release** while the version is 0.x.
+
+## Release criteria for v1.0.0 (playable)
 
 1. **Played start to finish by a person:** the whole campaign on one save, by hand, with a dated playthrough log
    (chapter, time, build, bugs met) published beside the release.
 2. **A picture first:** the game's frames are drawn correctly in the first level and compared with the PS3 emulator
-   RPCS3 on the same scene. Until then no release of any kind.
+   RPCS3 on the same scene.
 3. **Automated coverage:** a scripted sweep that loads and plays every chapter on the release build, longer runs per
    chapter logging asserts, stalls and frame rate, checkpoint save and reload, quit and continue, and the boot check.
 4. **Speed:** about 30 frames per second in levels on the recommended hardware (see

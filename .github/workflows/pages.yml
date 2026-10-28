@@ -1,14 +1,15 @@
 # GitHub Pages (adapted from Project Helghast, the Killzone 3 PC port: same author, MIT): publishes only site/ (the
-# generated project page, tools/release/website.py) and the banner images it loads from assets/. Dormant until the
+# generated project page, tools/release/website.py), the banner images it loads from assets/ and the screenshots it
+# shows from docs/screenshots/. Dormant until the
 # maintainer sets the repository variable PAGES_ENABLED to "true" (Settings, Secrets and variables, Actions, Variables)
 # and Settings, Pages, Source to "GitHub Actions": without the variable both jobs are skipped on every push.
-# Triggers: a push to main that touches site/ or assets/, and workflow_dispatch.
+# Triggers: a push to main that touches site/, assets/ or docs/screenshots/, and workflow_dispatch.
 name: pages
 
 on:
   push:
     branches: [main]
-    paths: ["site/**", "assets/**", ".github/workflows/pages.yml"]
+    paths: ["site/**", "assets/**", "docs/screenshots/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions: {}   # each job asks for what it needs
@@ -33,10 +34,11 @@ jobs:
       - name: Stage _site/
         run: |
           set -euo pipefail
-          mkdir -p _site/site _site/assets
+          mkdir -p _site/site _site/assets _site/docs/screenshots
           cp -a site/. _site/site/
-          # the page loads ../assets/banner.png and banner@2x.png
+          # the page loads ../assets/banner.png and banner@2x.png, and the screens from ../docs/screenshots/
           cp -a assets/banner.png assets/banner@2x.png _site/assets/
+          cp -a docs/screenshots/. _site/docs/screenshots/
           touch _site/.nojekyll
           printf '%s\n' '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; site/"><title>Redirect</title><a href="site/">site/</a>' > _site/index.html
           test -s _site/site/index.html

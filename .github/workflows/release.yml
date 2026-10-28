@@ -5,9 +5,10 @@
 # builds and uploads the workflow artifact, never publishes). Nothing runs on a push to a branch or on a pull request.
 # Release rules: the version is installer/VERSION and a tag must say the same (tools/release/release_version.py; the
 # same string is in the exe, the launcher, the installer and CITATION.cff); the release is a pre-release while the
-# major version is 0; its title is the tag; SHA256SUMS and one .sha256 per file sit beside the assets; an existing
-# release is never touched, no tag is created, moved or deleted, and no asset is overwritten. The maintainer reads the
-# draft and publishes it.
+# major version is 0; its title is the tag; its notes are written from the tag's CHANGELOG.md entry
+# (tools/release/release_notes.py, which refuses a tag without one); SHA256SUMS and one .sha256 per file sit beside
+# the assets; an existing release is never touched, no tag is created, moved or deleted, and no asset is overwritten.
+# The maintainer reads the draft and publishes it.
 #
 # Jobs: nix-parts (Linux, Nix; a Windows runner has none) builds the two LGPL FFmpeg decoder DLLs from
 # tools/runtime/ffmpeg-lgpl-win.nix and stages SDL3.dll from the flake's nixpkgs (the same SDL3 the local build ships);
@@ -116,6 +117,20 @@ jobs:
           fi
           echo "version=$(python3 tools/release/release_version.py)" >> "$GITHUB_OUTPUT"
 
+      # The release notes come from the tag's CHANGELOG.md entry (tools/release/release_notes.py; nobody writes them
+      # by hand). A tag with no released entry stops here, before the build; a dispatch previews the notes.
+      - name: Release notes (from CHANGELOG.md)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p installer/Output
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            python3 tools/release/release_notes.py --tag "$GITHUB_REF_NAME" --out installer/Output/release-body.md
+          else
+            python3 tools/release/release_notes.py --preview "$VERSION" --out installer/Output/release-body.md
+          fi
+          cat installer/Output/release-body.md
+
       - name: Release checks (no download)
         run: |
           python3 tools/release/fetch_toolchain.py --check --strict
@@ -215,6 +230,7 @@ jobs:
             installer/Output/Project-Pyrrhus-setup.exe.sha256
             installer/Output/Project-Pyrrhus-*-portable.zip
             installer/Output/Project-Pyrrhus-*-portable.zip.sha256
+            installer/Output/release-body.md
           if-no-files-found: error
           retention-days: 14
 
@@ -252,6 +268,7 @@ jobs:
           sha256sum Project-Pyrrhus-setup.exe "$zip" > SHA256SUMS
           cat SHA256SUMS
           pre=""; case "$VERSION" in 0.*) pre="--prerelease" ;; esac
-          printf '%s\n' "Project Pyrrhus $VERSION. Windows installer and portable zip. Pre-release, partly playable. You need your own Killzone 2 disc dump (US, BCUS98116), the 1.29 update and a decrypted EBOOT made from your own copy; none of them is included or downloaded. SHA-256 sums: SHA256SUMS (and the .sha256 files). See the README for what it does and what goes online." > ../notes.txt
-          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "$GITHUB_REF_NAME" --notes-file ../notes.txt \
+          # the notes the installer job wrote from the tag's CHANGELOG.md entry (not uploaded as an asset)
+          test -s release-body.md
+          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-body.md \
             Project-Pyrrhus-setup.exe Project-Pyrrhus-setup.exe.sha256 "$zip" "$zip.sha256" SHA256SUMS

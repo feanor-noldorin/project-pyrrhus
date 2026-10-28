@@ -67,32 +67,40 @@ personal paths and host names.
 
 ## Versions and releases
 
-Tags are `vMAJOR.MINOR.PATCH`. The first release is `v0.1.0`, published as a GitHub pre-release. A fix is `v0.1.1`, a
-feature `v0.2.0`. Every release stays a pre-release until `v1.0.0`. No suffixes (no `-alpha`, `-rc`). A tag is never
-moved or reused: if a release is wrong, publish the next version. Put the checksum files next to the assets.
+Tags are `vMAJOR.MINOR.PATCH`: a fix bumps the last number, a feature the middle one. Every release stays a GitHub
+pre-release until `v1.0.0`. No suffixes (no `-alpha`, `-rc`). A tag is never moved or reused: if a release is wrong,
+publish the next version (the first tag, `v0.1.0`, was never published as a release for that reason). Put the checksum
+files next to the assets.
 
-One file holds the version: `installer/VERSION` (`MAJOR.MINOR.PATCH`, nothing else). Change it there and nowhere
-else; `tools/release/release_version.py --check --tag vX.Y.Z` confirms that a release tag matches it.
+One file holds the version: `installer/VERSION` (`MAJOR.MINOR.PATCH`, nothing else). Change it only with
+`python3 tools/release/bump_version.py X.Y.Z` (`--check` lists what would change): it writes `installer/VERSION`,
+`CITATION.cff` (`version`, `date-released`), the `<!-- version -->...<!-- /version -->` spans in the README, the docs
+and the site, any literal version in the resource scripts, `installer/kz2.iss` or `port/kz2/CMakeLists.txt`, and turns
+`## [Unreleased]` in `CHANGELOG.md` into `## [X.Y.Z] - DATE (pre-release)`; then it regenerates the site and runs
+`tools/release/test_version_agree.py`. Write the changes for players under `## [Unreleased]` as you make them.
+`tools/release/release_version.py --check --tag vX.Y.Z` confirms that a release tag matches the version. The release
+workflow writes the release notes from the tag's `CHANGELOG.md` entry (`tools/release/release_notes.py`) and stops
+when there is none.
 
 | Place | How it gets the version |
 |---|---|
 | Portable zip and installed files | `tools/release/assemble_payload.py` writes `VERSION.txt` from `installer/VERSION`; `tools/release/firstrun.py`, the launcher and the update check read it |
 | Installer | `installer/kz2.iss` reads `AppVersion` from the payload's `VERSION.txt` when it is compiled |
-| Launcher exe version block | `tools/release/build_launcher.sh` writes `launcher_version.h` for `installer/launcher/launcher.rc` (`FileVersion` 0.1.0, `FILEVERSION` 0.1.0.0) |
+| Launcher exe version block | `tools/release/build_launcher.sh` writes `launcher_version.h` for `installer/launcher/launcher.rc` (`FileVersion` X.Y.Z, `FILEVERSION` X,Y,Z,0) |
 | `kz2.exe` version block and icon | `assemble_payload.py` writes the payload's `port/kz2/app.rc` from `installer/app.rc.in` and puts the launcher icon beside it as `kz2.ico`; `port/kz2/CMakeLists.txt` compiles it on the player's build |
-| `CITATION.cff` | `release_version.py --stamp-citation --date YYYY-MM-DD` sets `version` and `date-released` at release time |
+| `CITATION.cff` | `bump_version.py` sets `version` and `date-released` (`release_version.py --stamp-citation --date YYYY-MM-DD` does the same alone) |
 
 `assemble_payload.py`, `release_version.py` and `version_check.py` refuse a version with a suffix, and
-`assemble_payload.py` refuses a `--version` that is not the one in `installer/VERSION`. The `VERSION 0.1.0` in
-`port/kz2/CMakeLists.txt`'s `project()` line is not used for anything shown to players.
+`assemble_payload.py` refuses a `--version` that is not the one in `installer/VERSION`. `port/kz2/CMakeLists.txt`'s
+`project()` line carries no version.
 
 Checksums: `tools/release/pack_zip.py` writes `<zip>.sha256` ("hash, two spaces, name") beside the portable zip, and
 `version_check.py` looks for a `.sha256` asset named after the installer. Publish one for each asset you upload.
 
 ## CI and GitHub settings
 
-There is no `.github/workflows/` folder in this tree, so no workflow runs on a fork. The host tests are listed in
-`tools/host-tests.txt`, one command per line, with no game data and no network. If you add workflows:
+The workflows in `.github/workflows/` run on a fork too once Actions are enabled there. The host tests are listed in
+`tools/host-tests.txt`, one command per line, with no game data and no network. For these workflows and your own:
 
 - Pin every third-party action to a full commit SHA, not a tag.
 - Give the workflow token the least permission it needs (`permissions: contents: read` at the top, widen per job).

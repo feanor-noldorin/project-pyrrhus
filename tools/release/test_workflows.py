@@ -10,7 +10,8 @@ tree). Text checks only (standard library, no YAML parser, no network):
   - release.yml: a tag push or workflow_dispatch only; the tag must be v + installer/VERSION; the draft pre-release
     command is `gh release create TAG --draft --prerelease --verify-tag --title TAG --notes-file`, with no
     --clobber, upload, edit or delete; only the publish job can write and it is skipped on workflow_dispatch;
-    SHA256SUMS and .sha256 files; the notes text says what the player needs and that nothing of the game is included;
+    SHA256SUMS and .sha256 files; the notes are generated from the tag's CHANGELOG entry (release_notes.py) before
+    the build and passed to publish;
   - issue-labels.yml: every rule's heading is the first field label of one issue form and every label it may add is
     one the forms use; with node on PATH the rules block itself is run on sample issues;
   - dependabot.yml covers github-actions.
@@ -93,6 +94,9 @@ def test_pages():
     site = read(os.path.join(os.path.dirname(GH), "site", "index.html"))
     for img in sorted(set(re.findall(r'\.\./assets/([\w@.-]+\.png)', site))):
         check(f"assets/{img}" in t, f"pages.yml stages assets/{img} (the page loads it)")
+    if "../docs/screenshots/" in site:
+        check("cp -a docs/screenshots/. _site/docs/screenshots/" in t and "docs/screenshots/**" in t,
+              "pages.yml stages docs/screenshots/ (the page shows the screens) and runs when they change")
 
 
 def test_release():
@@ -120,13 +124,15 @@ def test_release():
     check("> SHA256SUMS" in t and "SHA256SUMS" in c and ".sha256" in c, "release.yml: SHA256SUMS and .sha256 files beside the assets")
     check("Text.UTF8Encoding $false" in t and "`n\"" in t, "release.yml: the setup's .sha256 is LF with no BOM")
     check("gh release view" in pub, "release.yml: an existing release is refused, never touched")
-    notes = re.search(r"printf '%s\\n' \"(Project Pyrrhus \$VERSION\.[^\"]*)\"", t)
-    n = notes.group(1) if notes else ""
-    for want in ("Windows installer and portable zip", "Pre-release, partly playable", "BCUS98116", "1.29 update",
-                 "decrypted EBOOT made from your own copy", "none of them is included or downloaded", "SHA256SUMS",
-                 "what goes online"):
-        check(want in n, f"release.yml notes say: {want}", n)
-    check(not re.search(r"\b(PM|lanes?)\b", n), "release.yml notes: public wording only", n)
+    # the notes come from the tag's CHANGELOG entry (release_notes.py, tested by test_release_notes.py); no hand text
+    inst = js.get("installer", "")
+    check('release_notes.py --tag "$GITHUB_REF_NAME" --out installer/Output/release-body.md' in inst
+          and 'release_notes.py --preview "$VERSION"' in inst, "release.yml: the installer job writes the notes from CHANGELOG.md")
+    check(inst.index("release_notes.py") < inst.index("fetch_toolchain.py"), "release.yml: the notes are checked before the build")
+    check("installer/Output/release-body.md" in inst[inst.index("upload-artifact"):], "release.yml: the notes travel in the artifact")
+    check("--notes-file release-body.md" in c and "test -s release-body.md" in pub and "printf" not in pub,
+          "release.yml: publish uses the generated notes, never a hand-written text", c)
+    check("release-body.md" not in c.split("--notes-file release-body.md", 1)[-1], "release.yml: the notes are not an asset", c)
     check("fetch_toolchain.py --check --strict" in t and "test_iss_ispp.py" in t,
           "release.yml: pinned manifest and the ISPP line check before the build")
 

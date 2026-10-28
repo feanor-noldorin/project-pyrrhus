@@ -36,7 +36,7 @@ and the newest log file).
   waits for them: hand-play recordings show pauses of 0.2 to 0.9 s, and some black frames, until most shaders are
   built. A later visit to the same area is smoother. A fix builds the known shaders during the load from a list kept
   by each session: in two pairs of scripted runs with an empty cache, pauses over 0.1 s in the first minute of the
-  level fell from 18-20 to 2. From version 0.1.0 the installer and the portable zip ship this list
+  level fell from 18-20 to 2. The installer and the portable zip ship this list
   (`pso-template.bin`); its effect has not been measured in an installed copy yet. A build from source needs the file
   next to `kz2.exe` or one folder up.
 - **Motion blur is off by default.** The game's blur is tuned for 30 frames per second and looks doubled at lower
