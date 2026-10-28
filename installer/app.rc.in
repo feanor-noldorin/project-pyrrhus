@@ -1,0 +1,33 @@
+// kz2.exe resources (Project Pyrrhus): icon and version block. A template: tools/release/assemble_payload.py writes
+// it as the payload's port/kz2/app.rc with the version from installer/VERSION (tools/release/release_version.py) and
+// puts installer/art/kz2-launcher.ico beside it as kz2.ico; port/kz2/CMakeLists.txt compiles app.rc when it exists
+// (windres of the player's toolchain). No manifest: DPI awareness and the like stay as the runtime sets them.
+#include <winver.h>
+
+1 ICON "kz2.ico"
+
+1 VERSIONINFO
+FILEVERSION @VER_COMMA@
+PRODUCTVERSION @VER_COMMA@
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Project Pyrrhus contributors"
+      VALUE "FileDescription", "Project Pyrrhus (Killzone 2 PC port)"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "InternalName", "kz2"
+      VALUE "OriginalFilename", "kz2.exe"
+      VALUE "ProductName", "Project Pyrrhus"
+      VALUE "ProductVersion", "@VERSION@"
+      VALUE "Comments", "https://github.com/undecuple/project-pyrrhus"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

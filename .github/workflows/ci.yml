@@ -1,0 +1,51 @@
+# CI without the game (adapted from Project Helghast, the Killzone 3 PC port: same author, MIT). The exe cannot be
+# built here: the translated code comes from the player's own EBOOT and is never committed. So this checks what can be
+# checked without game data: that the flake evaluates, that every patch applies to the pinned ps3recomp, the
+# self-contained host tests (tools/host-tests.txt, plus any tools/release/test_*.py), the release manifests and the
+# version, and a secret scan of the whole history.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b  # v31.11.3
+      - name: Flake check
+        run: nix flake check --no-build
+      - name: Patches apply to the pinned ps3recomp
+        run: nix develop .#re --command bash tools/ps3recomp-patched.sh > /dev/null
+      - name: Release manifests and version (no download)
+        run: |
+          nix develop .#re --command python3 tools/release/fetch_toolchain.py --check --strict
+          nix develop .#re --command python3 tools/release/release_version.py --check
+      - name: Host tests (no game data, no network)
+        run: bash tools/release/ci_host_tests.sh --gh --no-sandbox
+
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b  # v31.11.3
+      - name: Gitleaks (full history; the version the flake's nixpkgs pins)
+        run: nix shell --inputs-from . nixpkgs#gitleaks --command gitleaks git --redact --verbose --exit-code 1 .

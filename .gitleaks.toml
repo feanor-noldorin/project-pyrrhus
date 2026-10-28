@@ -1,0 +1,11 @@
+# gitleaks settings for this repository: the default rules, plus reviewed false positives matched by content (not by
+# commit, so they hold for any history).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "An environment variable name in a patch comment (KZ3_KB_PROMPTS_FLIP=N), not a key"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''KZ3_KB_PROMPTS_FLIP=N''']
+paths = ['''^port/patches/4011-cellpad-last-device-button-prompts-option\.patch$''']

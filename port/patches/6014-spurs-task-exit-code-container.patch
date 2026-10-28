@@ -1,0 +1,104 @@
+cellSpurs: cellSpursTaskExitCodeInitialize and cellSpursTaskAttributeSetExitCodeContainer.
+
+Symptom: Killzone 2 (1.29), on entering its first level, logs "[hle] unresolved NID 0x34552FA6" and
+"[hle] unresolved NID 0xA121A224" before every cellSpursCreateTaskWithAttribute of its physics taskset.
+Cause: neither export had an HLE body (the default returned 0 and wrote nothing). Fix: ExitCodeInitialize clears the
+128-byte container (NULL then alignment checks, task error codes); SetExitCodeContainer records the container EA in
+the task attribute (new field from the padding, attribute size unchanged). Exit codes are not published into it.
+Diagnostic: KZ2_TASKARG_DUMP=<n> dumps the task argument block and the guest words behind it for the first n
+calls of cellSpursCreateTaskWithAttribute (off by default).
+Credit: the ExitCodeInitialize contract follows upstream ps3recomp PR #283 (tekulvw); code written independently.
+
+Verification: Killzone 2 under Proton. Upstream: #283 covers the first half.
+
+Rebased onto ps3recomp v0.15.0 (kz2-v015 round): cellSpursTaskExitCodeInitialize is upstream's (PR #283) and was removed here; the attribute field, cellSpursTaskAttributeSetExitCodeContainer and the KZ2_TASKARG_DUMP diagnostic are kept.
+Source and author: the cellSpursTaskExitCodeInitialize contract follows sp00nznet/ps3recomp PR #283 by tekulvw (MIT); the rest (the task attribute field, cellSpursTaskAttributeSetExitCodeContainer, KZ2_TASKARG_DUMP) was written for this port by undecuple (MIT).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 80852fc..fe4c815 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1482,6 +1482,30 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
+      * dropping them left the TaskInfo with a zero argument + zero lsPattern and
+      * the SPU task library then refuses every blocking wait with 0x8041090F --
+      * LBP's binkspu movie-IO task spun forever on that). */
++    /* KZ2 patch 6014: KZ2_TASKARG_DUMP=<n>: for the first n calls, the exit-code
++     * container and the guest words behind the 16-byte task argument (each of its
++     * four words as an EA: 0x40 bytes; the second word, Havok's shared object in
++     * Killzone 2's physics taskset, 0x200 bytes) -- to tell a stale or never-built
++     * object from one overwritten later. Diagnostic only, off by default. */
++    { static int s_n = -1; static int s_used = 0;
++      if (s_n < 0) { const char* e = getenv("KZ2_TASKARG_DUMP"); s_n = e ? atoi(e) : 0; }
++      if (s_used < s_n && attr_h->argument_ea) {
++          s_used++;
++          u32 a = attr_h->argument_ea;
++          fprintf(stderr, "[kz2-taskarg] attr=0x%08X exit=0x%08X arg@0x%08X = %08X %08X %08X %08X\n",
++                  (u32)(uintptr_t)attr, attr_h->exitCodeContainer_ea, a,
++                  vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
++          for (int w = 0; w < 4; w++) {
++              u32 ea = vm_read32(a + 4u * (u32)w);
++              u32 len = (w == 1) ? 0x200u : 0x40u;
++              if (ea < 0x10000u || ea >= 0xF0000000u) continue;
++              for (u32 o = 0; o < len; o += 0x20) {
++                  fprintf(stderr, "[kz2-taskarg]   w%d 0x%08X:", w, ea + o);
++                  for (u32 k = 0; k < 0x20; k += 4) fprintf(stderr, " %08X", vm_read32(ea + o + k));
++                  fprintf(stderr, "\n");
++              }
++          }
++      } }
+     return cellSpursCreateTask(taskset, taskId,
+                                (void*)(uintptr_t)(u32)attr_h->eaElf,
+                                (void*)(uintptr_t)(u32)attr_h->eaContext,
+@@ -1580,6 +1604,25 @@ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
+     return CELL_OK;
+ }
+ 
++/* KZ2 patch 6014: cellSpursTaskAttributeSetExitCodeContainer (NID 0xA121A224)
++ * records the container's EA in the (host-layout) task attribute; errors
++ * NULL_POINTER (0x80410911) before ALIGN (0x80410910), as upstream's
++ * cellSpursTaskExitCodeInitialize (NID 0x34552FA6, PR #283) above.
++ * Killzone 2 1.29 calls both before each cellSpursCreateTaskWithAttribute of
++ * its physics taskset (caller 0x0080C4E0..0x0080C524, one container for all
++ * tasks); it imports neither cellSpursTaskExitCodeGet nor TryGet.
++ * ASSUMPTION: nothing in the game waits on the container contents, so the exit
++ * code is not published into it at task exit (not implemented). */
++s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr, void* exitCode)
++{
++    u32 aea = (u32)(uintptr_t)attr, xea = (u32)(uintptr_t)exitCode;
++    if (!aea || !xea) return (s32)0x80410911u;
++    if ((aea & 7u) || (xea & 0x7Fu)) return (s32)0x80410910u;
++    GUEST_PTR(attr, CellSpursTaskAttribute*)->exitCodeContainer_ea = xea;
++    { static int n = 0; if (n++ < 4) printf("[cellSpurs] TaskAttributeSetExitCodeContainer(attr=0x%08X exit=0x%08X)\n", aea, xea); }
++    return CELL_OK;
++}
++
+ /* =========================================================================
+  * Workload
+  * =====================================================================*/
+diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
+index 07a3d2e..35cac72 100644
+--- a/libs/spurs/cellSpurs.h
++++ b/libs/spurs/cellSpurs.h
+@@ -156,7 +156,10 @@ struct CellSpursTaskAttribute {
+      * spinning forever. */
+     u32  lsPattern_ea;
+     u32  argument_ea;
+-    u8   _padding[48];
++    /* KZ2 patch 6014: guest EA of the CellSpursTaskExitCode container set by
++     * cellSpursTaskAttributeSetExitCodeContainer (0 = none). */
++    u32  exitCodeContainer_ea;
++    u8   _padding[44];
+ };
+ 
+ /* Guest-owned exit container: unlike the legacy host records above, both its
+@@ -254,6 +257,8 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
+ 
+ s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
+ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode);
++/* KZ2 patch 6014: exit-code container (NID 0xA121A224). */
++s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr, void* exitCode);
+ 
+ /* ---------------------------------------------------------------------------
+  * Workload functions

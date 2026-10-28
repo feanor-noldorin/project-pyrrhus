@@ -1,0 +1,64 @@
+KZ2 patch 4016: the keyboard becomes the prompt device on a key press, not while a key reads as held.
+
+KZ3 patch 4011 (KZ2's copy) sets "this poll had keyboard input" from the held state of the bound keys. In a hand
+session (Proton on a Wayland desktop, DS4 through SDL3) the log flipped "last input: PS4 pad" and
+"last input: keyboard (port -1)" again and again with nobody on the keyboard: a key read as held (a release the window
+never saw), so every idle poll after a pad input switched the prompts back to keycaps. Now only a bound key going down
+(up at the previous poll) counts, and the flag is kept until pad_prompt_track reads it. A stuck key switches once at
+most (again after a focus change, when the keys read as up while unfocused). The keyboard's "last input" log line names
+the bits that went down (buttons/dirs masks of PadKbState) to find the phantom key. KZ3's 4011 has the same held-state
+rule (KZ3 9caa0d76), so this is also a note for KZ3.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 3cf8295..ddfb9ba 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -99,6 +99,7 @@ static int           s_port_dev[PAD_MAX_HOST_PORTS];
+ static int           s_port_motion[PAD_MAX_HOST_PORTS];
+ static PadLastDevice s_last_dev = { PAD_DEV_NONE, -1 };
+ static int           s_keys_active = 0;   /* this poll had keyboard/mouse input (pad_poll_keyboard) */
++static unsigned      s_keys_new_b, s_keys_new_d;   /* 4016: the keys that went down (the log line names them) */
+ 
+ #if PAD_BACKEND_SDL
+ typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
+@@ -399,6 +400,8 @@ static int pad_kb_test_key(void)
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
++    /* KZ2 patch 4016: the keys held at the last poll, so only a new press makes the keyboard the prompt device */
++    const PadKbState was = s_kb_state;
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     s_kb_state.buttons = 0; s_kb_state.dirs = 0;
+     if (off) return;
+@@ -435,7 +438,15 @@ static void pad_poll_keyboard(void)
+     }
+     s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
+     ReleaseSRWLockExclusive(&s_kb_lock);
+-    s_keys_active = (s_kb_state.buttons || s_kb_state.dirs) ? 1 : 0;   /* 4011: pad_prompt_track */
++    /* KZ2 patch 4016: a key going down, not a key being down (KZ3 4011 took the held state). Under Proton on a Wayland
++     * desktop a key can read as held with nobody touching the keyboard (a release the window never saw), and every
++     * idle moment then switched the prompts back to keycaps: "last input: keyboard (port -1)" after each pad input,
++     * over and over (in a hand session). A stuck key now switches at most once. Kept until
++     * pad_prompt_track reads it. */
++    {
++        const unsigned nb = (unsigned)(s_kb_state.buttons & ~was.buttons), nd = (unsigned)(s_kb_state.dirs & ~was.dirs);
++        if (nb || nd) { s_keys_active = 1; s_keys_new_b = nb; s_keys_new_d = nd; }
++    }
+ }
+ 
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+@@ -930,8 +941,11 @@ static void pad_prompt_track(void)
+     s_keys_active = 0;
+     if (pad_last_device_update(&s_last_dev, keys, s_host_state, s_port_dev, PAD_MAX_HOST_PORTS) && said < 40) {
+         said++;
+-        printf("[pad] last input: %s%s (port %d)\n", pad_dev_name(s_last_dev.dev),
++        printf("[pad] last input: %s%s (port %d)", pad_dev_name(s_last_dev.dev),
+                s_last_dev.port >= 0 && s_port_motion[s_last_dev.port] ? ", motion sensors" : "", s_last_dev.port);
++        if (s_last_dev.dev == PAD_DEV_KEYBOARD)   /* 4016: which bound buttons/directions went down */
++            printf(" keys buttons 0x%04X dirs 0x%02X", s_keys_new_b, s_keys_new_d);
++        printf("\n");
+         fflush(stdout);
+     }
+ }

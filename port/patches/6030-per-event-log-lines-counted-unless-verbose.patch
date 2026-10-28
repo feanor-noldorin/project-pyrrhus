@@ -1,0 +1,138 @@
+KZ2 patch 6030: per-event log lines (SPURS tasks, GCM user handler) print the first 8, then counts, unless PS3_VERBOSE.
+
+An earlier change counted a level's log: of about 2,250 lines a second, the per-event ones were [cellSpurs] CreateTask,
+_TaskAttributeInitialize and TaskAttr R8-form (one each per task created, ~110/s each), [spu_workload] dispatch HIT
+(async) and async RETURNED (one per task run), [taskset] built SpursTasksetContext (with an fflush each) and start
+task, and [cellGcmSys] SetUserHandler (~60/s). ps3_log.h gets ps3_log_event(ctr, what): every line when
+ps3_log_verbose() (PS3_VERBOSE=1, or upstream's default of a redirected stderr when PS3_VERBOSE is unset), else the
+first 8 and then one "[log] <what>: N so far" line at each power of two. PS3_VERBOSE=0 makes a run quiet (PS3_LOG_EVENTS=0|1 sets these lines alone); KZ2 does
+not set it by default yet: with it, The New Sun's load stopped at an SPU assert (heqi in Gfx.PB.ShadowMap) in both
+runs, a timing race that the slower logging hid (the RE notes "An earlier change"). The existing ps3_log_verbose() sites
+([RSX null] set_viewport / set_render_target, [WAIT] event_queue_receive, ...) follow the same switch. Nothing but logging changes.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1285,6 +1285,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+             g_ydkj_real_taskset_ea = taskset_ea;
+             g_ydkj_real_taskid     = i;
+ 
++            static long _ev = 0;   /* patch 6030 */
++            if (ps3_log_event(&_ev, "[cellSpurs] CreateTask"))
+             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
+                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
+@@ -1419,6 +1421,8 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
+       if (s_r8) {
+           attr->argument_ea  = (u32)sizeContext;   /* r8 */
+           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
++          static long _ev = 0;   /* patch 6030 */
++          if (ps3_log_event(&_ev, "[cellSpurs] TaskAttr R8-form"))
+           printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+                  attr->argument_ea, (u32)(uintptr_t)argument);
+       } }
+@@ -1453,6 +1457,8 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
+                  d, (u32)attr->eaContext, attr->sizeContext,
+                  attr->lsPattern_ea, attr->argument_ea);
+       } }
++    static long _ev = 0;   /* patch 6030 */
++    if (ps3_log_event(&_ev, "[cellSpurs] _TaskAttributeInitialize"))
+     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
+            (u32)eaElf, (u32)eaContext, sizeContext,
+            attr->lsPattern_ea, attr->argument_ea);
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -39,6 +39,7 @@ static int kz3_ft_on(void) { static int on = -1; if (on < 0) { const char* e = g
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include "ps3emu/log_first.h"
++#include "../../runtime/ps3_log.h"   /* patch 6030: ps3_log_event */
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -4194,6 +4195,8 @@ void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler)
+ /* NID: 0x0B4B62D5 */
+ void cellGcmSetUserHandler(CellGcmUserHandler handler)
+ {
++    static long _ev = 0;   /* patch 6030 */
++    if (ps3_log_event(&_ev, "[cellGcmSys] SetUserHandler"))
+     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
+     s_user_handler_opd = (u32)(size_t)handler;
+     s_user_handler = handler;
+diff --git a/runtime/ps3_log.h b/runtime/ps3_log.h
+--- a/runtime/ps3_log.h
++++ b/runtime/ps3_log.h
+@@ -45,4 +45,24 @@ static __inline int ps3_log_verbose(void)
+     return v;
+ }
+ 
++/* KZ2 patch 6030: per-event lines (one per SPURS task created, started, run or ended, one per GCM user handler
++ * set). Killzone 2 makes about 150 such events a second in a level. Printed every time when PS3_LOG_EVENTS=1, or
++ * when it is unset and ps3_log_verbose();
++ * otherwise the first 8, then one count line at each power of two, so a quiet log still says how often:
++ *     static long _n; if (ps3_log_event(&_n, "spurs task created")) printf(...);  */
++#ifdef __cplusplus
++static inline int ps3_log_event(long* ctr, const char* what)
++#else
++static __inline int ps3_log_event(long* ctr, const char* what)
++#endif
++{
++    static int on = -1;   /* PS3_LOG_EVENTS=0|1 decides for these lines alone; unset: ps3_log_verbose() */
++    long n = __atomic_add_fetch(ctr, 1, __ATOMIC_RELAXED);
++    if (on < 0) { const char* e = getenv("PS3_LOG_EVENTS"); on = e ? (e[0] && e[0] != '0') : ps3_log_verbose(); }
++    if (on || n <= 8) return 1;
++    if ((n & (n - 1)) == 0)
++        fprintf(stderr, "[log] %s: %ld so far (PS3_VERBOSE=1 prints each)\n", what, n);
++    return 0;
++}
++
+ #endif /* PS3_LOG_H */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -667,6 +667,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task, int
+     spu_coh_notify_write(taskset_ea);
+     spu_lockline_unlock();
+     for (int i = 0; i < n_start; i++) {
++        static long _ev = 0;   /* patch 6030 */
++        if (ps3_log_event(&_ev, "[taskset] task started after an exit"))
+         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
+         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
+@@ -978,9 +980,11 @@ static void spu_async_run(spu_async_job* j)
+                  * both audio tasks run task 1's descriptor). */
+                 if (j->taskset_ea) {
+                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
++                    static long _ev = 0;   /* patch 6030 */
++                    if (ps3_log_event(&_ev, "[taskset] SpursTasksetContext built")) {
+                     fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                             "taskset=0x%08X task=%u\n", j->image_id,
+-                            j->taskset_ea, j->taskid); fflush(stderr);
++                            j->taskset_ea, j->taskid); fflush(stderr); }
+                 }
+             }
+             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
+@@ -1118,8 +1122,10 @@ static void spu_async_run(spu_async_job* j)
+                   FILE* f = fopen(path, "wb");
+                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
+                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
++            { static long _ev = 0;   /* patch 6030 */
++              if (ps3_log_event(&_ev, "[spu_workload] async task returned"))
+             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
++                    "(job ran to completion, did not loop)\n", j->image_id, rc); }
+             spu_serial_release();
+             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid, rc);
+         }
+@@ -1687,6 +1693,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
+     }
+ 
++    static long _ev_hit = 0;   /* patch 6030 */
++    if (ps3_log_event(&_ev_hit, "[spu_workload] async dispatch (new host thread)"))
+     fprintf(stderr,
+         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
+         (unsigned long long)fp, args_ea, image_id);

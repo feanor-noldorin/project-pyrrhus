@@ -1,0 +1,176 @@
+gcm/live-draw: fragment WPOS honours the shader window's origin (LD_WPOS_ORIGIN=0 old).
+
+Symptom (Killzone 2, Corinth River): a vertically mirrored, translucent copy of the frame shows over parts of the
+picture (an upside-down Garza head below Garza at the railing, girders across the walls and windows).
+
+Cause: NV4097_SET_SHADER_WINDOW (0x1D88; height bits 0-11, origin bits 12-15: 0 top, 1 bottom, pixel centre bits
+16-19). With the origin at the bottom the RSX gives the fragment program WPOS.y = height - y (RPCS3: wpos_scale -1,
+wpos_bias height). The decompiler always returned SV_Position (y from the top), so a program on a bottom-origin
+window that addresses a screen-space texture from WPOS read it upside down.
+
+Fix: a program that reads WPOS (rsx_fp_reads_wpos) on a bottom-origin window reads input.position as
+float4(p.x, height - p.y, p.zw), applied before patch 2088's per-pixel centre. The height is in the pipeline key only
+for those programs, so other pipelines keep their keys. [wpos-origin] logs the first 64 distinct (window, target)
+pairs of WPOS-reading draws and a count every 65536 such draws. ASSUMPTION: the pixel-centre field is still ignored.
+Behaviour follows RPCS3 (GPL-2.0), wpos_scale / wpos_bias in its fragment-program decompiler; read, not copied.
+Written for this port.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -637,6 +637,26 @@ u32 rsx_fp_texture_bx2_units(const u8* ucode, u32 max_bytes)
+     return 0;
+ }
+ 
++/* KZ2 patch 2090: does any instruction read WPOS (input register 0)? The same walk as the unit scans above. */
++int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes)
++{
++    if (!ucode) return 0;
++    for (u32 off = 0; off + 16 <= max_bytes;) {
++        const u32 w0 = rsx_fp_read_word(ucode + off);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        const u32 src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
++        if (!(w2 & FP_BRANCH) && src == 0 &&
++            ((w1 & 3u) == FP_REG_TYPE_INPUT || (w2 & 3u) == FP_REG_TYPE_INPUT || (w3 & 3u) == FP_REG_TYPE_INPUT))
++            return 1;
++        off += 16;
++        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
++        if (w0 & FP_END) return 0;
++    }
++    return 0;
++}
++
+ static void fp_expand_helper(Out* out)
+ {
+     out_puts(out,
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -171,6 +171,8 @@ typedef struct rsx_fp_shadow_desc {
+ void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
+     u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
+ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
++/* KZ2 patch 2090: 1 when an instruction of the program reads WPOS (input register 0). */
++int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes);
+ int rsx_fp_decompile_buffered_shadow_ex(
+     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+     const rsx_fp_shadow_desc shadow[16],
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8064,6 +8064,8 @@ typedef struct {
+     int vp_branch_bits_used; u32 vp_branch_bits;   /* upstream #485: BRB/CLB outcomes baked into the VP */
+     int vgpu;                                  /* patch 2076: GPU-fetch vertex shader (packed payload 2) */
+     u32 wpos_aa;                               /* KZ2 patch 2088: aa_sx | aa_sy << 8 of the target, 0 = 1x1 */
++    u32 wpos_flip;                             /* KZ2 patch 2090: window height in pixels when the shader window's
++                                                * origin is the bottom and the program reads WPOS, else 0 */
+ } ld_xl_in;
+ static CRITICAL_SECTION g_ld_xl_cs;
+ static volatile LONG g_ld_xl_state;
+@@ -8127,6 +8129,55 @@ static int ld_wpos_aa_apply(char* hlsl, size_t size, u32 wpos_aa)
+     if (logs++ < 8) fprintf(stderr, "[wpos-aa] %u WPOS read(s) scaled to pixels (%ux%u samples per pixel)\n", (u32)n, ax, ay);
+     return (int)n;
+ }
++/* KZ2 patch 2090: WPOS honours the shader window's origin.
++ *
++ * NV4097_SET_SHADER_WINDOW (0x1D88): height in bits 0-11, origin in bits 12-15 (0 = top, 1 = bottom), pixel centre in
++ * bits 16-19. With the origin at the bottom the RSX hands the fragment program WPOS.y = height - y (y counted from the
++ * top, as SV_Position counts it); RPCS3 does the same with its wpos_scale -1 / wpos_bias height fragment constants.
++ * The decompiler always handed out SV_Position, so a program on a bottom-origin window that addresses a screen-space
++ * texture from WPOS read it upside down. Fix: in such a program every read of input.position becomes
++ * float4(p.x, height - p.y, p.zw) (applied before 2088, so 2088's per-pixel centre is taken first). Keyed only for
++ * programs that read WPOS on a bottom-origin window. LD_WPOS_ORIGIN=0 = old behaviour. The first 64 distinct
++ * (window, target) pairs of WPOS-reading draws are logged as [wpos-origin] either way.
++ * ASSUMPTION: the pixel-centre field (half/integer) is still ignored, as before. */
++static int ld_wpos_origin_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_WPOS_ORIGIN");
++        on = e ? atoi(e) != 0 : 1;
++        fprintf(stderr, "[wpos-origin] WPOS.y from the bottom on bottom-origin shader windows: %s\n",
++                on ? "on" : "off (LD_WPOS_ORIGIN=0)");
++    }
++    return on;
++}
++static int ld_wpos_flip_apply(char* hlsl, size_t size, u32 height)
++{
++    if (!hlsl || !height) return 0;
++    static const char key[] = "input.position";
++    char rep[200];
++    snprintf(rep, sizeof rep, "float4(input.position.x, %u.0 - input.position.y, input.position.zw)", height);
++    const size_t kl = sizeof key - 1, rl = strlen(rep);
++    size_t n = 0;
++    for (const char* p = strstr(hlsl, key); p; p = strstr(p + kl, key)) n++;
++    if (!n) return 0;
++    const size_t len = strlen(hlsl), need = len + n * (rl - kl) + 1;
++    if (need > size) return -1;
++    char* out = (char*)malloc(need);
++    if (!out) return -1;
++    char* o = out; const char* p = hlsl;
++    for (const char* q = strstr(p, key); q; q = strstr(p, key)) {
++        memcpy(o, p, (size_t)(q - p)); o += q - p;
++        memcpy(o, rep, rl); o += rl;
++        p = q + kl;
++    }
++    strcpy(o, p);
++    memcpy(hlsl, out, need);
++    free(out);
++    static u32 logs;
++    if (logs++ < 8) fprintf(stderr, "[wpos-origin] %u WPOS read(s) flipped (window height %u)\n", (u32)n, height);
++    return (int)n;
++}
+ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_hlsl, size_t ps_sz, int* vi_out, int* fi_out)
+ {
+     const u8* vp_uc = in->vp_uc; const u32 vp_instrs = in->vp_instrs; const u32 vtex_mask = in->vtex_mask;
+@@ -8199,6 +8250,8 @@ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_h
+         fi = -1;
+     if (fi > 0 && rsx_fp_apply_depth_argb(ps_hlsl, ps_sz, argb_mask, argb_remap) < 0)
+         fi = -1;
++    if (fi > 0 && in->wpos_flip && ld_wpos_flip_apply(ps_hlsl, ps_sz, in->wpos_flip) < 0)   /* KZ2 patch 2090 */
++        fi = -1;
+     if (fi > 0 && in->wpos_aa && ld_wpos_aa_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* KZ2 patch 2088 */
+         fi = -1;
+     if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, ps_sz) < 0) {   /* patch 2055 */
+@@ -8252,6 +8305,8 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+     if (unnorm_mask) key = fnv1a(unnorm_dim, 128, key);
+     if (xi->wpos_aa) { const u32 tag = 0x57504F00u | 0x41u; key = fnv1a(&tag, sizeof tag, key);   /* KZ2 patch 2088 */
+                        key = fnv1a(&xi->wpos_aa, sizeof xi->wpos_aa, key); }
++    if (xi->wpos_flip) { const u32 tag = 0x57504F00u | 0x46u; key = fnv1a(&tag, sizeof tag, key);   /* KZ2 patch 2090 */
++                         key = fnv1a(&xi->wpos_flip, sizeof xi->wpos_flip, key); }
+     if (masked_layout) {
+         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+         const u32 payload_stride =
+@@ -9609,6 +9664,28 @@ static ID3D12PipelineState* get_pso(
+         rsx_dsp_get_surface(&g.rsx, &wsf);
+         if (wsf.aa_sx != 1u || wsf.aa_sy != 1u) xi.wpos_aa = wsf.aa_sx | (wsf.aa_sy << 8);
+     }
++    xi.wpos_flip = 0;   /* KZ2 patch 2090 */
++    if (rsx_fp_reads_wpos(fp_uc, fp_size)) {
++        const u32 sw = rsx_dsp_reg(&g.rsx, 0x1D88), sw_h = sw & 0xFFFu, sw_origin = (sw >> 12) & 0xFu;
++        if (sw_origin == 1u && sw_h && ld_wpos_origin_on()) xi.wpos_flip = sw_h;
++        static u64 seen[64]; static u32 n_seen; static u64 n_wpos, n_bottom;
++        n_wpos++; if (sw_origin == 1u) n_bottom++;
++        if ((n_wpos & 0xFFFFu) == 0)
++            fprintf(stderr, "[wpos-origin] WPOS draws %llu, on bottom-origin windows %llu\n",
++                    (unsigned long long)n_wpos, (unsigned long long)n_bottom);
++        rsx_dsp_surface osf;
++        rsx_dsp_get_surface(&g.rsx, &osf);
++        const u64 id = ((u64)sw << 32) | osf.color_offset[0];
++        u32 k = 0;
++        while (k < n_seen && seen[k] != id) k++;
++        if (k == n_seen && n_seen < 64u) {
++            seen[n_seen++] = id;
++            fprintf(stderr, "[wpos-origin] window=0x%08X (height %u origin %s centre %s) target 0x%X clip %ux%u aa %ux%u "
++                    "fp %u bytes frame %u%s\n", sw, sw_h, sw_origin == 1u ? "bottom" : sw_origin == 0u ? "top" : "?",
++                    ((sw >> 16) & 0xFu) ? "integer" : "half", osf.color_offset[0], osf.clip_w, osf.clip_h, osf.aa_sx,
++                    osf.aa_sy, fp_size, g_ld_frames, xi.wpos_flip ? " -> flipped" : "");
++        }
++    }
+     u64 kl_pre_rs = 0;
+     key = ld_pso_key_tail(key, &xi, packed_payload, &kl_pre_rs);   /* patch 2071: shared with the prewarm */
+ #if defined(YZ_PERF_PROFILE)

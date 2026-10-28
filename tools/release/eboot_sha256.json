@@ -1,0 +1,11 @@
+{
+ "comment": "Expected SHA-256 of the decrypted Killzone 2 EBOOT (from the player's own copy). A hash is a number, not game data. 1.29 and 1.01 from a disc dump and its update; empty = unknown yet, and firstrun_check.py only warns (H1). Sizes from firstrun_check.EBOOT_ELF_SIZES.",
+ "1.29": {
+  "size": 16455144,
+  "sha256": "e8b0ddefc0cb1dc116fb4ae9675a5f551a26cc7eb7d74b06f00ec294ceea8c3d"
+ },
+ "1.01": {
+  "size": 16381928,
+  "sha256": "39a28358efd91fd0e914944392a3807b0141e4c5b6ba22e4964640c9c43b9799"
+ }
+}

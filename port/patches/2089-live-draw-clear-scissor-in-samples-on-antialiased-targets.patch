@@ -1,0 +1,38 @@
+gcm/live-draw: CLEAR_SURFACE scissor scaled to the sample grid of an antialiased target (LD_CLEAR_AA_SCISSOR=0 old).
+
+Symptom (Killzone 2, Corinth River): once the level fades in, the right half of the 1280x720 picture is white or a
+smear, with an edge at x = 640.
+
+Cause: patch 2006 limits a clear to the surface clip and the guest scissor. An antialiased surface is held at its
+sample resolution (rsx_dispatch.h: clip_x/w and clip_y/h are already multiplied by aa_sx/aa_sy), but the scissor
+register stays in pixels, and the clear took it as samples. Killzone 2 clears its 2560x720 sample depth (0x25B0000,
+DIAGONAL_CENTERED_2, 1280x720 pixels) with scissor 1280x720 every frame: only the left 1280 samples were cleared, so
+the right half kept old depth, the G-buffer pass failed the depth test there (only the first-person weapon, nearer
+than the stale depth, was drawn), and the lighting and the resolve showed last frames' white. The draw path already
+scales the scissor by aa_sx/aa_sy; the clear now does the same.
+
+Upstream candidate (general: any title that clears an antialiased surface with a scissor set).
+Verification: Killzone 2 under Proton.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 90a3166..d9e07ab 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14177,8 +14177,13 @@ static void sink_clear_impl(void* user, const rsx_dispatch* r, u32 mask)
+           if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
+               const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+               const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+-              const LONG sx = (LONG)(sh & 0xFFFFu), sw = (LONG)(sh >> 16);
+-              const LONG sy = (LONG)(sv & 0xFFFFu), svh = (LONG)(sv >> 16);
++              /* KZ2 patch 2089: the scissor is in pixels, the clip of an antialiased surface in samples (as the
++               * draw path's scissor; LD_CLEAR_AA_SCISSOR=0 = old: pixels taken as samples). */
++              static int aa_on = -1;
++              if (aa_on < 0) { const char* e = getenv("LD_CLEAR_AA_SCISSOR"); aa_on = e ? atoi(e) != 0 : 1; }
++              const LONG ax = aa_on ? (LONG)csf.aa_sx : 1, ay = aa_on ? (LONG)csf.aa_sy : 1;
++              const LONG sx = (LONG)(sh & 0xFFFFu) * ax, sw = (LONG)(sh >> 16) * ax;
++              const LONG sy = (LONG)(sv & 0xFFFFu) * ay, svh = (LONG)(sv >> 16) * ay;
+               if (sx > l) l = sx;
+               if (sy > t) t = sy;
+               if (sx + sw < r) r = sx + sw;

@@ -1,0 +1,47 @@
+cellVdec/cellAdec: cellVdecQueryAttrEx, cellVdecOpenEx, cellAdecOpenEx.
+
+Symptom: Killzone 2 (1.29) hangs when its intro movie starts (intro/introfmvmov.jsp, MOVIES/GameIntro_PS3.avi):
+"[hle] unresolved NID 0xC982A84A / 0x0053E2D8 / 0x8B5551A4", then StartSeq(handle=0) for both decoders, two 2 MB
+reads of the file and no DecodeAu; flips stop and the last menu frame stays on screen.
+Cause: the movie player opens its decoders through the Ex forms, which were not implemented; the HLE default
+returned 0 without writing the attr or the handle. Fix: the Ex forms forward to QueryAttr/Open (the Ex type and
+resource structs keep the leading codecType and the same four-argument layout; the stub ignores the resource).
+
+Verification: Killzone 2 under Proton. Upstream candidate (general).
+v0.17.0 rebase (ps3recomp a6d76c8): 6013 Vdec half dropped (upstream #379, same forwarders); cellAdecOpenEx half kept.
+
+diff --git a/libs/codec/cellAdec.c b/libs/codec/cellAdec.c
+index 9bacce2..0cd5d76 100644
+--- a/libs/codec/cellAdec.c
++++ b/libs/codec/cellAdec.c
+@@ -173,6 +173,16 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
+     return (s32)CELL_ADEC_ERROR_BUSY;
+ }
+ 
++/* KZ2 patch 6013: cellAdecOpenEx (NID 0x8B5551A4), used by Killzone 2's movie
++ * player next to cellVdecOpenEx. CellAdecResourceEx only adds SPURS/PPU
++ * placement fields this stub ignores; forward to cellAdecOpen. */
++s32 cellAdecOpenEx(const CellAdecType* type, const void* resEx,
++                   const CellAdecCb* cb, CellAdecHandle* handle)
++{
++    printf("[cellAdec] OpenEx -> Open\n");
++    return cellAdecOpen(type, (const CellAdecResource*)resEx, cb, handle);
++}
++
+ s32 cellAdecClose(CellAdecHandle handle)
+ {
+     printf("[cellAdec] Close(handle=%u)\n", handle);
+diff --git a/libs/codec/cellAdec.h b/libs/codec/cellAdec.h
+index 2282b24..e19cbbb 100644
+--- a/libs/codec/cellAdec.h
++++ b/libs/codec/cellAdec.h
+@@ -124,6 +124,9 @@ s32 cellAdecQueryAttr(const CellAdecType* type, void* attr);
+ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
+                  const CellAdecCb* cb, CellAdecHandle* handle);
+ s32 cellAdecClose(CellAdecHandle handle);
++/* KZ2 patch 6013: Ex form (CellAdecResourceEx), same argument layout. */
++s32 cellAdecOpenEx(const CellAdecType* type, const void* resEx,
++                   const CellAdecCb* cb, CellAdecHandle* handle);
+ 
+ s32 cellAdecStartSeq(CellAdecHandle handle, void* param);
+ s32 cellAdecEndSeq(CellAdecHandle handle);

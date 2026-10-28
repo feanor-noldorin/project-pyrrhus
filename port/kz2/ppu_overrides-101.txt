@@ -1,0 +1,13 @@
+# PPU functions the host replaces (ps3recomp patch 1018, ppu_lifter --overrides): one guest address per line (hex,
+# 8 digits) plus a comment. The lifter renames the lifted body func_X__lifted and announces PPU_OVERRIDE_X in
+# ppu_overrides.h (patch 3005); tools/build-kz2.sh refuses a lift whose announcements differ from this list.
+# KZ3's list is KZ3 addresses and is not carried over. Host bodies: port/kz2/kz2_ppu_overrides.cpp.
+# One list per EBOOT (tools/lift.sh KZ2_EBOOT_VER): this file is the 1.29 update EBOOT (default);
+# ppu_overrides-101.txt is the v1.01 disc EBOOT. Keep the two in step (same functions, each version's address).
+00A463E0  # v1.01 SPU post-processing list loop (= 1.29 0xA5A7B0, same 32-byte prologue; patch site 0xA463FC); KZ2_SPU_POST, KZ2_POST_LOG
+00045568  # v1.01 GCM user-command handler (opd 0xE68BE8): KZ2_USERCMD_LOG
+0053E930  # v1.01 post stage Render (vtable 0xFA1030 slot 5): KZ2_POSTSTAGE_LOG
+0053FD78  # v1.01 post stage Submit (slot 13): KZ2_POSTSTAGE_LOG
+0053E448  # v1.01 post stage Unlock-job setup: KZ2_POSTSTAGE_LOG, registers P with the GCM walker watch
+# Page-layer hooks (1.29 0x78528, 0x2C7688, 0x2C4A78, 0x2C6E38, 0x489970, 0x48D848, 0x3ABC40, 0x49EA38, 0x49E5C0, 0x2AF50, 0x4893A8, 0x489078, 0x488FB8, 0x3ABED0, 0x49E820, 0x49ED98, listener 0x48A660 0x48A520 0x48A5B0 0x48A650 0x48A920 0x48A948 0x484170) are not mapped to v1.01 yet.
+# SV engine page-layer hooks (1.29 0x3B7908, 0x3B6220, 0x3A7198, 0x3A8330, 0x3A8264, 0x3B69C0, 0x49E668, 0x49EF10, 0x3B8628) are not mapped to v1.01 yet.

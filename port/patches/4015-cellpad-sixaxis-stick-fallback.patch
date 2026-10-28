@@ -1,0 +1,123 @@
+Port patch 4015 (ENHANCEMENT): SIXAXIS stick fallback. Killzone 2 turns valves and arms demolition charges by tilting
+the pad; a pad with no motion sensor sends the rest values, so those sections cannot be finished. When the host pad
+has no accelerometer and the game sees L1 and R1 both held, the X motion word follows the right stick:
+X = 512 + 113 * tan(36 deg * s), s = right stick X in [-1, 1], with Y 399, Z 512, G 512 (a DS3 at rest; len 24 and
+the PRESS_MODE capability were already reported). Full deflection is a 36 deg roll, inside the valve's +-35 deg hand
+clamp and the charge's 33.4-37.3 deg arm windows. One shoulder alone sends the rest values, so the L1 zoom's
+SIXAXIS aim correction (0x171698) is unchanged; pads with real sensors keep their own data. KZ2_MOTION_STICK=0 turns
+it off. Game side (1.29): valve controller 0x127210 (grab buttons 0x127120), charge controller 0x119C90 (grab
+buttons 0x119B88, read only while the charge's state +0x234 is 3), both EDeviceFunction 20/21 (GrabLeftHand,
+GrabRightHand). The mapping is the pure header libs/input/pad_motion_stick.h; host test tools/runtime/test_motion_stick.sh.
+The approach (an env-switchable stick stand-in for pads without motion) follows another ps3recomp port's description;
+no code was taken from it.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -64,6 +64,7 @@ static double pad_clock(unsigned long long t0_ms)
+   #pragma comment(lib, "xinput.lib")
+ #endif
+ #include "pad_host.h"
++#include "pad_motion_stick.h"   /* 4015 */
+ #ifndef _WIN32
+ /* 4011: PKB_PROMPTS_* and the value names on every platform (pure header; the Windows keyboard code below includes it
+  * again for the bindings, which only Windows polls). */
+@@ -1664,11 +1665,26 @@ skip_inject: ;
+     /* Sensor data (only meaningful if SENSOR_ON) */
+     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
+         /* 4010: the pad's accelerometer and gyro where it has them (pad_sdl_sensors); otherwise a DS3 at rest
+-         * (512 = 0 g, Y 399 = gravity, gyro 512 = still). */
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = hs->has_sensor ? hs->sensor_x : 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = hs->has_sensor ? hs->sensor_y : 399;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = hs->has_sensor ? hs->sensor_z : 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = hs->has_sensor ? hs->sensor_g : 512;
++         * (512 = 0 g, Y 399 = gravity, gyro 512 = still). 4015 (ENHANCEMENT): without sensors, L1+R1 held tilts the
++         * pad with the right stick X (pad_motion_stick.h; the valves and demolition charges read the roll).
++         * KZ2_MOTION_STICK=0 keeps the rest values. */
++        static int s_ms = -1, s_ms_logged = 0;
++        if (s_ms < 0) { const char* e = getenv("KZ2_MOTION_STICK"); s_ms = !(e && e[0] == '0'); }
++        const u16 real[4] = { hs->sensor_x, hs->sensor_y, hs->sensor_z, hs->sensor_g };
++        const u16 seen = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF)
++                               | ((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xFF) << 8));
++        u16 w[4];
++        if (pad_motion_words(s_ms, hs->has_sensor, real, seen, (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X], w)
++            && !s_ms_logged) {
++            s_ms_logged = 1;
++            printf("[pad] port %u: SIXAXIS stick fallback in use (L1+R1 + right stick X; KZ2_MOTION_STICK=0 off)\n",
++                   (unsigned)port_no);
++            fflush(stdout);
++        }
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = w[0];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = w[1];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = w[2];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = w[3];
+     }
+     }  /* end connected block */
+ 
+diff --git a/libs/input/pad_motion_stick.h b/libs/input/pad_motion_stick.h
+new file mode 100644
+--- /dev/null
++++ b/libs/input/pad_motion_stick.h
+@@ -0,0 +1,60 @@
++/*
++ * pad_motion_stick.h -- SIXAXIS stick fallback (KZ2 port patch 4015; ENHANCEMENT).
++ *
++ * Killzone 2 turns valves and arms demolition charges by tilting the pad (SIXAXIS). It reads the motion words
++ * (CellPadData.button[20..23]) only when the pad reports the PRESS_MODE capability and len > 20, and both the valve
++ * (ValveJoystickController @0x00127210) and the charge (ExplosiveLocationJoystickController @0x00119C90) use only
++ * the roll  atan(-X / sqrt(Y^2 + Z^2))  of the low-passed, centred words. Both read the grab buttons
++ * GrabLeftHand/GrabRightHand (EDeviceFunction 20/21, L1/R1; @0x00127120 and @0x00119B88), and the valve only turns
++ * while both are held. A pad with no motion sensor reports the rest values, so the roll never changes and these
++ * sections cannot be finished.
++ *
++ * The fallback: while L1 and R1 are both held on a pad without motion sensors, the right stick's X tilts the pad,
++ *     X = 512 + 113 * tan(36 deg * s),  s = right stick X in [-1, 1],  Y = 399 (1 g), Z = 512, G = 512,
++ * so full deflection is a 36 deg roll: inside the valve's +-35 deg hand clamp and inside the charge's arm windows
++ * (33.4..37.3 deg of +-45 on each side). Anything else sends the rest values. Only L1+R1 together, never one
++ * shoulder alone: L1 (zoom) also reads roll and pitch for the SIXAXIS aim correction (@0x00171698), which must
++ * stay as it was. A pad with real sensors keeps its own data. KZ2_MOTION_STICK=0 turns the fallback off.
++ * ASSUMPTION: the sign (stick right = positive X) was not checked against a real DS3; both directions are used
++ * by the valves and the charge, so it does not decide whether they work.
++ *
++ * Pure: no SDL, no OS call; tools/runtime/test_motion_stick.c tests it on the host.
++ */
++#ifndef PS3RECOMP_PAD_MOTION_STICK_H
++#define PS3RECOMP_PAD_MOTION_STICK_H
++
++#include <math.h>
++#include "cellPad.h"
++
++#define PMS_REST_X 512
++#define PMS_REST_Y 399   /* 1 g on Y: 113 words per g below 512, a DS3 lying flat */
++#define PMS_REST_Z 512
++#define PMS_REST_G 512
++#define PMS_WORDS_PER_G 113.0f
++#define PMS_MAX_DEG 36.0f
++
++/* Stick byte (0..255, 128 centre) to [-1, 1], both ends reachable (PAD_SCRIPT's -1 -> 0, +1 -> 255). */
++static inline float pms_stick_unit(u8 v)
++{
++    float s = v >= 128 ? (float)(v - 128) / 127.0f : (float)(v - 128) / 128.0f;
++    return s < -1.0f ? -1.0f : s > 1.0f ? 1.0f : s;
++}
++
++/* The four motion words (X, Y, Z, G) one poll sends. has_sensor/real = the host pad's own sensor words (4010),
++ * buttons = the CELL_PAD_CTRL_* mask the game sees this poll, rx = right stick X byte, enabled = KZ2_MOTION_STICK
++ * is not 0. A pad with sensors sends its own words; without, the rest values, or the stick tilt while L1+R1 are
++ * both held. Returns 1 when the stick tilt applies. */
++static inline int pad_motion_words(int enabled, int has_sensor, const u16 real[4], u16 buttons, u8 rx, u16 out[4])
++{
++    if (has_sensor) { out[0] = real[0]; out[1] = real[1]; out[2] = real[2]; out[3] = real[3]; return 0; }
++    out[0] = PMS_REST_X; out[1] = PMS_REST_Y; out[2] = PMS_REST_Z; out[3] = PMS_REST_G;
++    const u16 both = (u16)(CELL_PAD_CTRL_L1 | CELL_PAD_CTRL_R1);
++    if (!enabled || (buttons & both) != both) return 0;
++    const float rad = PMS_MAX_DEG * pms_stick_unit(rx) * 0.017453293f;
++    float w = (float)PMS_REST_X + PMS_WORDS_PER_G * tanf(rad);
++    w += w >= 0.0f ? 0.5f : -0.5f;
++    out[0] = (u16)(w < 0.0f ? 0 : w > 1023.0f ? 1023 : (int)w);
++    return 1;
++}
++
++#endif /* PS3RECOMP_PAD_MOTION_STICK_H */

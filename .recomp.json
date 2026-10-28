@@ -1,0 +1,25 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Killzone 2",
+  "system": "PS3",
+  "type": "recomp",
+  "original": {
+    "region": "US",
+    "serial": "BCUS98116",
+    "revision": "1.29 (update)"
+  },
+  "project": "Project Pyrrhus",
+  "status": "in-progress",
+  "targets": ["PC (Windows)"],
+  "toolchain": ["ps3recomp"],
+  "approach": "Static recompilation of the PPU and SPU code to C++ with ps3recomp, HLE system libraries, Direct3D 12 RSX backend",
+  "maintainers": [{"name": "undecuple", "link": "https://github.com/undecuple"}],
+  "links": [
+    {"label": "Features", "url": "https://github.com/undecuple/project-pyrrhus/blob/main/docs/FEATURES.md"},
+    {"label": "Release criteria", "url": "https://github.com/undecuple/project-pyrrhus/blob/main/docs/RELEASE-CRITERIA.md"},
+    {"label": "Screenshots", "url": "https://github.com/undecuple/project-pyrrhus/blob/main/docs/SCREENSHOTS.md"}
+  ],
+  "help": ["Testing on real Windows with NVIDIA GPUs", "Testing with real PlayStation and Xbox pads", "Speed: the first level ran at 23.3 frames per second in one scripted run (PS3: 30)"],
+  "tags": ["cell", "spurs", "d3d12"],
+  "notes": "Needs your own copy of the game (disc dump, the 1.29 update and its decrypted EBOOT); the build happens on your PC. Partly playable: the first level is drawn and can be played with a pad; a scripted run gives about 23 frames per second (PS3: 30), and hand play is not measured."
+}

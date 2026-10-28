@@ -1,0 +1,10 @@
+{
+ "comment": "Known data_ps3.psarc of the Killzone 2 US disc (BCUS98116, VERSION 01.01), hashed on our one copy (2026-10-28, inside the sandbox). firstrun_check.py A1: a match is OK; a mismatch on a disc listed here is a WARN until a second copy confirms the hash (then fail_on_mismatch becomes true and a mismatch is a FAIL); any other disc is a WARN.",
+ "sha256": "063d3f157ec4d5b130808f70c22086bb0edaf0070a5aba407d20c200ee8a59e9",
+ "size": 6998576922,
+ "discs": [
+  "BCUS98116"
+ ],
+ "fail_on_mismatch": false,
+ "copies_checked": 1
+}

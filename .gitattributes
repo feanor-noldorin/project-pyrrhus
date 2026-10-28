@@ -1,0 +1,13 @@
+# Adapted from Project Helghast (the Killzone 3 PC port, same author, MIT).
+# No global text/eol normalisation: several ps3recomp sources are CRLF and the patches carry that context byte for
+# byte (a global `text=auto eol=lf` made `git apply` reject them in CI).
+*.png binary
+*.ico binary
+*.bmp binary
+*.ttf binary
+*.bin binary
+*.patch -text linguist-generated=true
+# Licence texts kept byte for byte: tools/release/toolchain.json pins their SHA-256
+tools/release/licence-texts/* -text
+re/wws_jobs_*.tsv linguist-generated=true
+site/index.html linguist-generated=true

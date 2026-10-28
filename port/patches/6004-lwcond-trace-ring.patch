@@ -1,0 +1,60 @@
+ppu_sysprx: PS3_LWCOND_RING=1 records the PS3_LWCOND_TRACE events in a 512-entry ring with timestamps and the paired
+lwmutex owner, printed by ps3_lwcond_ring_dump() (KZ2 watchdog), so the trace does not change the timing it is
+meant to catch (FIOS startup race). Diagnostic only, off by default.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -458,9 +458,50 @@ static int lwc_traced(uint32_t lwcond)
+     }
+     return 0;
+ }
++/* KZ2 patch 6004: PS3_LWCOND_RING=1 keeps the traced events in a 512-entry in-memory ring instead of printing them
++ * (fprintf per event changed the timing enough to hide the FIOS startup race), with a timestamp and the paired
++ * lwmutex's owner word at the time; ps3_lwcond_ring_dump() (the KZ2 watchdog calls it) prints the ring. */
++struct LwcRing { long long us; const char* what; uint32_t ea, tid, lr, owner, arg; long waiters; };
++static LwcRing g_lwc_ring[512];
++static volatile long g_lwc_ring_n = 0;
++static int lwc_ring_on(void)
++{
++    static int r = -1;
++    if (r < 0) { const char* e = getenv("PS3_LWCOND_RING"); r = (e && *e && *e != '0') ? 1 : 0; }
++    return r;
++}
++static long long lwc_ring_us(void)
++{
++    static LARGE_INTEGER f; LARGE_INTEGER c;
++    if (!f.QuadPart) QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (long long)(c.QuadPart * 1000000 / f.QuadPart);
++}
++extern "C" void ps3_lwcond_ring_dump(void)
++{
++    long n = g_lwc_ring_n, first = n > 512 ? n - 512 : 0;
++    long long t0 = first < n ? g_lwc_ring[first % 512].us : 0;
++    fprintf(stderr, "[LWC-RING] %ld events (showing %ld)\n", n, n - first);
++    for (long i = first; i < n; i++) {
++        const LwcRing& e = g_lwc_ring[i % 512];
++        fprintf(stderr, "[LWC-RING] %4ld +%9lldus %-10s ea=0x%08X tid=%u lr=0x%08X waiters=%ld mutex-owner=%u arg=0x%X\n",
++                i, e.us - t0, e.what ? e.what : "?", e.ea, e.tid, e.lr, e.waiters, e.owner, e.arg);
++    }
++}
+ static void lwc_trace(const char* what, uint32_t lwcond, ppu_context* ctx, long waiters, uint32_t arg)
+ {
+     if (!lwc_traced(lwcond)) return;
++    if (lwc_ring_on()) {
++        long i = _InterlockedIncrement(&g_lwc_ring_n) - 1;
++        LwcRing& e = g_lwc_ring[i % 512];
++        e.what = nullptr;
++        e.us = lwc_ring_us(); e.ea = lwcond; e.tid = ctx ? (uint32_t)ctx->thread_id : 0u;
++        e.lr = ctx ? (uint32_t)ctx->lr : 0u; e.waiters = waiters; e.arg = arg;
++        uint32_t m = vm_read32(lwcond + 0x00);
++        e.owner = m ? vm_read32(m + LWM_OWNER) : 0xFFFFFFFFu;
++        e.what = what;
++        return;
++    }
+     fprintf(stderr, "[LWC] %s ea=0x%08X tid=%llu lr=0x%08X waiters=%ld arg=0x%X\n", what, lwcond,
+             ctx ? (unsigned long long)ctx->thread_id : 0ull, ctx ? (uint32_t)ctx->lr : 0u, waiters, arg);
+ }

@@ -1,0 +1,241 @@
+KZ2 patch 6026: the FIFO walker follows the new-form RSX JUMP (offset | 1) as well as the old one (0x20000000 | offset).
+
+The walker decoded a JUMP only as w >> 29 == 1. The RSX also takes JUMP as (w & 0xE0000003) == 1 with target
+w & 0xFFFFFFFC (RPCS3 rsx_methods.h RSX_METHOD_NEW_JUMP_CMD; read, not copied); the walker read that word as a method
+header (type 0, count (w >> 18) & 0x7FF) and walked on into the words behind it, writing them into registers until a
+resync (a black room in another ps3recomp port; a register the game writes only on change stays wrong). Masks kept
+in one place: libs/video/gcm_fifo_word.h (new). The new form goes through the existing JUMP branch, self-JUMP park
+check included; CALL takes its target with 0xFFFFFFFC and RETURN is matched with 0xFFFF0003 as RPCS3 does. The park
+diagnostics (KZ3 1008 park-diag, 1009 park-trace terminator, 1025 park-scan), the 6008 command watch and the
+reference rescue scans read both forms. GCM_WORD_STATS splits the jump count: jump= (old form), jumpn= (new form),
+and hdr0= (method headers with count 0); a running "[words] new-form JUMPs so far" line appears once there are any.
+Host test: tools/runtime/test_gcm_jump.sh. Upstream: a candidate, shared with other ps3recomp ports.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -11,6 +11,7 @@
+ #include "rsx_live_draw.h"
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+ #include "rsx_draw_engine.h"
++#include "gcm_fifo_word.h"   /* KZ2 patch 6026: old- and new-form JUMP decode */
+ #include "cellGcmSys.h"
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+@@ -1107,11 +1108,11 @@ static void gcm_cmd_watch_check(u32 get, u32 w, u32 put)
+         s_cw_last[k] = w;
+         if (logged >= cap) return;
+         logged++;
+-        const u32 type = w >> 29;
++        const int jmp = gcm_word_is_jump(w);   /* patch 6026: either JUMP form */
+         fprintf(stderr, "[gcm-watch] tag %u io 0x%08X word 0x%08X %s 0x%08X put 0x%08X\n", s_cw_tag[k], get, w,
+-                type == 1 ? ((w & 0x1FFFFFFCu) == get ? "JUMP-self (park) ->" : "JUMP ->") :
+-                (w & 3u) == 2u ? "CALL ->" : w == 0x00020000u ? "RET" : "method/data",
+-                type == 1 ? (w & 0x1FFFFFFCu) : (w & 3u) == 2u ? (w & ~3u) : 0u, put);
++                jmp ? (gcm_word_jump_target(w) == get ? "JUMP-self (park) ->" : "JUMP ->") :
++                gcm_word_is_call(w) ? "CALL ->" : gcm_word_is_return(w) ? "RET" : "method/data",
++                jmp ? gcm_word_jump_target(w) : gcm_word_is_call(w) ? gcm_word_call_target(w) : 0u, put);
+     }
+ }
+ static u64 s_park_t0 = 0;
+@@ -1165,11 +1166,12 @@ static void kz3_pt_dump(void) {
+     if (!kz3_pt_on()) return;
+     unsigned first = s_pt_n > KZ3_PT_N ? s_pt_n - KZ3_PT_N : 0;
+     for (unsigned k = first; k < s_pt_n; k++) { kz3_pt* e = &s_pt[k % KZ3_PT_N];
+-        u32 nch = 0, lo = 0xFFFFFFFFu, hi = 0, term_then = 0xFFFFFFFFu, term_now = 0xFFFFFFFFu, back = 0x20000000u | (e->park + 0xC);
++        u32 nch = 0, lo = 0xFFFFFFFFu, hi = 0, term_then = 0xFFFFFFFFu, term_now = 0xFFFFFFFFu, back = e->park + 0xC;
+         for (u32 i = 0; i < KZ3_PT_SNAP; i += 4) { u32 ea = gcm_io2ea(e->tgt + i); u32 v = ea ? vm_read32(ea) : 0, o; memcpy(&o, e->snap + i, 4);
+             if (v != o) { nch++; if (i < lo) lo = i; hi = i; }
+-            if (o == back && term_then == 0xFFFFFFFFu) term_then = i;
+-            if (v == back && term_now == 0xFFFFFFFFu) term_now = i; }
++            /* patch 6026: the JUMP back to park + 0xC in either form */
++            if (gcm_word_is_jump(o) && gcm_word_jump_target(o) == back && term_then == 0xFFFFFFFFu) term_then = i;
++            if (gcm_word_is_jump(v) && gcm_word_jump_target(v) == back && term_now == 0xFFFFFFFFu) term_now = i; }
+         fprintf(stderr, "[park-trace] #%u t=%u park=%08X refs=%u -> %08X put=%08X cur0=%08X cur1=%08X | ret from %08X t=%u cur1=%08X | term then +%X now +%X | %u words changed since [+%X..+%X] now t=%u\n",
+                 k, e->t_ms, e->park, e->refs, e->tgt, e->put, e->cur0, e->cur1, e->ret_from, e->ret_t, e->ret_cur1,
+                 term_then, term_now, nch, lo, hi, kz3_pt_ms()); }
+@@ -1986,7 +1988,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+              * every flip after it waits for the drain forever. */
+             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
+                 s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
+-            if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
++            if ((w >> 29) != 0 || (w & 3u) != 0 || (w & 0x1FFCu) != 0x0050u) continue;   /* (w & 3): patch 6026 */
+             u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
+             gcm_ref_push_at(vm_read32(dea), io);
+             rescued++;
+@@ -2908,7 +2910,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         for (u32 io = 0; io + 8 <= put; io += 4) {
+             u32 ea = gcm_io2ea(io); if (!ea) continue;
+             u32 w = vm_read32(ea);
+-            if ((w & 0x1FFCu) == 0x0050u && (w >> 29) == 0) {
++            if ((w & 0x1FFCu) == 0x0050u && (w >> 29) == 0 && (w & 3u) == 0) {   /* (w & 3): patch 6026 */
+                 u32 dea = gcm_io2ea(io + 4);
+                 fprintf(stderr, "[SCANREF] io=%08X w=%08X count=%u arg=%08X\n",
+                         io, w, (w >> 18) & 0x7FFu, dea ? vm_read32(dea) : 0xDEADu);
+@@ -2980,12 +2982,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         s_tr_off[s_tr_i % GCM_TRACE_N] = s_fifo_getoff;
+         s_tr_w[s_tr_i % GCM_TRACE_N] = w;
+         s_tr_i++;
+-        if (w && ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u || (w & 3u) == 2u)) {
++        if (gcm_word_is_branch(w)) {   /* patch 6026 */
+             s_cf_off[s_cf_i % 8] = s_fifo_getoff; s_cf_w[s_cf_i % 8] = w; s_cf_i++; }
+         /* GCM_WORD_STATS=<secs>: NOP words vs headers vs jumps/calls/returns
+          * walked -- a frame that is mostly NOPs is reserved space someone
+          * (an SPU job) was supposed to fill. */
+-        { static int ws = -1; static unsigned long long nop, hdr, jmp, cal, ret, t0;
++        /* Patch 6026: jumps split into the old form (jump=) and the new form (jumpn=); hdr0 = method headers with
++         * count 0 (how a walker without the new form read a new-form JUMP). */
++        { static int ws = -1; static unsigned long long nop, hdr, jmp, jmpn, hdr0, cal, ret, t0;
+           if (ws < 0) { const char* e = getenv("GCM_WORD_STATS"); ws = e ? atoi(e) : 0; }
+           if (ws > 0) {
+               if (!w && s_fifo_getoff < put) { static int mm = 0;
+@@ -2994,20 +2998,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                       fprintf(stderr, "[io2ea-mismatch] io=%08X walker_ea=%08X (w=0) alias=%08X w=%08X\n",
+                               s_fifo_getoff, ea, alias, vm_read32(alias)); } }
+               if (!w) nop++;
+-              else if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) jmp++;
+-              else if ((w & 3u) == 2u) cal++;
+-              else if (w == 0x00020000u) ret++;
+-              else hdr++;
++              else if (gcm_word_is_old_jump(w)) jmp++;
++              else if (gcm_word_is_new_jump(w)) jmpn++;
++              else if (gcm_word_is_call(w)) cal++;
++              else if (gcm_word_is_return(w)) ret++;
++              else { hdr++; if (!((w >> 18) & 0x7FFu)) hdr0++; }
+               extern unsigned long long ps3_ms_now(void);
+               const unsigned long long now = ps3_ms_now();
+               if (!t0) t0 = now;
+               if (now - t0 >= (unsigned long long)ws * 1000u) {
+-                  fprintf(stderr, "[words] nop=%llu hdr=%llu jump=%llu call=%llu ret=%llu get=0x%08X put=0x%08X jumps:",
+-                          nop, hdr, jmp, cal, ret, s_fifo_getoff, put);
++                  fprintf(stderr, "[words] nop=%llu hdr=%llu hdr0=%llu jump=%llu jumpn=%llu call=%llu ret=%llu get=0x%08X put=0x%08X jumps:",
++                          nop, hdr, hdr0, jmp, jmpn, cal, ret, s_fifo_getoff, put);
++                  { static unsigned long long tn; tn += jmpn;   /* patch 6026: running total of new-form JUMPs */
++                    if (jmpn) fprintf(stderr, "[words] new-form JUMPs so far: %llu\n", tn); }
+                   for (u32 t = 4; t >= 1; t--) { u32 q = (s_cf_i - t) % 8;
+                       fprintf(stderr, " %08X@%08X", s_cf_w[q], s_cf_off[q]); }
+                   fprintf(stderr, "\n");
+-                  nop = hdr = jmp = cal = ret = 0; t0 = now;
++                  nop = hdr = hdr0 = jmp = jmpn = cal = ret = 0; t0 = now;
+               } } }
+         /* A run of NOP words. God of War HD builds command blocks on SPUs into
+          * fixed-size reservations and leaves the rest of each one zero: in
+@@ -3096,11 +3103,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             continue;
+         }
+ 
+-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
++        /* JUMP: 0x20000000 | offset (old form) or offset | 1 (new form). Patch 6026: the new form was read as a
++         * method header (type 0, count (w >> 18) & 0x7FF) and the walker went on into the words behind it. */
++        if (gcm_word_is_jump(w)) {
+             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+-              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+-                               s_fifo_getoff, w & 0x1FFFFFFCu, put); }
+-            { u32 tgt = w & 0x1FFFFFFCu;
++              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)%s\n",
++                               s_fifo_getoff, gcm_word_jump_target(w), put, gcm_word_is_new_jump(w) ? " new-form" : ""); }
++            { u32 tgt = gcm_word_jump_target(w);
+               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
+               /* A JUMP to its own address is the "park the RSX here" idiom:
+                * the title leaves it at the write head so the GPU stops if it
+@@ -3156,11 +3165,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                 fprintf(stderr, "\n"); }
+                             u32 base = s_config.ioAddress, sz = s_config.ioSize; int hits = 0;
+                             for (u32 q = 0; q + 4 <= sz && hits < 24; q += 4) {
+-                                u32 w = vm_read32(base + q), t = w & 0x1FFFFFFCu;
+-                                if (((w & 0xE0000003u) == 0x20000000u || (w & 0xE0000003u) == 2u) &&
++                                u32 w = vm_read32(base + q), t = gcm_word_branch_target(w);   /* patch 6026: both JUMP forms */
++                                if ((gcm_word_is_jump(w) || (w & 0xE0000003u) == 2u) &&
+                                     t + 0x4000u > s_fifo_getoff && t <= s_fifo_getoff && t != q) {
+                                     hits++;
+-                                    fprintf(stderr, "[park-scan] %s at io 0x%08X -> 0x%08X; before:", (w & 3u) == 2u ? "CALL" : "JUMP", q, t);
++                                    fprintf(stderr, "[park-scan] %s at io 0x%08X -> 0x%08X; before:", gcm_word_is_call(w) ? "CALL" : gcm_word_is_new_jump(w) ? "JUMPn" : "JUMP", q, t);
+                                     for (u32 j = 8; j >= 1; j--) fprintf(stderr, " %08X", q >= j * 4 ? vm_read32(base + q - j * 4) : 0);
+                                     fprintf(stderr, "\n"); }
+                             }
+@@ -3191,11 +3200,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                                         fprintf(stderr, "\n"); }
+                                     /* Which JUMP/CALL in IO memory leads into the 0x400 bytes before it. */
+                                     for (u32 q = 0; q + 4 <= sz; q += 4) {
+-                                        u32 w = vm_read32(base + q), t = w & 0x1FFFFFFCu;
+-                                        if (((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 2u) &&
++                                        u32 w = vm_read32(base + q), t = gcm_word_branch_target(w);   /* patch 6026 */
++                                        if ((gcm_word_is_jump(w) || (w & 0xE0000003u) == 2u) &&
+                                             t + 0x400 > o && t <= o && t != q)
+                                             fprintf(stderr, "[park-diag]   %s at io 0x%08X -> 0x%08X\n",
+-                                                    (w & 3u) == 2u ? "CALL" : "JUMP", q, t);
++                                                    gcm_word_is_call(w) ? "CALL" : gcm_word_is_new_jump(w) ? "JUMPn" : "JUMP", q, t);
+                                     }
+                                 }
+                         } }
+@@ -3229,14 +3238,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+               if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
+             continue;
+         }
+-        if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+-            { u32 tgt = w & 0x1FFFFFFCu;
++        if (gcm_word_is_call(w)) {             /* CALL: offset | 2 */
++            { u32 tgt = gcm_word_call_target(w);
+               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+               s_fifo_calloff = s_fifo_getoff + 4;
+               s_fifo_getoff  = tgt; }
+             continue;
+         }
+-        if (w == 0x00020000u) {                /* RET */
++        if (gcm_word_is_return(w)) {           /* RET (patch 6026: RPCS3's mask, method bits ignored) */
+             s_fifo_getoff = s_fifo_calloff;
+             s_fifo_calloff = 0;
+             continue;
+diff --git a/libs/video/gcm_fifo_word.h b/libs/video/gcm_fifo_word.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/gcm_fifo_word.h
+@@ -0,0 +1,46 @@
++/* KZ2 patch 6026: RSX FIFO control-word decode, in one place for the walker and its diagnostics.
++ *
++ * The RSX command stream has two JUMP encodings. The old one is 0x20000000 | offset (top three bits 001, low two
++ * bits 00, offset in bits 2..28). The new one is offset | 1 (top three bits 000, low two bits 01, offset in bits
++ * 2..31, which the top-bits test limits to below 0x20000000). CALL is offset | 2 and RETURN is 0x00020000. A word
++ * whose low two bits are 01 is never a valid method header (a header's method offset is word-aligned), so a walker
++ * that only knows the old JUMP reads a new-form JUMP as a header with method count (w >> 18) & 0x7FF and walks into
++ * whatever follows it.
++ * Masks as RPCS3's RSX_METHOD_OLD_JUMP_CMD_MASK / RSX_METHOD_NEW_JUMP_CMD_MASK / RSX_METHOD_CALL_CMD_MASK /
++ * RSX_METHOD_RETURN_MASK (rsx_methods.h; read, not copied), as another ps3recomp port also does. */
++#ifndef GCM_FIFO_WORD_H
++#define GCM_FIFO_WORD_H
++
++#include <stdint.h>
++
++#define GCM_OLD_JUMP_MASK    0xE0000003u
++#define GCM_OLD_JUMP_CMD     0x20000000u
++#define GCM_OLD_JUMP_OFFSET  0x1FFFFFFCu
++#define GCM_NEW_JUMP_MASK    0xE0000003u
++#define GCM_NEW_JUMP_CMD     0x00000001u
++#define GCM_NEW_JUMP_OFFSET  0xFFFFFFFCu
++#define GCM_CALL_MASK        0x00000003u
++#define GCM_CALL_CMD         0x00000002u
++#define GCM_CALL_OFFSET      0xFFFFFFFCu
++#define GCM_RETURN_MASK      0xFFFF0003u
++#define GCM_RETURN_CMD       0x00020000u
++
++static inline int gcm_word_is_old_jump(uint32_t w) { return (w & GCM_OLD_JUMP_MASK) == GCM_OLD_JUMP_CMD; }
++static inline int gcm_word_is_new_jump(uint32_t w) { return (w & GCM_NEW_JUMP_MASK) == GCM_NEW_JUMP_CMD; }
++static inline int gcm_word_is_jump(uint32_t w) { return gcm_word_is_old_jump(w) || gcm_word_is_new_jump(w); }
++static inline int gcm_word_is_call(uint32_t w) { return (w & GCM_CALL_MASK) == GCM_CALL_CMD; }
++static inline int gcm_word_is_return(uint32_t w) { return (w & GCM_RETURN_MASK) == GCM_RETURN_CMD; }
++/* JUMP target (either form; the caller has checked gcm_word_is_jump). */
++static inline uint32_t gcm_word_jump_target(uint32_t w)
++{
++    return gcm_word_is_old_jump(w) ? (w & GCM_OLD_JUMP_OFFSET) : (w & GCM_NEW_JUMP_OFFSET);
++}
++static inline uint32_t gcm_word_call_target(uint32_t w) { return w & GCM_CALL_OFFSET; }
++/* A JUMP or CALL (the words the park scans look for as sources). */
++static inline int gcm_word_is_branch(uint32_t w) { return gcm_word_is_jump(w) || gcm_word_is_call(w); }
++static inline uint32_t gcm_word_branch_target(uint32_t w)
++{
++    return gcm_word_is_jump(w) ? gcm_word_jump_target(w) : gcm_word_call_target(w);
++}
++
++#endif

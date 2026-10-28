@@ -1,0 +1,765 @@
+sys_fs / cellFs: a file a FAT32 copy keeps as <name>.66600, <name>.66601, ... is opened, read and stat'ed as one file.
+
+Symptom: a PS3 disc copied to a FAT32 drive keeps every file over 4 GiB as numbered parts; Killzone 2's
+data_ps3.psarc (6,998,576,922 bytes) becomes data_ps3.psarc.66600 and .66601, and Killzone 3's public issue 4 came
+from such a dump. The game opens data_ps3.psarc twice (lv2 sys_fs_open from guest code, then cellFsOpen for FIOS) and
+stats it through cellFsStat; every one of those misses, and sys_fs's USRDIR flattening cannot even find the
+PS3_GAME path because its fallbacks test candidates with stat(). Fix: a header-only part-set reader
+(include/ps3emu/split_file.h, adapted from the Killzone 3 PC port's port/vfs/kz3_splitfile.h, KZ3 b1a6262d, same
+author, MIT) and the routing:
+ - sys_fs.c: the path resolvers (ps3game_layout_fallback, the miss hook test, sys_fs_translate_path's fallbacks)
+   count a part set as an existing file (fs_host_exists); a read-only sys_fs_open that misses opens the set
+   (sys_fs_fd_info.sf instead of fp); read, lseek, fstat (first part's times, the set's size) and close serve it,
+   write answers EBADF; sys_fs_stat answers the set's size.
+ - ppu_fs.cpp: a read-only cellFsOpen that misses opens the set (g_split[fd]); cellFsRead/Lseek/Fstat/Close,
+   cellFsFGetBlockSize and cellFsAioRead (positional) serve it; cellFsStat is registered through cellFsStat_split,
+   which answers a set only after the plain stat missed (a hit costs nothing extra).
+A single file is opened exactly as before (the set is only looked for after the plain open missed). A set must
+start at .66600 and be contiguous: a missing part with a later one present is refused (ENOENT) and the missing
+part is named in the log ("[fs] open FAIL ...: split parts: <name>.66601 is missing ..."). Part sizes come from
+the files, so any splitter's part size works. The first read across a part edge is logged once per fd, and close
+logs how many reads crossed an edge. Not done: opendir/readdir still list the parts by their own names (KZ2 lists
+only patch_data_ps3/). Upstream candidate (general: any title from a FAT32 dump).
+Verification: tools/runtime/test_split_file.sh (single file, parts of uneven size, reads across every edge,
+positional reads, seeks, the gaps named); kz2.exe booted from staged 2- and 7-part copies of the dump into the
+first level, including a read across a part edge.
+
+diff --git a/include/ps3emu/split_file.h b/include/ps3emu/split_file.h
+new file mode 100644
+index 0000000..2272bed
+--- /dev/null
++++ b/include/ps3emu/split_file.h
+@@ -0,0 +1,211 @@
++/*
++ * ps3recomp - a read-only file stored as FAT32 split parts, read as one file.
++ *
++ * A PS3 disc copied to a FAT32 drive keeps every file over 4 GiB as parts named <name>.66600, <name>.66601, ...
++ * in order (Killzone 2's data_ps3.psarc is 6,998,576,922 bytes: two parts). The guest opens <name>; on the PS3
++ * the parts are joined when the copy is made. ps3_sf_open(path) opens <path> when it is a file, else the parts
++ * <path>.66600, .66601, ... as one file whose size is the sum of theirs. Part sizes are read from the files, never
++ * assumed, so any splitter's part size works. The set must start at .66600 and be contiguous: a missing part with
++ * a later one present ("a gap") is refused and named (why), so a game never reads a short archive. The same rule as
++ * KZ2's first-run check (tools/release/firstrun_check.py split_parts). Names: the suffix is digits, and the host
++ * file system decides case (Windows and Wine match DATA_PS3.PSARC.66600 for data_ps3.psarc.66600).
++ *
++ * Every part stays open while the handle is. Reads are positional per part (seek + read under the part stream's
++ * lock), so several threads may read one handle; ps3_sf_read/ps3_sf_seek also keep a handle position (cellFs
++ * semantics) under the first part's lock. Header only, plain C (C++ compatible). Host test:
++ * tools/runtime/test_split_file.sh (KZ2).
++ *
++ * Adapted from the Killzone 3 PC port's port/vfs/kz3_splitfile.h (KZ3 commit b1a6262d, same author, MIT): the part
++ * names and the size walk are KZ3's; the positional reads, the handle lock, the gap check with the missing part
++ * named, the existence probe for the VFS path resolvers and the edge counter are new here (Killzone 2 port, KZ2
++ * patch 6034).
++ */
++#ifndef PS3EMU_SPLIT_FILE_H
++#define PS3EMU_SPLIT_FILE_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#define PS3_SF_FIRST_PART    66600   /* the FAT32 splitter's first suffix */
++#define PS3_SF_MAX_PARTS     100     /* .66600 ... .66699 */
++#define PS3_SF_GAP_LOOKAHEAD 4       /* with no .66600: .66601-.66604 looked for (a missing first part named) */
++
++#ifdef _WIN32
++#  define PS3_SF_SEEK(f, o)  _fseeki64((f), (__int64)(o), SEEK_SET)
++#  define PS3_SF_LOCK(f)     _lock_file(f)
++#  define PS3_SF_UNLOCK(f)   _unlock_file(f)
++#else
++#  define PS3_SF_SEEK(f, o)  fseeko((f), (off_t)(o), SEEK_SET)
++#  define PS3_SF_LOCK(f)     flockfile(f)
++#  define PS3_SF_UNLOCK(f)   funlockfile(f)
++#endif
++
++typedef struct ps3_sf {
++    int nparts;
++    FILE** f;               /* nparts open streams */
++    uint64_t* start;        /* nparts + 1 offsets; start[nparts] is the size */
++    uint64_t pos;           /* the handle position (ps3_sf_read / ps3_sf_seek) */
++    uint32_t edge_reads;    /* reads that crossed a part edge (diagnostics) */
++    int new_part;           /* the part a read reached for the first time, -1 when it reached none (diagnostics) */
++    uint8_t seen[PS3_SF_MAX_PARTS];   /* parts read at least once (diagnostics) */
++} ps3_sf;
++
++/* 1 and the size when p is a regular file. */
++static inline int ps3_sf_file_size_(const char* p, uint64_t* out)
++{
++#ifdef _WIN32
++    struct _stat64 st;
++    if (_stat64(p, &st) != 0 || !(st.st_mode & _S_IFREG)) return 0;
++#else
++    struct stat st;
++    if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
++#endif
++    if (out) *out = (uint64_t)st.st_size;
++    return 1;
++}
++
++static inline void ps3_sf_part_name(char* out, size_t cap, const char* path, int i)
++{
++    snprintf(out, cap, "%s.%d", path, PS3_SF_FIRST_PART + i);
++}
++
++/* Cheap existence test for path resolvers: is there a first part beside a missing <path>? One stat. */
++static inline int ps3_sf_has_parts(const char* path)
++{
++    char p[1100];
++    if (!path || strlen(path) + 8 >= sizeof p) return 0;
++    ps3_sf_part_name(p, sizeof p, path, 0);
++    return ps3_sf_file_size_(p, NULL);
++}
++
++/* The part set beside <path> (the plain file is not looked at).
++ *   1  a complete set: *nparts parts, *total bytes (sizes[] filled when given, PS3_SF_MAX_PARTS entries)
++ *   0  no parts at all
++ *  -1  a broken set: a part is missing before a later one; why names the missing part */
++static inline int ps3_sf_scan(const char* path, int* nparts, uint64_t* total, uint64_t* sizes, char* why, size_t whycap)
++{
++    char p[1100];
++    uint64_t sz = 0, sum = 0;
++    int n = 0;
++    if (why && whycap) why[0] = 0;
++    if (!path || strlen(path) + 8 >= sizeof p) return 0;
++    for (; n < PS3_SF_MAX_PARTS; n++) {
++        ps3_sf_part_name(p, sizeof p, path, n);
++        if (!ps3_sf_file_size_(p, &sz)) break;
++        if (sizes) sizes[n] = sz;
++        sum += sz;
++    }
++    /* After a set: every later number (as the first-run check, which lists the folder); before any part: a few,
++     * so a plain missing file costs only a handful of stats. */
++    const int last = n ? PS3_SF_MAX_PARTS - 1 : PS3_SF_GAP_LOOKAHEAD;
++    for (int k = n + 1; k <= last && k < PS3_SF_MAX_PARTS; k++) {
++        ps3_sf_part_name(p, sizeof p, path, k);
++        if (!ps3_sf_file_size_(p, NULL)) continue;
++        if (why && whycap) {
++            if (n) snprintf(why, whycap, "%s.%d is missing (found .%d to .%d, and .%d)", path, PS3_SF_FIRST_PART + n,
++                            PS3_SF_FIRST_PART, PS3_SF_FIRST_PART + n - 1, PS3_SF_FIRST_PART + k);
++            else   snprintf(why, whycap, "%s.%d is missing (found .%d)", path, PS3_SF_FIRST_PART, PS3_SF_FIRST_PART + k);
++        }
++        return -1;
++    }
++    if (n == 0) return 0;
++    if (nparts) *nparts = n;
++    if (total) *total = sum;
++    return 1;
++}
++
++static inline void ps3_sf_close(ps3_sf* s)
++{
++    if (!s) return;
++    for (int i = 0; i < s->nparts; i++) if (s->f && s->f[i]) fclose(s->f[i]);
++    free(s->f); free(s->start); free(s);
++}
++
++/* <path> itself when it is a regular file, else its complete part set. NULL when neither (why names a missing
++ * part of a broken set, else stays empty). */
++static inline ps3_sf* ps3_sf_open(const char* path, char* why, size_t whycap)
++{
++    uint64_t sizes[PS3_SF_MAX_PARTS];
++    int n = 0, plain = 0;
++    uint64_t total = 0;
++    char p[1100];
++    if (why && whycap) why[0] = 0;
++    if (!path || strlen(path) + 8 >= sizeof p) return NULL;
++    if (ps3_sf_file_size_(path, &sizes[0])) n = plain = 1;
++    else if (ps3_sf_scan(path, &n, &total, sizes, why, whycap) != 1) return NULL;
++    ps3_sf* s = (ps3_sf*)calloc(1, sizeof *s);
++    if (!s) return NULL;
++    s->f = (FILE**)calloc((size_t)n, sizeof(FILE*));
++    s->start = (uint64_t*)calloc((size_t)n + 1, sizeof(uint64_t));
++    if (!s->f || !s->start) { ps3_sf_close(s); return NULL; }
++    s->nparts = n;
++    s->new_part = -1;
++    for (int i = 0; i < n; i++) {
++        if (plain) snprintf(p, sizeof p, "%s", path);
++        else ps3_sf_part_name(p, sizeof p, path, i);
++        s->f[i] = fopen(p, "rb");
++        if (!s->f[i]) {
++            if (why && whycap) snprintf(why, whycap, "%s cannot be opened", p);
++            ps3_sf_close(s);
++            return NULL;
++        }
++        s->start[i + 1] = s->start[i] + sizes[i];
++    }
++    return s;
++}
++
++static inline uint64_t ps3_sf_size(const ps3_sf* s) { return s->start[s->nparts]; }
++
++/* pread: up to n bytes at off; short only at the end of the set or on an I/O error. Leaves the handle position. */
++static inline size_t ps3_sf_pread(ps3_sf* s, uint64_t off, void* buf, size_t n)
++{
++    uint8_t* o = (uint8_t*)buf;
++    size_t done = 0;
++    int i = 0, touched = 0;
++    s->new_part = -1;
++    while (i < s->nparts && off >= s->start[i + 1]) i++;
++    while (done < n && i < s->nparts) {
++        const uint64_t in_part = off - s->start[i], left = s->start[i + 1] - off;
++        size_t want = n - done, got = 0;
++        if ((uint64_t)want > left) want = (size_t)left;
++        touched++;
++        if (!s->seen[i]) { s->seen[i] = 1; s->new_part = i; }
++        PS3_SF_LOCK(s->f[i]);
++        if (PS3_SF_SEEK(s->f[i], in_part) == 0) got = fread(o + done, 1, want, s->f[i]);
++        PS3_SF_UNLOCK(s->f[i]);
++        done += got; off += got;
++        if (got != want) break;
++        i++;
++    }
++    if (touched > 1) s->edge_reads++;
++    return done;
++}
++
++/* fread(buf, 1, n, f) on the handle position. */
++static inline size_t ps3_sf_read(ps3_sf* s, void* buf, size_t n)
++{
++    PS3_SF_LOCK(s->f[0]);
++    const size_t got = ps3_sf_pread(s, s->pos, buf, n);
++    s->pos += got;
++    PS3_SF_UNLOCK(s->f[0]);
++    return got;
++}
++
++/* lseek: whence SEEK_SET / SEEK_CUR / SEEK_END. Past the end is allowed (the next read returns 0); a negative
++ * result is refused (-1, position unchanged). */
++static inline int ps3_sf_seek(ps3_sf* s, int64_t off, int whence, uint64_t* newpos)
++{
++    PS3_SF_LOCK(s->f[0]);
++    int64_t base = whence == SEEK_END ? (int64_t)ps3_sf_size(s) : whence == SEEK_CUR ? (int64_t)s->pos : 0;
++    const int ok = base + off >= 0;
++    if (ok) s->pos = (uint64_t)(base + off);
++    if (newpos) *newpos = s->pos;
++    PS3_SF_UNLOCK(s->f[0]);
++    return ok ? 0 : -1;
++}
++
++#endif /* PS3EMU_SPLIT_FILE_H */
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index c9255bb..bbc5af4 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -28,6 +28,7 @@
+ #include <atomic>
+ #include <sys/stat.h>
+ #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
++#include "../../include/ps3emu/split_file.h"   /* FAT32 split parts read as one file */
+ 
+ /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
+  * `extern "C"` inside a function body is ill-formed in C++. */
+@@ -228,6 +229,10 @@ static void fs_set_dir(int fd, FILE* f, uint8_t dir)
+     g_fd_dir[fd] = dir;
+ }
+ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
++/* A read-only file a FAT32 copy keeps as <name>.66600, .66601, ...: the fd holds the part set instead of a FILE*
++ * (ps3emu/split_file.h). Exactly one of g_files / g_dirs / g_split is set for an open fd. */
++static ps3_sf* g_split[FS_MAX];
++static uint8_t g_split_edge_logged[FS_MAX];   /* the first read across a part edge is logged once per open */
+ 
+ /* Guest threads open, read and close concurrently (FIOS media threads, audio
+  * streamers). Allocation and release take this lock, so two opens can no longer
+@@ -238,7 +243,7 @@ static int fd_alloc_file(FILE* f)
+ {
+     std::lock_guard<std::mutex> hold(g_fd_lock);
+     for (int i = 3; i < FS_MAX; i++)
+-        if (!g_files[i] && !g_dirs[i]) {
++        if (!g_files[i] && !g_dirs[i] && !g_split[i]) {
+             g_fd_dir[i] = 0;
+             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
+             return i;
+@@ -249,7 +254,7 @@ static int fd_alloc_dir(DIR* d)
+ {
+     std::lock_guard<std::mutex> hold(g_fd_lock);
+     for (int i = 3; i < FS_MAX; i++)
+-        if (!g_files[i] && !g_dirs[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
++        if (!g_files[i] && !g_dirs[i] && !g_split[i]) { __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE); return i; }
+     return -1;
+ }
+ static FILE* fd_file(int fd)
+@@ -261,6 +266,60 @@ static DIR* fd_dir(int fd)
+     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
+ }
+ 
++/* ---- FAT32 split parts ------------------------------------------------------
++ *
++ * A disc copied to a FAT32 drive keeps each file over 4 GiB as <name>.66600, <name>.66601, ... (Killzone 2's
++ * data_ps3.psarc, 7.0 GB, is two parts). The guest opens <name>; a read-only open that misses opens the part set
++ * as one file (a single file and a part set read the same), and the fd's read, lseek, fstat, AIO read and close
++ * go to it. A set with a missing part is refused, and the missing part is named in the log. */
++static int fd_alloc_split(ps3_sf* s)
++{
++    std::lock_guard<std::mutex> hold(g_fd_lock);
++    for (int i = 3; i < FS_MAX; i++)
++        if (!g_files[i] && !g_dirs[i] && !g_split[i]) { __atomic_store_n(&g_split[i], s, __ATOMIC_RELEASE); return i; }
++    return -1;
++}
++static ps3_sf* fd_split(int fd)
++{
++    return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_split[fd], __ATOMIC_ACQUIRE) : nullptr;
++}
++/* cellFsOpen after the host open missed: 1 when the part set answered (opened, or refused with a reason). */
++static int fs_open_split(ppu_context* ctx, const char* gpath, const char* hpath, uint32_t flags, uint32_t fd_ptr)
++{
++    if ((flags & 0x3) != CELL_FS_O_RDONLY || (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND))) return 0;
++    char why[1400];
++    int np = 0;
++    uint64_t total = 0;
++    const int r = ps3_sf_scan(hpath, &np, &total, nullptr, why, sizeof why);
++    if (r == 0) return 0;
++    ps3_sf* s = r > 0 ? ps3_sf_open(hpath, why, sizeof why) : nullptr;
++    if (!s) {
++        fprintf(stderr, "[fs] open FAIL '%s': split parts: %s\n", gpath, why[0] ? why : "cannot be opened");
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT;
++        return 1;
++    }
++    const int fd = fd_alloc_split(s);
++    if (fd < 0) { ps3_sf_close(s); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return 1; }
++    if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
++    strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd] - 1); g_fd_path[fd][sizeof g_fd_path[fd] - 1] = 0;
++    fprintf(stderr, "[fs] open '%s' -> fd %d (%d split parts, %llu bytes)\n", gpath, fd, s->nparts,
++            (unsigned long long)ps3_sf_size(s));
++    ctx->gpr[3] = CELL_OK;
++    return 1;
++}
++static void fs_split_close(int fd)
++{
++    ps3_sf* s = nullptr;
++    if (fd >= 0 && fd < FS_MAX) {
++        std::lock_guard<std::mutex> hold(g_fd_lock);
++        s = g_split[fd];
++        if (s) { __atomic_store_n(&g_split[fd], (ps3_sf*)nullptr, __ATOMIC_RELEASE); g_split_edge_logged[fd] = 0; }
++    }
++    if (!s) return;
++    fprintf(stderr, "[fs] close fd=%d (split parts: %u reads across a part edge)\n", fd, s->edge_reads);
++    ps3_sf_close(s);
++}
++
+ /* ---- handlers ---- */
+ static void cellFsOpen(ppu_context* ctx)
+ {
+@@ -303,6 +362,7 @@ static void cellFsOpen(ppu_context* ctx)
+     }
+     int hfd = open(hpath, oflags | O_BINARY, 0666);
+     if (hfd < 0) {
++        if (fs_open_split(ctx, gpath, hpath, flags, fd_ptr)) return;   /* FAT32 split parts */
+         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+     }
+@@ -448,6 +508,7 @@ static void cellFsClose(ppu_context* ctx)
+         }
+     }
+     if (f) fclose(f);
++    else fs_split_close(fd);   /* FAT32 split parts */
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -488,8 +549,61 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
+     p[len - 1] = p[len - 1];
+ }
+ 
++/* cellFsRead / cellFsLseek / cellFsFstat on a split-parts fd: 1 when answered. */
++static int fs_split_read(ppu_context* ctx)
++{
++    const int fd = (int)(uint32_t)ctx->gpr[3];
++    ps3_sf* s = fd_split(fd);
++    if (!s) return 0;
++    const uint32_t buf = (uint32_t)ctx->gpr[4], nread_ptr = (uint32_t)ctx->gpr[6];
++    uint64_t nbytes = ctx->gpr[5];
++    if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
++    fs_prefault(buf, nbytes);
++    const uint64_t at = s->pos;
++    const size_t n = ps3_sf_read(s, vm_base + buf, (size_t)nbytes);
++    fs_note_guest_write(buf, n);   /* patch 2078 */
++    const int np = s->new_part;
++    if (np >= 0)   /* once per part: which parts the guest has reached */
++        fprintf(stderr, "[fs] read fd=%d reaches split part %d of %d (offset %llu, %llu bytes -> %zu)\n", fd,
++                np + 1, s->nparts, (unsigned long long)at, (unsigned long long)nbytes, n);
++    if (s->edge_reads && !g_split_edge_logged[fd]) {
++        g_split_edge_logged[fd] = 1;
++        fprintf(stderr, "[fs] read fd=%d crosses a split part edge (offset %llu, %llu bytes -> %zu)\n", fd,
++                (unsigned long long)at, (unsigned long long)nbytes, n);
++    }
++    if (nread_ptr) vm_write64(nread_ptr, n);
++    ctx->gpr[3] = CELL_OK;
++    return 1;
++}
++static int fs_split_lseek(ppu_context* ctx)
++{
++    ps3_sf* s = fd_split((int)(uint32_t)ctx->gpr[3]);
++    if (!s) return 0;
++    const uint32_t wh = (uint32_t)ctx->gpr[5], pos_ptr = (uint32_t)ctx->gpr[6];
++    const int w = wh == CELL_FS_SEEK_SET ? SEEK_SET : wh == CELL_FS_SEEK_CUR ? SEEK_CUR : wh == CELL_FS_SEEK_END ? SEEK_END : -1;
++    uint64_t np = 0;
++    if (w < 0 || ps3_sf_seek(s, (int64_t)ctx->gpr[4], w, &np) != 0) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;   /* CELL_FS_EINVAL */
++        return 1;
++    }
++    if (pos_ptr) vm_write64(pos_ptr, np);
++    ctx->gpr[3] = CELL_OK;
++    return 1;
++}
++static void write_stat(uint32_t sb, uint32_t mode, uint64_t size);
++static int fs_split_fstat(ppu_context* ctx)
++{
++    ps3_sf* s = fd_split((int)(uint32_t)ctx->gpr[3]);
++    if (!s) return 0;
++    const uint32_t sb = (uint32_t)ctx->gpr[4];
++    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, ps3_sf_size(s));   /* as cellFsFstat answers a single file */
++    ctx->gpr[3] = CELL_OK;
++    return 1;
++}
++
+ static void cellFsRead(ppu_context* ctx)
+ {
++    if (fs_split_read(ctx)) return;   /* FAT32 split parts */
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+     uint32_t buf    = (uint32_t)ctx->gpr[4];
+     uint64_t nbytes = ctx->gpr[5];
+@@ -629,7 +743,7 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
+ static void cellFsFGetBlockSize(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+-    if (!fd_file(fd)) {
++    if (!fd_file(fd) && !fd_split(fd)) {
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+         return;
+     }
+@@ -645,6 +759,7 @@ static void cellFsGetBlockSize(ppu_context* ctx)
+ 
+ static void cellFsLseek(ppu_context* ctx)
+ {
++    if (fs_split_lseek(ctx)) return;   /* FAT32 split parts */
+     int fd        = (int)(uint32_t)ctx->gpr[3];
+     int64_t off   = (int64_t)ctx->gpr[4];
+     uint32_t wh   = (uint32_t)ctx->gpr[5];
+@@ -711,6 +826,7 @@ static void cellFsStat(ppu_context* ctx)
+ 
+ static void cellFsFstat(ppu_context* ctx)
+ {
++    if (fs_split_fstat(ctx)) return;   /* FAT32 split parts */
+     int fd      = (int)(uint32_t)ctx->gpr[3];
+     uint32_t sb = (uint32_t)ctx->gpr[4];
+     FILE* f = fd_file(fd);
+@@ -1040,7 +1156,13 @@ static void cellFsAioRead(ppu_context* ctx)
+ 
+     size_t n = 0;
+     int32_t err = CELL_FS_ENOENT;
+-    if (FILE* f = fd_file(fd)) {
++    if (ps3_sf* s = fd_split(fd)) {   /* FAT32 split parts: positional, the fd position stays */
++        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
++        fs_prefault(buf, size);
++        n = ps3_sf_pread(s, offset, vm_base + buf, (size_t)size);
++        fs_note_guest_write(buf, n);
++        err = CELL_OK;
++    } else if (FILE* f = fd_file(fd)) {
+         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+         fs_prefault(buf, size);
+         /* AIO reads are absolute: they must not move the fd's own position,
+@@ -1068,6 +1190,26 @@ static void cellFsAioRead(ppu_context* ctx)
+                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+ }
+ 
++/* cellFsStat for a file a FAT32 copy keeps as parts: the host has no <name>, so the stat missed. A complete set
++ * answers as one file of the parts' total size, as a single file would; a broken set stays ENOENT (the open names
++ * the missing part). Registered in place of cellFsStat so a hit costs nothing extra. */
++static void cellFsStat_split(ppu_context* ctx)
++{
++    const uint32_t path_ea = (uint32_t)ctx->gpr[3], sb = (uint32_t)ctx->gpr[4];
++    cellFsStat(ctx);
++    if ((int64_t)ctx->gpr[3] != (int64_t)CELL_FS_ENOENT) return;
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, path_ea, sizeof gpath);
++    if (g_ps3_fs_stat_hook && g_ps3_fs_stat_hook(gpath)) return;   /* the port's own answer stands */
++    host_path(hpath, sizeof hpath, gpath);
++    int np = 0;
++    uint64_t total = 0;
++    if (!ps3_sf_has_parts(hpath) || ps3_sf_scan(hpath, &np, &total, nullptr, nullptr, 0) != 1) return;
++    if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, total);
++    fprintf(stderr, "[fs] stat '%s' -> %d split parts, %llu bytes\n", gpath, np, (unsigned long long)total);
++    ctx->gpr[3] = CELL_OK;
++}
++
+ extern "C" void ppu_fs_register(void)
+ {
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+@@ -1081,7 +1223,7 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsLseek"),    "cellFsLseek",    cellFsLseek);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFGetBlockSize"), "cellFsFGetBlockSize", cellFsFGetBlockSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetBlockSize"),  "cellFsGetBlockSize",  cellFsGetBlockSize);
+-    ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat_split);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index 75c9772..239cb98 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -5,6 +5,7 @@
+ #include "sys_fs.h"
+ #include "../../libs/filesystem/edat.h"
+ #include "../memory/vm.h"
++#include "../../include/ps3emu/split_file.h"   /* FAT32 split parts read as one file */
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -100,20 +101,27 @@ extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
+  * on PE/COFF (MinGW). NULL = no hook. */
+ void (*g_ps3_vfs_miss_hook)(char* path, size_t cap) = NULL;
+ 
++/* A host path the VFS can serve: a file or directory, or a file a FAT32 copy keeps as parts <path>.66600, ...
++ * (ps3emu/split_file.h). The resolvers below test candidates with it, so a part set is found where the single file
++ * would be (Killzone 2's data_ps3.psarc reaches sys_fs as .\USRDIR\data_ps3.psarc and is found under PS3_GAME). */
++static int fs_host_exists(const char* path)
++{
++    struct stat st;
++    return stat(path, &st) == 0 || ps3_sf_has_parts(path);
++}
++
+ static void ps3game_layout_fallback(char* path, size_t cap);
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+ {
+-    struct stat st;
+     if (!path || !*path) return;
+     ps3game_layout_fallback(path, cap);
+-    if (g_ps3_vfs_miss_hook && stat(path, &st) != 0)
++    if (g_ps3_vfs_miss_hook && !fs_host_exists(path))
+         g_ps3_vfs_miss_hook(path, cap);
+ }
+ 
+ static void ps3game_layout_fallback(char* path, size_t cap)
+ {
+-    struct stat st;
+-    if (!path || !*path || stat(path, &st) == 0)
++    if (!path || !*path || fs_host_exists(path))
+         return;
+     /* An HDD game (a PSN title, CATEGORY "HG") boots from /dev_hdd0/game/<id>/,
+      * so that directory is the booted game tree: <root>/game/<id>/X is
+@@ -134,7 +142,7 @@ static void ps3game_layout_fallback(char* path, size_t cap)
+                 memcpy(alt, path, head);
+                 snprintf(alt + head, sizeof alt - head, "/PS3_GAME/%s", g + strlen(key));
+                 fs_normalize_sep(alt);
+-                if (stat(alt, &st) == 0) { snprintf(path, cap, "%s", alt); return; }
++                if (fs_host_exists(alt)) { snprintf(path, cap, "%s", alt); return; }
+             }
+         }
+     }
+@@ -152,7 +160,7 @@ static void ps3game_layout_fallback(char* path, size_t cap)
+         memcpy(alt, path, head);
+         snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
+         fs_normalize_sep(alt);
+-        if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
++        if (fs_host_exists(alt)) snprintf(path, cap, "%s", alt);
+         return;
+     }
+     char alt[1024];
+@@ -161,7 +169,7 @@ static void ps3game_layout_fallback(char* path, size_t cap)
+         return;
+     memcpy(alt, path, head);
+     snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+-    if (stat(alt, &st) != 0)
++    if (!fs_host_exists(alt))
+         return;
+     snprintf(path, cap, "%s", alt);
+ }
+@@ -282,14 +290,13 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
+      * install tree the guest opens. If the primary path doesn't exist but a
+      * USRDIR-relative path under <root>/extracted does, use that. Additive: only
+      * affects paths unresolved at the primary location. */
+-    struct stat st;
+-    if (stat(host_path, &st) != 0) {
++    if (!fs_host_exists(host_path)) {
+         const char* usr = strstr(ps3_path, "/USRDIR/");
+         if (usr) {
+             char alt[1024];
+             snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
+             fs_normalize_sep(alt);
+-            if (stat(alt, &st) == 0)
++            if (fs_host_exists(alt))
+                 snprintf(host_path, (size_t)host_path_size, "%s", alt);
+         }
+     }
+@@ -309,11 +316,11 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
+     /* Use the STRIPPED path and do not require a relative spelling: the title
+      * reports Working Path "/" and opens "/Data/Resources/first.xml", which is
+      * absolute but still means "relative to my USRDIR". */
+-    if (stat(host_path, &st) != 0) {
++    if (!fs_host_exists(host_path)) {
+         char alt2[1024];
+         snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
+         fs_normalize_sep(alt2);
+-        if (stat(alt2, &st) == 0)
++        if (fs_host_exists(alt2))
+             snprintf(host_path, (size_t)host_path_size, "%s", alt2);
+     }
+     ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
+@@ -475,6 +482,32 @@ int64_t sys_fs_open(ppu_context* ctx)
+         }
+     }
+ 
++    /* A read-only open of a file a FAT32 copy keeps as parts: the set is the file (a missing part is named). */
++    if (!fp && access == CELL_FS_O_RDONLY && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND))) {
++        char why[1200];
++        int np = 0;
++        uint64_t total = 0;
++        const int r = ps3_sf_scan(host_path, &np, &total, NULL, why, sizeof why);
++        struct ps3_sf* sf = r > 0 ? ps3_sf_open(host_path, why, sizeof why) : NULL;
++        if (r != 0 && !sf) {
++            fprintf(stderr, "[sys_fs] open FAILED: %s: split parts: %s\n", host_path, why[0] ? why : "cannot be opened");
++            return (int64_t)(int32_t)CELL_ENOENT;
++        }
++        if (sf) {
++            fprintf(stderr, "[sys_fs] open OK: %s (%d split parts, %llu bytes)\n", host_path, sf->nparts,
++                    (unsigned long long)ps3_sf_size(sf));
++            sys_fs_fd_info* f = &g_sys_fs_fds[slot];
++            f->active = 1;
++            f->fp     = NULL;
++            f->sf     = sf;
++            f->flags  = flags;
++            strncpy(f->path, host_path, sizeof(f->path) - 1);
++            f->path[sizeof(f->path) - 1] = '\0';
++            write_be32(fd_out, (uint32_t)(slot + 3));
++            return CELL_OK;
++        }
++    }
++
+     if (!fp) {
+         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
+           fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+@@ -487,6 +520,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+     f->active = 1;
+     f->fp     = fp;
++    f->sf     = NULL;
+     f->flags  = flags;
+     strncpy(f->path, host_path, sizeof(f->path) - 1);
+     f->path[sizeof(f->path) - 1] = '\0';
+@@ -518,6 +552,17 @@ int64_t sys_fs_read(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_EBADF;
+ 
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
++    if (f->active && f->sf) {   /* FAT32 split parts */
++        if (size) vm_commit(buf_addr, (uint32_t)size);
++        const uint64_t at = f->sf->pos;
++        const size_t got = ps3_sf_read(f->sf, vm_to_host(buf_addr), (size_t)size);
++        const int np = f->sf->new_part;
++        if (np >= 0)   /* once per part: which parts the guest has reached */
++            fprintf(stderr, "[sys_fs] read fd=%d reaches split part %d of %d (offset %llu, %llu bytes -> %zu)\n", fd,
++                    np + 1, f->sf->nparts, (unsigned long long)at, (unsigned long long)size, got);
++        if (nread_addr != 0) write_be64(nread_addr, (uint64_t)got);
++        return CELL_OK;
++    }
+     if (!f->active || !f->fp)
+         return (int64_t)(int32_t)CELL_EBADF;
+ 
+@@ -592,6 +637,8 @@ int64_t sys_fs_write(ppu_context* ctx)
+     }
+ 
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
++    if (f->active && f->sf)   /* FAT32 split parts: read-only */
++        return (int64_t)(int32_t)CELL_EBADF;
+     if (!f->active || !f->fp) {
+         if (nwritten_addr != 0)
+             write_be64(nwritten_addr, size);
+@@ -630,6 +677,11 @@ int64_t sys_fs_close(ppu_context* ctx)
+         fclose(f->fp);
+         f->fp = NULL;
+     }
++    if (f->sf) {
++        fprintf(stderr, "[sys_fs] close fd=%d (split parts: %u reads across a part edge)\n", fd, f->sf->edge_reads);
++        ps3_sf_close(f->sf);
++        f->sf = NULL;
++    }
+     f->active = 0;
+ 
+     return CELL_OK;
+@@ -660,7 +712,7 @@ int64_t sys_fs_lseek(ppu_context* ctx)
+     }
+ 
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+-    if (!f->active || !f->fp) {
++    if (!f->active || (!f->fp && !f->sf)) {
+         if (pos_addr)
+             write_be64(pos_addr, 0);
+         return 0;
+@@ -674,6 +726,15 @@ int64_t sys_fs_lseek(ppu_context* ctx)
+         default: return (int64_t)(int32_t)CELL_EINVAL;
+     }
+ 
++    if (f->sf) {   /* FAT32 split parts */
++        uint64_t np = 0;
++        if (ps3_sf_seek(f->sf, offset, origin, &np) != 0)
++            return (int64_t)(int32_t)CELL_EINVAL;
++        if (pos_addr != 0)
++            write_be64(pos_addr, np);
++        return CELL_OK;
++    }
++
+ #ifdef _WIN32
+     _fseeki64(f->fp, offset, origin);
+     int64_t pos = _ftelli64(f->fp);
+@@ -747,7 +808,15 @@ int64_t sys_fs_stat(ppu_context* ctx)
+     if (stat(host_path, &st) != 0)
+ #endif
+     {
+-        return (int64_t)(int32_t)CELL_ENOENT;
++        /* A file a FAT32 copy keeps as parts: one file of their total size, the first part's times. */
++        int np = 0;
++        uint64_t total = 0;
++        char p0[1100];
++        ps3_sf_part_name(p0, sizeof p0, host_path, 0);
++        if (!ps3_sf_has_parts(host_path) || ps3_sf_scan(host_path, &np, &total, NULL, NULL, 0) != 1
++            || stat(p0, &st) != 0)
++            return (int64_t)(int32_t)CELL_ENOENT;
++        st.st_size = (int64_t)total;
+     }
+ 
+     fill_cell_stat(stat_addr, &st);
+@@ -770,20 +839,22 @@ int64_t sys_fs_fstat(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_EBADF;
+ 
+     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+-    if (!f->active || !f->fp)
++    if (!f->active || (!f->fp && !f->sf))
+         return (int64_t)(int32_t)CELL_EBADF;
+ 
+     struct stat st;
++    FILE* sfp = f->sf ? f->sf->f[0] : f->fp;   /* split parts: the first part's times, the set's size below */
+ #ifdef _WIN32
+-    int fno = _fileno(f->fp);
++    int fno = _fileno(sfp);
+     if (_fstat64(fno, (struct _stat64*)&st) != 0)
+ #else
+-    int fno = fileno(f->fp);
++    int fno = fileno(sfp);
+     if (fstat(fno, &st) != 0)
+ #endif
+     {
+         return (int64_t)(int32_t)CELL_EBADF;
+     }
++    if (f->sf) st.st_size = (int64_t)ps3_sf_size(f->sf);
+ 
+     fill_cell_stat(stat_addr, &st);
+     return CELL_OK;
+diff --git a/runtime/syscalls/sys_fs.h b/runtime/syscalls/sys_fs.h
+index dbe84c4..85a1531 100644
+--- a/runtime/syscalls/sys_fs.h
++++ b/runtime/syscalls/sys_fs.h
+@@ -81,9 +81,11 @@ extern "C" {
+ #define CELL_FS_SEEK_END   2
+ 
+ /* File descriptor entry */
++struct ps3_sf;   /* ps3emu/split_file.h */
+ typedef struct sys_fs_fd_info {
+     int    active;
+     FILE*  fp;
++    struct ps3_sf* sf; /* instead of fp: a file a FAT32 copy keeps as <name>.66600, .66601, ... */
+     char   path[512];  /* host path */
+     int    flags;
+ } sys_fs_fd_info;

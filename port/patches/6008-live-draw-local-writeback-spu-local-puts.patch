@@ -1,0 +1,395 @@
+gcm/live-draw: Killzone 2's SPU post chain: local-memory surface write-back, SPU puts into local memory uploaded at bind/present, command-word watch.
+
+Symptom: the scene is drawn into a LOCAL-memory target (0x7B0000 v1.01, 0x760000 1.29) whose
+EA the PPU hands to the SPU post-processing chain (WWS Gfx.Post.* jobs), and the last draw of each frame samples the
+other display buffer, which only the SPU chain writes. Patch 2017 wrote back main-memory surfaces only, and the SPU
+write hook (KZ3 2033) only marked pages for texture hashing; the 2017 band hash can miss an SPU write that lands before
+the walker's flip baseline.
+
+Fix:
+- rsx_live_draw_before_guest_sync also writes back local colour surfaces chosen by LD_LOCAL_WRITEBACK (0/unset off;
+  1|auto = GPU-written local colour surfaces that are not display buffers and have >= LD_LOCAL_WB_MIN_PIXELS pixels,
+  default 640*360; `post` = as auto once rsx_live_draw_local_writeback_arm() was called, which the KZ2 port does when
+  the game's post stage renders; or a comma list of hex offsets). LD_WB_LOG=N logs each local write-back with a non-black count.
+- SPU puts into local memory (cellGcm_note_guest_write_pages_ea, the SPU hook's only user) set bits in a separate
+  page bitmap; ld_gv_validate (texture bind, write-back) and the present consume the bits under a surface and upload
+  those rows from guest memory. LD_SPU_LOCAL_UPLOAD=0 disables, LD_SPU_LOCAL_LOG=N logs marks and applies.
+- LD_FAKE_POST=1 (test aid): after a local write-back, copy that surface's guest rows into every local display buffer
+  and report it through the SPU hook, standing in for the post chain.
+- cellGcm_watch_cmd_ea(ea, tag): the walker logs the word it finds at up to 8 watched command addresses each time
+  it changes (GCM_CMD_WATCH_LOG=N, default 64); the port registers the post stage's command-stream patch word P.
+
+Verification: Killzone 2 under Proton.
+Rebased 2026-10-19 onto KZ3 2044-2086 (context of the SPU hook moved by 2078/2080).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 7b2f7ab..5165e00 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1029,6 +1029,36 @@ static u32 gcm_fifo_backlog(u32 put, u32 get)
+ static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+ static u32 s_fifo_calloff = 0;
+ static u32 s_park_off = 0xFFFFFFFFu;  /* KZ3 patch 1007: park being waited on */
++/* KZ2 patch 6008 (diagnostic): command words the walker reports when it reaches them (cellGcm_watch_cmd_ea). The
++ * Killzone 2 post stage (Render 1.29 0x54B9D0 / v1.01 0x53E930) leaves a word P in the command stream that the PPU
++ * (Render) and the SPU job Gfx.Post.Unlock both overwrite with a JUMP; the port's override registers P here. */
++static volatile u32 s_cw_io[8], s_cw_tag[8], s_cw_last[8];
++static volatile LONG s_cw_n;
++void cellGcm_watch_cmd_ea(u32 ea, u32 tag)
++{
++    const u16 io_page = s_io_address_table[ea >> 20];
++    if (io_page == 0xFFFF) return;
++    const u32 io = ((u32)io_page << 20) | (ea & 0xFFFFFu);
++    const LONG k = InterlockedIncrement(&s_cw_n) - 1;
++    s_cw_io[k & 7] = io; s_cw_tag[k & 7] = tag; s_cw_last[k & 7] = 0xFFFFFFFFu;
++}
++static void gcm_cmd_watch_check(u32 get, u32 w, u32 put)
++{
++    static int cap = -1;
++    static LONG logged;
++    if (cap < 0) { const char* e = getenv("GCM_CMD_WATCH_LOG"); cap = e ? atoi(e) : 64; }
++    for (u32 k = 0; k < 8; k++) {
++        if (s_cw_io[k] != get || s_cw_last[k] == w) continue;
++        s_cw_last[k] = w;
++        if (logged >= cap) return;
++        logged++;
++        const u32 type = w >> 29;
++        fprintf(stderr, "[gcm-watch] tag %u io 0x%08X word 0x%08X %s 0x%08X put 0x%08X\n", s_cw_tag[k], get, w,
++                type == 1 ? ((w & 0x1FFFFFFCu) == get ? "JUMP-self (park) ->" : "JUMP ->") :
++                (w & 3u) == 2u ? "CALL ->" : w == 0x00020000u ? "RET" : "method/data",
++                type == 1 ? (w & 0x1FFFFFFCu) : (w & 3u) == 2u ? (w & ~3u) : 0u, put);
++    }
++}
+ static u64 s_park_t0 = 0;
+ static u32 s_park_put = 0, s_park_putchg = 0;  /* KZ3 patch 1011: put moves during a park wait */
+ 
+@@ -2845,6 +2875,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             break;
+         }
+         u32 w = vm_read32(ea);
++        if (s_cw_n) gcm_cmd_watch_check(s_fifo_getoff, w, put);   /* KZ2 patch 6008 */
+         /* Only remember offsets BELOW put -- those are positions in the
+          * ring the title is writing. A park in another region is where the
+          * walker gave up, not how far it got through the ring. */
+@@ -4497,7 +4528,15 @@ extern void spu_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) _
+ /* The SPU hook marks pages only. Feeding every DMA put into the patch-2017 gv ring made the walker scan all
+  * cache entries per put (texture binds 37-48 ms/frame against 21 before). The ring stays for
+  * explicit callers (cellGcm_note_guest_write_ea: host tests, PPU-side copies). */
+-void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size) { gcm_note_pages_ea(ea, size); }
++/* KZ2 patch 6008: this is the SPU write hook only (no other caller); puts into local memory also go to live-draw's
++ * SPU-local bitmap (rsx_live_draw_note_spu_local_write: the rows are uploaded into the surface under them at its
++ * next bind or present), because Killzone 2's SPU post chain writes its output into a display buffer. */
++void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size)
++{
++    gcm_note_pages_ea(ea, size);
++    if (size && rsx_live_draw_enabled() && ea >= s_config.localAddress && ea - s_config.localAddress < s_config.localSize)
++        rsx_live_draw_note_spu_local_write(ea - s_config.localAddress, size);
++}
+ /* KZ3 patch 2078: host file reads into guest memory (runtime/ppu/ppu_fs.cpp: cellFsRead, the AIO read) mark
+  * pages the same way; a weak reference for the same reason (host tests link without the fs layer). */
+ extern void fs_set_guest_write_hook(void (*hook)(uint32_t ea, uint32_t size)) __attribute__((weak));
+diff --git a/libs/video/cellGcmSys.h b/libs/video/cellGcmSys.h
+index 1892231..bd1d1a2 100644
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -460,6 +460,9 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location);
+  * (SPU DMA put, PPU copy into a texture or render target). Any thread; the
+  * live renderer re-reads the range before its next texture bind. */
+ void cellGcm_note_guest_write_ea(u32 ea, u32 size);
++/* KZ2 patch 6008 (diagnostic): watch the command word at guest EA `ea` (up to 8, oldest replaced); the walker logs
++ * what it finds there each time the word changes (GCM_CMD_WATCH_LOG=N lines, default 64). `tag` names the caller. */
++void cellGcm_watch_cmd_ea(u32 ea, u32 tag);
+ 
+ 
+ #ifdef __cplusplus
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index b1b767e..f7a6a92 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -53,6 +53,8 @@ void rsx_live_draw_debug_vc_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] =
+ u32  rsx_live_draw_report_value(u32 off, u32 dflt) { (void)off; return dflt; }
+ void rsx_live_draw_debug_report_readback_stats(u64 o[6]) { for (int i = 0; i < 6; i++) o[i] = 0; }
+ void rsx_live_draw_note_guest_write_async(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
++void rsx_live_draw_note_spu_local_write(u32 o, u32 n) { (void)o; (void)n; }   /* KZ2 patch 6008 */
++void rsx_live_draw_local_writeback_arm(void) {}                                  /* KZ2 patch 6008 */
+ void rsx_live_draw_note_guest_write_pages(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }   /* patch 2033 */
+ void rsx_live_draw_set_write_source(u32 s) { (void)s; }   /* patch 2081 */
+ void rsx_live_draw_watch_copy(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+@@ -4924,10 +4926,100 @@ static int ld_gv_upload_rows(surface_t* s, u32 y0, u32 y1)
+     return 1;
+ }
+ 
++/* KZ2 patch 6008: SPU DMA puts into RSX local memory.
++ *
++ * Killzone 2's SPU post-processing chain (WWS jobs Gfx.Post.*) writes its result
++ * into a display buffer in local memory, which the GPU then samples as a
++ * texture (the last draw of a frame copies that buffer into the one it flips).
++ * The SPU write hook (spu_dma.h -> cellGcm_note_guest_write_pages_ea) only
++ * marked pages for the quiet-texture hashing (KZ3 2033), and the band hash of
++ * patch 2017 can miss such a write when the flip baselined the surface after
++ * the SPU had already written it (the walker runs behind the PPU, so an SPU job
++ * kicked for frame N can finish before the walker reaches flip N-1). So SPU puts
++ * into local memory also set bits in a separate 64 KB page bitmap; a surface
++ * bound as a texture or presented consumes the bits under it and uploads those
++ * rows from guest memory (the SPU's bytes win over the GPU's copy).
++ * LD_SPU_LOCAL_UPLOAD=0 disables; LD_SPU_LOCAL_LOG=N logs the first N marks and
++ * N applies. ASSUMPTION: SPU puts into local memory are post output (whole
++ * images); one that lands under a live surface the GPU later redraws before any
++ * bind is uploaded at that bind anyway (the GPU's newer pixels are lost). The
++ * hook runs before the put's copy: a bind on the RSX thread inside that window
++ * would upload the old bytes (the game's own sync, semaphore/command-stream
++ * JUMP, normally keeps the RSX behind the SPU). */
++static volatile LONG g_ld_spu_local[LD_TD_WORDS];
++static volatile LONG g_ld_spu_local_any;
++static volatile LONG g_ld_spu_local_marks, g_ld_spu_local_logged;
++static u32 g_ld_spu_local_applies;
++static int ld_spu_local_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_SPU_LOCAL_UPLOAD"); on = e ? atoi(e) != 0 : 1; }
++    return on;
++}
++static int ld_spu_local_log_n(void)
++{
++    static int n = -1;
++    if (n < 0) { const char* e = getenv("LD_SPU_LOCAL_LOG"); n = e ? atoi(e) : 0; }
++    return n;
++}
++/* Any thread (the SPU write hook). `offset` is a local-memory offset. */
++void rsx_live_draw_note_spu_local_write(u32 offset, u32 size)
++{
++    if (!size || !ld_spu_local_on()) return;
++    const u64 end = (u64)offset + size - 1u;
++    const u32 p0 = offset >> 16, p1 = (u32)(end > 0xFFFFFFFFull ? 0xFFFFFFFFull : end) >> 16;
++    for (u32 p = p0; ; p++) {
++        const LONG bit = (LONG)(1u << (p & 31u));
++        if (!(g_ld_spu_local[p >> 5] & bit)) InterlockedOr(&g_ld_spu_local[p >> 5], bit);
++        if (p == p1) break;
++    }
++    g_ld_spu_local_any = 1;
++    const LONG m = InterlockedIncrement(&g_ld_spu_local_marks);
++    const int ln = ld_spu_local_log_n();
++    if (ln > 0 && (m <= ln || (m & 65535) == 0))
++        fprintf(stderr, "[kz2-spu-local] mark #%ld local 0x%08X +0x%X (frame %u)\n", (long)m, offset, size, g_ld_frames);
++}
++/* RSX thread. Upload the SPU-marked rows of local surface i. Returns 1 if it uploaded. */
++static u32 ld_spu_local_apply(u32 i)
++{
++    if (!g_ld_spu_local_any || i >= g.n_surfaces) return 0;
++    surface_t* s = &g.surfaces[i];
++    u32 texel, gp;
++    if (s->location != 0u || !ld_gv_geometry(s, &texel, &gp)) return 0;
++    const u64 span = (u64)gp * (s->h - 1u) + (u64)s->w * texel;
++    const u32 p0 = s->offset >> 16, p1 = (u32)(((u64)s->offset + span - 1u) >> 16);
++    u32 lo = 0xFFFFFFFFu, hi = 0;
++    for (u32 p = p0; p <= p1 && p < LD_TD_WORDS * 32u; p++) {
++        const LONG bit = (LONG)(1u << (p & 31u));
++        if (g_ld_spu_local[p >> 5] & bit) {
++            InterlockedAnd(&g_ld_spu_local[p >> 5], ~bit);
++            if (lo == 0xFFFFFFFFu) lo = p;
++            hi = p;
++        }
++    }
++    if (lo == 0xFFFFFFFFu) return 0;
++    const u64 b0 = (u64)lo << 16, b1 = ((u64)hi + 1u) << 16;
++    const u32 y0 = b0 <= s->offset ? 0u : (u32)((b0 - s->offset) / gp);
++    u64 y1 = (b1 - s->offset + gp - 1u) / gp;
++    if (y1 > s->h) y1 = s->h;
++    const int ok = ld_gv_upload_rows(s, y0, (u32)y1);
++    if (ok) {
++        if (ld_gv_enabled()) ld_gv_baseline(s);
++        g_ld_spu_local_applies++;
++        const int ln = ld_spu_local_log_n();
++        if (ln > 0 && (g_ld_spu_local_applies <= (u32)ln || (g_ld_spu_local_applies & 1023u) == 0))
++            fprintf(stderr, "[kz2-spu-local] apply #%u surface 0:0x%08X %ux%u rows %u..%u uploaded (frame %u, marks %ld)\n",
++                    g_ld_spu_local_applies, s->offset, s->w, s->h, y0, (u32)y1, g_ld_frames, (long)g_ld_spu_local_marks);
++    }
++    return ok ? 1u : 0u;
++}
++
+ /* Bring surface i up to date with guest writes made after the GPU's last
+  * write. Returns the number of row ranges uploaded (0 = host copy current). */
+ static u32 ld_gv_validate(u32 i)
+ {
++    { const u32 sl = ld_spu_local_apply(i);   /* KZ2 patch 6008: SPU puts into local memory */
++      if (sl) return sl; }
+     if (i >= g.n_surfaces || !ld_gv_enabled()) return 0;
+     surface_t* s = &g.surfaces[i];
+     if (!s->tex) return 0;
+@@ -16762,18 +16854,147 @@ u32 rsx_live_draw_writeback_range(u32 location, u32 offset, u32 size)
+  * since its last write-back back to guest memory before the guest can observe
+  * a sync point: NV4097 back-end/texture-read semaphore release, NV406E
+  * semaphore release, flip. LD_MAIN_SURFACE_WRITEBACK=0 disables. */
++/* KZ2 patch 6008: colour surfaces in LOCAL memory that SPU code reads.
++ * Killzone 2 draws its scene into a local-memory target (0x7B0000 in v1.01,
++ * 0x760000 in 1.29) and hands its EA (0xC0000000 + offset) to the SPU
++ * post-processing chain, which DMAs it from guest memory (RPCS3 needs "Write
++ * color buffers" for the same reason). Patch 2017 wrote back main-memory
++ * surfaces only. LD_LOCAL_WRITEBACK selects local ones too, at the same sync
++ * points (NV4097 0x1D70/0x1D74 releases, NV406E release, flip), at most once per
++ * GPU write (gv_gpu_dirty):
++ *   unset or 0  off;
++ *   1 or auto   every GPU-written local colour surface that is not a registered
++ *               display buffer and has at least LD_LOCAL_WB_MIN_PIXELS pixels
++ *               (default 640*360);
++ *   post        as auto, but only once rsx_live_draw_local_writeback_arm() was
++ *               called (the port calls it when the game's post stage renders):
++ *               a write-back costs a GPU wait (~8 ms per 1280x720 surface in
++ *               Killzone 2), so screens without the SPU chain do not pay it;
++ *   list        comma-separated hex offsets (e.g. 0x760000).
++ * LD_WB_LOG=N logs the first N local write-backs (then every 1024th) with a
++ * non-black count of the guest bytes afterwards (every 16th row).
++ * LD_FAKE_POST=1 (test aid, never in a real run): after a local write-back,
++ * copy the first written-back surface's guest rows into every registered local
++ * display buffer and report the write through the SPU write hook
++ * (cellGcm_note_guest_write_pages_ea), standing in for the SPU post chain. */
++static int g_ld_lwb_mode = -1;   /* 0 off, 1 auto, 2 list, 3 post (auto once armed) */
++static volatile LONG g_ld_lwb_armed;
++void rsx_live_draw_local_writeback_arm(void)
++{
++    if (InterlockedExchange(&g_ld_lwb_armed, 1) == 0)
++        fprintf(stderr, "[kz2-wb] local write-back armed (post stage active, frame %u)\n", g_ld_frames);
++}
++static u32 g_ld_lwb_list[16], g_ld_lwb_n, g_ld_lwb_min = 640u * 360u;
++static int ld_local_wb_mode(void)
++{
++    if (g_ld_lwb_mode < 0) {
++        const char* e = getenv("LD_LOCAL_WRITEBACK");
++        const char* m = getenv("LD_LOCAL_WB_MIN_PIXELS");
++        if (m) g_ld_lwb_min = (u32)strtoul(m, NULL, 0);
++        if (!e || !e[0] || !strcmp(e, "0")) g_ld_lwb_mode = 0;
++        else if (!strcmp(e, "1") || !strcmp(e, "auto")) g_ld_lwb_mode = 1;
++        else if (!strcmp(e, "post")) g_ld_lwb_mode = 3;
++        else {
++            const char* p = e;
++            while (*p && g_ld_lwb_n < 16) {
++                char* end = NULL;
++                const unsigned long v = strtoul(p, &end, 16);
++                if (end == p) break;
++                g_ld_lwb_list[g_ld_lwb_n++] = (u32)v;
++                p = *end == ',' ? end + 1 : end;
++            }
++            g_ld_lwb_mode = g_ld_lwb_n ? 2 : 0;
++        }
++        fprintf(stderr, "[kz2-wb] local-memory surface write-back: %s (min %u pixels, %u listed)\n",
++                g_ld_lwb_mode == 0 ? "off" : g_ld_lwb_mode == 1 ? "auto" : g_ld_lwb_mode == 3 ? "post (auto once armed)" : "list", g_ld_lwb_min, g_ld_lwb_n);
++    }
++    return g_ld_lwb_mode;
++}
++static int ld_local_wb_wanted(const surface_t* sf)
++{
++    const int mode = ld_local_wb_mode();
++    if (!mode || sf->location != 0u) return 0;
++    if (mode == 3 && !g_ld_lwb_armed) return 0;
++    if (mode == 2) {
++        for (u32 k = 0; k < g_ld_lwb_n; k++) if (g_ld_lwb_list[k] == sf->offset) return 1;
++        return 0;
++    }
++    if ((u64)sf->w * sf->h < g_ld_lwb_min) return 0;
++    for (u32 b = 0; b < 8; b++)
++        if (g.display_buffers[b].valid && g.display_buffers[b].location == 0u && g.display_buffers[b].offset == sf->offset)
++            return 0;
++    return 1;
++}
++static void ld_local_wb_report(u32 i)
++{
++    static int cap = -1;
++    static u32 n;
++    if (cap < 0) { const char* e = getenv("LD_WB_LOG"); cap = e ? atoi(e) : 0; }
++    n++;
++    if (cap <= 0 || !(n <= (u32)cap || (n & 1023u) == 0)) return;
++    const surface_t* sf = &g.surfaces[i];
++    u32 texel, gp;
++    u64 nonblack = 0, sampled = 0;
++    if (ld_gv_geometry(sf, &texel, &gp)) {
++        const u8* gm = guest_ptr(sf->location, sf->offset, gp * (sf->h - 1u) + sf->w * texel);
++        for (u32 y = 0; gm && y < sf->h; y += 16)
++            for (u32 x = 0; x < sf->w; x++, sampled++) {
++                const u8* px = gm + (size_t)y * gp + (size_t)x * texel;
++                if (texel == 4 ? (px[1] | px[2] | px[3]) : (px[0] | px[1] | px[2] | px[3] | px[4] | px[5])) nonblack++;
++            }
++    }
++    fprintf(stderr, "[kz2-wb] #%u local 0x%08X %ux%u pitch %u written back (frame %u); guest nonblack %llu/%llu sampled\n",
++            n, sf->offset, sf->w, sf->h, sf->pitch, g_ld_frames, (unsigned long long)nonblack, (unsigned long long)sampled);
++}
++static void ld_fake_post(u32 i)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_FAKE_POST"); on = e ? atoi(e) : 0; }
++    if (!on) return;
++    extern void cellGcm_note_guest_write_pages_ea(u32 ea, u32 size);
++    extern u32 cellGcmResolveLocated(int local, u32 offset);
++    const surface_t* sf = &g.surfaces[i];
++    u32 texel, gp;
++    if (sf->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || !ld_gv_geometry(sf, &texel, &gp)) return;
++    const u8* src = guest_ptr(0u, sf->offset, gp * (sf->h - 1u) + sf->w * 4u);
++    for (u32 b = 0; src && b < 8; b++) {
++        const display_buffer_t* d = &g.display_buffers[b];
++        if (!d->valid || d->location != 0u || d->offset == sf->offset) continue;
++        const u32 w = d->width < sf->w ? d->width : sf->w, h = d->height < sf->h ? d->height : sf->h;
++        const u32 dp = d->pitch ? d->pitch : d->width * 4u;
++        if (!w || !h) continue;
++        u8* dst = (u8*)guest_ptr(0u, d->offset, dp * (h - 1u) + w * 4u);
++        if (!dst) continue;
++        for (u32 y = 0; y < h; y++) memcpy(dst + (size_t)y * dp, src + (size_t)y * gp, (size_t)w * 4u);
++        cellGcm_note_guest_write_pages_ea(cellGcmResolveLocated(1, d->offset), dp * (h - 1u) + w * 4u);
++        static u32 logs;
++        if (logs++ < 4)
++            fprintf(stderr, "[kz2-fake-post] 0:0x%08X -> display buffer %u 0:0x%08X %ux%u (frame %u)\n",
++                    sf->offset, b, d->offset, w, h, g_ld_frames);
++    }
++}
++
+ u32 rsx_live_draw_before_guest_sync(void)
+ {
+     static int en = -1;
+     if (en < 0) { const char* e = getenv("LD_MAIN_SURFACE_WRITEBACK"); en = e ? atoi(e) : 1; }
+     if (!en || !g.ready) return 0;
+-    u32 idx[64], n = 0;
++    u32 idx[64], n = 0, nlocal = 0;
+     for (u32 i = 0; i < g.n_surfaces && n < 64; i++)
+-        if (g.surfaces[i].tex && g.surfaces[i].location == 1u && g.surfaces[i].gv_gpu_dirty)
+-            idx[n++] = i;
++        if (g.surfaces[i].tex && g.surfaces[i].gv_gpu_dirty &&
++            (g.surfaces[i].location == 1u || ld_local_wb_wanted(&g.surfaces[i])))   /* KZ2 patch 6008 */
++            { idx[n++] = i; if (g.surfaces[i].location == 0u) nlocal++; }
+     if (!n) return 0;
+     LDW_T0(wb_t0);
+     const u32 done = ld_writeback_batch(idx, n, 0, 0);   /* patch 2018: one GPU wait */
++    if (nlocal) {   /* KZ2 patch 6008 */
++        int faked = 0;
++        for (u32 k = 0; k < n; k++)
++            if (g.surfaces[idx[k]].location == 0u && !g.surfaces[idx[k]].gv_gpu_dirty) {
++                ld_local_wb_report(idx[k]);
++                if (!faked) { ld_fake_post(idx[k]); faked = 1; }
++            }
++    }
+     if (wb_t0) { LDW_ADD(RSX_PERF_W_WB_SYNC_T, wb_t0); rsx_perf_add(RSX_PERF_W_WB_SYNC_N, 1); }
+     if (done) {
+         static u64 total; total += done;
+@@ -17035,6 +17256,7 @@ static void ld_present_body(u32 buffer_id)
+         fprintf(stderr, "[live-draw] frame present skipped: no color surface\n");
+         return;
+     }
++    ld_spu_local_apply(target);   /* KZ2 patch 6008: an SPU wrote the scanout buffer itself */
+     g_ld_last_present_target = target;
+     if (dump_now) {
+         char path[MAX_PATH * 2];
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 8607666..2d99109 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -94,6 +94,11 @@ void rsx_live_draw_note_guest_write_async(u32 location, u32 offset, u32 size);
+ /* KZ3 patch 2033: cheap page-level note of a guest write by the walker itself (NV3089 blits, NV308A inline
+  * writes): no entry scan, only the 64 KB page bitmap the quiet-texture hashing consults (LD_TEX_HASH_SPAN). */
+ void rsx_live_draw_note_guest_write_pages(u32 location, u32 offset, u32 size);
++/* KZ2 patch 6008: an SPU DMA put into RSX local memory (any thread): the rows under it are uploaded into a live
++ * surface at its next bind as a texture or present (LD_SPU_LOCAL_UPLOAD=0 disables). */
++void rsx_live_draw_note_spu_local_write(u32 offset, u32 size);
++/* KZ2 patch 6008: LD_LOCAL_WRITEBACK=post starts writing local surfaces back once this is called (any thread). */
++void rsx_live_draw_local_writeback_arm(void);
+ /* KZ3 patch 2081 diagnostic (LD_TEX_WRITER=1): tag the calling thread's next page notes with the writing path
+  * (1 SPU put, 2 host file read, 3 NV0039, 4 NV3089, 5 NV308A, 6 surface write-back, 7 EA note; 0 other). */
+ void rsx_live_draw_set_write_source(u32 src);

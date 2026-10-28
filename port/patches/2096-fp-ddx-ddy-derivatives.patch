@@ -1,0 +1,224 @@
+gcm/live-draw: fragment DDX and DDY (screen-space derivatives) are decompiled; LD_DDY_ORIGIN=0 old DDY sign.
+
+Symptom (Killzone 2, every menu page): the panels, the list's selection bar, the header bars, the difficulty and
+collectible icons and the mission picture on Mission Select are missing; only text, button glyphs and the opaque
+black frame behind the mission picture draw. The selected entry is therefore not highlighted, and Mission Select
+shows a black box where the picture should be.
+
+Cause: the panels' fragment program takes an anti-aliased edge factor from the screen-space derivative of its
+texture coordinate, min(uv - uv^2, fwidth(uv)) / fwidth(uv) with fwidth = |DDX| + |DDY| (Killzone 2 1.29, program
+at loc 1 0x00115480 in the Statistics page, frame 2609 of kz2-r41-ui1), and multiplies the alpha by it. The decompiler
+had no case for DDX (0x15) or DDY (0x16): it emitted a TODO comment and wrote nothing, so the destination kept 0, the
+factor became 0 * (1 / 0) = NaN and the export guard returned a transparent 0. Every panel, bar and picture that
+uses the program blended away.
+
+Fix: DDX emits ddx(v) * _rsx_deriv_scale.x and DDY ddy(v) * _rsx_deriv_scale.y; a program that uses either gets the
+declaration static const float2 _rsx_deriv_scale = float2(1.0, 1.0); in its preamble (other programs' text is
+unchanged). The live-draw rewrites the scale per pipeline: an antialiased target is kept at its sample resolution
+(patch 2088), so a derivative spans one sample where the RSX's spans a pixel (scale by the samples per pixel); and on
+a bottom-origin shader window (0x1D88 bits 12-15 = 1) the RSX's window y grows upwards (patch 2090), so DDY is
+negated. The sample grid is already in every pipeline key (2088); the DDY sign is keyed (deriv_flip) only for
+programs that use DDY on a bottom-origin window, and the prewarm template carries it as RSX_PT_FLAG_DDY_FLIP.
+"[fp-deriv]" logs the first programs and the switch. ASSUMPTION: the RSX's DDY follows its window y as WPOS does
+(Killzone 2's panels take |DDX| + |DDY|, so their picture does not depend on the sign).
+DDX/DDY are the NV40 fragment ops for the screen-space partial derivatives (opcode numbers as in the decompiler's
+table). Written for this port; no third-party code read for it. Host test: tools/runtime/test_fp_deriv.sh. Upstream candidate (any title: DDX/DDY are
+general NV40 ops).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -691,6 +691,38 @@ int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes)
+     return 0;
+ }
+ 
++/* KZ2 patch 2096: does any instruction take a screen-space derivative (DDY)? The same walk as above. DDX needs no
++ * state beyond the target's sample grid, which every pipeline key already carries (patch 2088). */
++int rsx_fp_uses_ddy(const u8* ucode, u32 max_bytes)
++{
++    if (!ucode) return 0;
++    for (u32 off = 0; off + 16 <= max_bytes;) {
++        const u32 w0 = rsx_fp_read_word(ucode + off);
++        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
++        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
++        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
++        if (!(w2 & FP_BRANCH) && ((w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT) == OP_DDY) return 1;
++        off += 16;
++        if (!(w2 & FP_BRANCH) && ((w1 & 3u) == 2 || (w2 & 3u) == 2 || (w3 & 3u) == 2)) off += 16;
++        if (w0 & FP_END) return 0;
++    }
++    return 0;
++}
++
++int rsx_fp_set_deriv_scale(char* hlsl, u32 hlsl_size, float sx, float sy)
++{
++    if (!hlsl) return 0;
++    char* at = strstr(hlsl, RSX_FP_DERIV_SCALE_DECL);
++    if (!at) return 0;
++    char rep[128];
++    const int rl = snprintf(rep, sizeof rep, "static const float2 _rsx_deriv_scale = float2(%.1f, %.1f);", sx, sy);
++    const size_t kl = sizeof RSX_FP_DERIV_SCALE_DECL - 1, len = strlen(hlsl);
++    if (rl <= 0 || (size_t)rl >= sizeof rep || len - kl + (size_t)rl + 1 > hlsl_size) return -1;
++    memmove(at + rl, at + kl, len - (size_t)(at - hlsl) - kl + 1);
++    memcpy(at, rep, (size_t)rl);
++    return 1;
++}
++
+ static void fp_expand_helper(Out* out)
+ {
+     out_puts(out,
+@@ -845,6 +877,7 @@ static int rsx_fp_decompile_internal(
+     Out o = { out, out_size, 0, 1 };
+     out[0] = '\0';
+     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
++    int uses_deriv = 0;  /* KZ2 patch 2096: DDX or DDY was decoded: the preamble declares _rsx_deriv_scale */
+     out_puts(&o,
+         /* 64 each: the source and destination register fields are 6 bits
+          * (FP_SRC_REG_MASK / FP_OUT_REG_MASK). 48 rejected every program
+@@ -1098,6 +1131,13 @@ static int rsx_fp_decompile_internal(
+         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
+         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
+         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
++        /* KZ2 patch 2096: screen-space derivatives. Unhandled, they wrote nothing, so the destination kept 0 and
++         * a program dividing by fwidth (Killzone 2's anti-aliased menu panels: min(uv - uv^2, fwidth) / fwidth)
++         * produced NaN, which the export guard turns into a transparent 0. _rsx_deriv_scale is (1, 1) in the
++         * decompiler's text; the live-draw rewrites it per pipeline for the target's sample grid and the shader
++         * window's origin (rsx_fp_set_deriv_scale). */
++        case OP_DDX: uses_deriv = 1; snprintf(rhs, sizeof(rhs), "(ddx(%s) * _rsx_deriv_scale.x)", a); break;
++        case OP_DDY: uses_deriv = 1; snprintf(rhs, sizeof(rhs), "(ddy(%s) * _rsx_deriv_scale.y)", a); break;
+         /* Pack/unpack (RPCS3 FragmentProgramDecompiler PK/UP cases and the pkg/upg
+          * builtins): the packed word is a scalar that replicates. */
+         case OP_PK4UB: uses_pack = 1; snprintf(rhs, sizeof(rhs), "asfloat(_rsx_pk4ub(%s))", a); break;
+@@ -1522,6 +1562,7 @@ static int rsx_fp_decompile_internal(
+      * decompiler skipped, leaving the destination with whatever it held.
+      * Only for a program that uses one, so every other program's text is
+      * unchanged. */
++    if (uses_deriv) out_puts(&p, RSX_FP_DERIV_SCALE_DECL "\n");   /* KZ2 patch 2096 */
+     if (uses_pack) out_puts(&p,
+         "uint   _rsx_pk4ub(float4 v) { uint4 b = (uint4)round(saturate(v) * 255.0); return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }\n"
+         "float4 _rsx_up4ub(float v) { uint u = asuint(v); return float4(u & 255u, (u >> 8) & 255u, (u >> 16) & 255u, (u >> 24) & 255u) / 255.0; }\n"
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -173,6 +173,13 @@ void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
+ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
+ /* KZ2 patch 2090: 1 when an instruction of the program reads WPOS (input register 0). */
+ int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes);
++/* KZ2 patch 2096: 1 when an instruction of the program is DDY (its sign follows the shader window's origin). */
++int rsx_fp_uses_ddy(const u8* ucode, u32 max_bytes);
++/* KZ2 patch 2096: the declaration a program using DDX/DDY carries, and its per-pipeline rewrite: x scales DDX, y DDY
++ * (the target's samples per pixel, y negative on a bottom-origin shader window). Returns 1 when rewritten, 0 when the
++ * program has no derivative, -1 when the text does not fit. */
++#define RSX_FP_DERIV_SCALE_DECL "static const float2 _rsx_deriv_scale = float2(1.0, 1.0);"
++int rsx_fp_set_deriv_scale(char* hlsl, u32 hlsl_size, float sx, float sy);
+ int rsx_fp_decompile_buffered_shadow_ex(
+     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+     const rsx_fp_shadow_desc shadow[16],
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8120,6 +8120,8 @@ typedef struct {
+     u32 wpos_aa;                               /* KZ2 patch 2088: aa_sx | aa_sy << 8 of the target, 0 = 1x1 */
+     u32 wpos_flip;                             /* KZ2 patch 2090: window height in pixels when the shader window's
+                                                 * origin is the bottom and the program reads WPOS, else 0 */
++    u32 deriv_flip;                            /* KZ2 patch 2096: 1 when the program uses DDY on a bottom-origin
++                                                * shader window, else 0 */
+ } ld_xl_in;
+ static CRITICAL_SECTION g_ld_xl_cs;
+ static volatile LONG g_ld_xl_state;
+@@ -8232,6 +8234,37 @@ static int ld_wpos_flip_apply(char* hlsl, size_t size, u32 height)
+     if (logs++ < 8) fprintf(stderr, "[wpos-origin] %u WPOS read(s) flipped (window height %u)\n", (u32)n, height);
+     return (int)n;
+ }
++/* KZ2 patch 2096: DDX / DDY in pixels of the RSX's window.
++ *
++ * The decompiler emits DDX as ddx(v) * _rsx_deriv_scale.x and DDY as ddy(v) * _rsx_deriv_scale.y, (1, 1) in its text.
++ * Two things differ between the RSX and the D3D12 pipeline the program runs in:
++ *  - an antialiased target is kept at its sample resolution (patch 2088), so a D3D derivative spans one sample where
++ *    the RSX's spans one pixel: scale by the samples per pixel (aa_sx, aa_sy);
++ *  - on a bottom-origin shader window (0x1D88 bits 12-15 = 1) the RSX's window y grows upwards (WPOS.y = height - y,
++ *    patch 2090) while SV_Position y grows downwards, so DDY changes sign.
++ * The sample grid is already in every pipeline key (2088); the DDY sign is keyed as deriv_flip, only for programs that
++ * use DDY on a bottom-origin window. LD_DDY_ORIGIN=0 keeps DDY unsigned by the origin (for an A/B).
++ * ASSUMPTION: the RSX's DDY follows its window y (as WPOS does); Killzone 2's menu panels take |DDX| + |DDY|, so their
++ * picture does not depend on it. */
++static int ld_ddy_origin_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_DDY_ORIGIN");
++        on = e ? atoi(e) != 0 : 1;
++        fprintf(stderr, "[fp-deriv] DDY follows the shader window's origin: %s\n", on ? "on" : "off (LD_DDY_ORIGIN=0)");
++    }
++    return on;
++}
++static int ld_deriv_scale_apply(char* hlsl, size_t size, u32 wpos_aa, u32 flip)
++{
++    const u32 ax = wpos_aa & 0xFFu, ay = (wpos_aa >> 8) & 0xFFu;
++    const float sx = ax > 1u ? (float)ax : 1.0f, sy = (ay > 1u ? (float)ay : 1.0f) * (flip ? -1.0f : 1.0f);
++    const int r = rsx_fp_set_deriv_scale(hlsl, (u32)size, sx, sy);
++    static u32 logs;
++    if (r > 0 && logs++ < 8) fprintf(stderr, "[fp-deriv] program with DDX/DDY: scale (%.0f, %.0f)\n", sx, sy);
++    return r;
++}
+ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_hlsl, size_t ps_sz, int* vi_out, int* fi_out)
+ {
+     const u8* vp_uc = in->vp_uc; const u32 vp_instrs = in->vp_instrs; const u32 vtex_mask = in->vtex_mask;
+@@ -8308,6 +8341,8 @@ static void ld_xlate(const ld_xl_in* in, char* vs_hlsl, size_t vs_sz, char* ps_h
+         fi = -1;
+     if (fi > 0 && in->wpos_aa && ld_wpos_aa_apply(ps_hlsl, ps_sz, in->wpos_aa) < 0)   /* KZ2 patch 2088 */
+         fi = -1;
++    if (fi > 0 && ld_deriv_scale_apply(ps_hlsl, ps_sz, in->wpos_aa, in->deriv_flip) < 0)   /* KZ2 patch 2096 */
++        fi = -1;
+     if (fi > 0 && srgb_out && rsx_fp_apply_srgb_output(ps_hlsl, ps_sz) < 0) {   /* patch 2055 */
+         static int said; if (!said++) fprintf(stderr, "[srgb-out] apply failed: PSO left linear\n");
+     }
+@@ -8361,6 +8396,7 @@ static u64 ld_pso_key_tail(u64 key, const ld_xl_in* xi, int packed_payload, u64*
+                        key = fnv1a(&xi->wpos_aa, sizeof xi->wpos_aa, key); }
+     if (xi->wpos_flip) { const u32 tag = 0x57504F00u | 0x46u; key = fnv1a(&tag, sizeof tag, key);   /* KZ2 patch 2090 */
+                          key = fnv1a(&xi->wpos_flip, sizeof xi->wpos_flip, key); }
++    if (xi->deriv_flip) { const u32 tag = 0x44445900u | 0x46u; key = fnv1a(&tag, sizeof tag, key); }   /* KZ2 patch 2096 */
+     if (masked_layout) {
+         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+         const u32 payload_stride =
+@@ -8443,7 +8479,8 @@ static void ld_pt_note(u64 key, const ld_xl_in* xi, int packed, int depth)
+     r->shadow_mask = xi->shadow_mask; r->argb_mask = xi->argb_mask; r->unnorm_mask = xi->unnorm_mask;
+     r->flags = RSX_PT_FLAG_BUFFERED | (xi->layout ? RSX_PT_FLAG_LAYOUT : 0u) | (xi->layout && packed ? RSX_PT_FLAG_PACKED : 0u) |
+                (depth ? RSX_PT_FLAG_DEPTH : 0u) |
+-               ((xi->wpos_aa & 0xFFFFu) << RSX_PT_WPOS_AA_SHIFT);   /* KZ2 patch 2088 */
++               ((xi->wpos_aa & 0xFFFFu) << RSX_PT_WPOS_AA_SHIFT) |   /* KZ2 patch 2088 */
++               (xi->deriv_flip ? RSX_PT_FLAG_DDY_FLIP : 0u);          /* KZ2 patch 2096 */
+     if (xi->layout) {
+         r->layout_mask = xi->layout->mask; r->layout_stride = xi->layout->stride; r->layout_count = xi->layout->count;
+         memcpy(r->attrs, xi->layout->attrs, sizeof r->attrs);
+@@ -8558,6 +8595,7 @@ static void ld_pt_build(u32 ri, char* vs_hlsl, char* ps_hlsl, rsx_fp_constant_bl
+     xi.vp_branch_bits_used = rsx_vp_uses_branch_bits(vp->bytes, r->vp_instrs * 16); xi.vp_branch_bits = 0;
+     /* KZ2 patch 2088: the walker keys pipelines of antialiased targets by their sample grid; the record carries it. */
+     xi.wpos_aa = ld_wpos_aa_on() ? (r->flags >> RSX_PT_WPOS_AA_SHIFT) & 0xFFFFu : 0u;
++    xi.deriv_flip = (r->flags & RSX_PT_FLAG_DDY_FLIP) && ld_ddy_origin_on() ? 1u : 0u;   /* KZ2 patch 2096 */
+     u64 key = r->key;
+     int packed = (r->flags & RSX_PT_FLAG_PACKED) != 0;
+     {   /* the record's key must be what the walker derives from these programs and this state */
+@@ -9718,6 +9756,9 @@ static ID3D12PipelineState* get_pso(
+         rsx_dsp_get_surface(&g.rsx, &wsf);
+         if (wsf.aa_sx != 1u || wsf.aa_sy != 1u) xi.wpos_aa = wsf.aa_sx | (wsf.aa_sy << 8);
+     }
++    xi.deriv_flip = 0;   /* KZ2 patch 2096 */
++    if (ld_ddy_origin_on() && ((rsx_dsp_reg(&g.rsx, 0x1D88) >> 12) & 0xFu) == 1u && rsx_fp_uses_ddy(fp_uc, fp_size))
++        xi.deriv_flip = 1;
+     xi.wpos_flip = 0;   /* KZ2 patch 2090 */
+     if (rsx_fp_reads_wpos(fp_uc, fp_size)) {
+         const u32 sw = rsx_dsp_reg(&g.rsx, 0x1D88), sw_h = sw & 0xFFFu, sw_origin = (sw >> 12) & 0xFu;
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+--- a/libs/video/rsx_pso_template.h
++++ b/libs/video/rsx_pso_template.h
+@@ -35,6 +35,7 @@
+ #define RSX_PT_FLAG_PACKED 2u    /* packed payload offsets */
+ #define RSX_PT_FLAG_DEPTH  4u    /* a depth surface was bound when the pipeline was first seen */
+ #define RSX_PT_FLAG_BUFFERED 8u  /* fragment constants in a constant buffer (the only mode the prewarm builds) */
++#define RSX_PT_FLAG_DDY_FLIP 16u /* KZ2 patch 2096: the program's DDY is negated (bottom-origin shader window) */
+ #define RSX_PT_WPOS_AA_SHIFT 8u  /* KZ2 patch 2088: flags bits 8-23 = sample grid of the target (aa_sx | aa_sy << 8),
+                                   * 0 = 1x1; the walker keys WPOS-in-pixels pipelines by it */
+ #define RSX_PT_FP_SEED   0x4B5A50545F465031ull   /* seed of the template's fragment-program structural hash */

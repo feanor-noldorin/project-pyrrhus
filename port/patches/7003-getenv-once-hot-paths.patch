@@ -1,0 +1,771 @@
+KZ2 patch 7003: getenv() looked up once on per-job, per-task, per-exit, per-file-op and per-FIFO-tick paths
+(ps3recomp issue 243: the CRT getenv takes the environment lock and scans every variable on each call; a port on
+Windows spent ~95% of two polling SPU threads there). New include/ps3emu/env_once.h: PS3_GETENV_ONCE("NAME") caches
+the first result per expansion site. Applied to: spurs_job.c (SPURS_JOB_DESCDUMP, SPURS_JOB_DUMP, per job),
+spu_lifted_job.h (SPURS_TASKSET_TRACE per task run, SPU_WORKER_TRACE per worker run; same change KZ3 is making
+upstream), spu_workload.c (per job), spu_channels.c (YDKJ_CRI_EXIT_HALT / YDKJ_NO_CRI_R4 on stop and policy
+entry), spu_dma.h, spu_interp.c, spu_raw.c, spu_coherency.c, spu_drain.c, ppu_fs.cpp (every file call),
+cellGcmSys.c (per FIFO tick: GCM_CTXDBG, GCM_DRAINDBG), ppu_loader.cpp, ppu_sysprx.cpp. Behaviour is unchanged
+when a variable is set at launch (nothing changes them later). Upstream: the toolkit-original sites go
+via KZ3 (spurs_job, spu_lifted_job); the rest is a candidate on its own.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): cellGcmSys takes upstream (it already reads these once); ppu_fs keeps upstream with PS3_GETENV_ONCE substituted
+
+diff --git a/include/ps3emu/env_once.h b/include/ps3emu/env_once.h
+new file mode 100644
+index 0000000..8cf38aa
+--- /dev/null
++++ b/include/ps3emu/env_once.h
+@@ -0,0 +1,15 @@
++/* PS3_GETENV_ONCE("NAME"): getenv() looked up once per expansion site, then cached.
++ * Diagnostic and tuning gates on per-job, per-task or per-exit paths used to call getenv() every time; the
++ * CRT takes its environment lock and scans every variable on each call (ps3recomp issue 243: two polling SPU
++ * threads spent ~95% of their samples there on Windows, 14.1 fps against 29.8 once looked up once).
++ * Nothing in the runtime changes these variables after start-up. Racing first uses store the same pointer.
++ * GNU statement expression (gcc, clang, MinGW). */
++#ifndef PS3EMU_ENV_ONCE_H
++#define PS3EMU_ENV_ONCE_H
++#include <stdlib.h>
++#define PS3_GETENV_ONCE(name) __extension__ ({ \
++    static const char* volatile ps3_env_once_v_; static volatile int ps3_env_once_d_; \
++    if (!__atomic_load_n(&ps3_env_once_d_, __ATOMIC_ACQUIRE)) { \
++        ps3_env_once_v_ = getenv(name); __atomic_store_n(&ps3_env_once_d_, 1, __ATOMIC_RELEASE); } \
++    ps3_env_once_v_; })
++#endif
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 6ec22d6..fcc687e 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -8,6 +8,7 @@
+  * Actual rendering is handled elsewhere -- this module just tracks state.
+  */
+ 
++#include "../../include/ps3emu/env_once.h"
+ #include "rsx_live_draw.h"
+ #include "rsx_nv3089_rows.h"   /* patch 2080 */
+ #include "rsx_draw_engine.h"
+@@ -3602,12 +3603,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                           "write head\n", s_fifo_getoff, put, burned);
+               /* What the walker circles in: the words at get, and where the
+                * buffer it is in was jumped/called from (GCM_CIRCLE_DUMP=1). */
+-              if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
++              if (n <= 3 && PS3_GETENV_ONCE("GCM_CIRCLE_DUMP"))
+                   for (u32 t = 0; t < 8; t++) {
+                       u32 q = (s_cf_i + t) % 8;
+                       if (s_cf_w[q]) fprintf(stderr, "[circle-jump] at io=%08X w=%08X\n", s_cf_off[q], s_cf_w[q]);
+                   }
+-              if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
++              if (n <= 3 && PS3_GETENV_ONCE("GCM_CIRCLE_DUMP"))
+                   for (int k = -8; k <= 24; k++) {
+                       u32 io = s_fifo_getoff + (u32)(k * 4), ea = gcm_io2ea(io);
+                       if (ea) fprintf(stderr, "[circle] %+3d io=%08X ea=%08X w=%08X\n", k, io, ea, vm_read32(ea));
+@@ -3783,7 +3784,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
+     u32 current = vm_read32(ctx_ea + 0x8);
+     if (current <= begin) return;                       /* nothing to recycle */
+ 
+-    if (getenv("CELLMARK_BLINKDBG"))
++    if (PS3_GETENV_ONCE("CELLMARK_BLINKDBG"))
+         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
+ 
+     static int s_recdbg = -1;
+@@ -5225,7 +5226,7 @@ void cellGcmSetDefaultCommandBuffer(void)
+      * draw engine go from 12,756 to 15,097 over the same five minutes. Still
+      * one title's evidence, so still opt-in -- but it is no longer unmeasured,
+      * and a port whose title manages its own segments should try it. */
+-    if (getenv("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
++    if (PS3_GETENV_ONCE("GCM_DEFAULT_CTX_REPOINT") && s_gcm_ctx_out_ea && s_gcm_context_ea) {
+         vm_write32(s_gcm_context_ea + 0x8, vm_read32(s_gcm_context_ea + 0x0));
+         vm_write32(s_gcm_ctx_out_ea, s_gcm_context_ea);
+         printf("[cellGcmSys] SetDefaultCommandBuffer: repointed "
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index c9255bb..eb9ecec 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -14,6 +14,7 @@
+  * through vm_base in big-endian.
+  */
+ #define PPU_NO_INLINE_STORES   /* declares its own out-of-line vm_write32/64 below */
++#include "../../include/ps3emu/env_once.h"
+ #include "ppu_recomp.h"      /* ppu_context */
+ #include "../../libs/filesystem/edat.h"
+ #include "ps3emu/nid.h"      /* ps3_compute_nid */
+@@ -139,7 +140,7 @@ static void host_path(char* out, size_t cap, const char* guest)
+      * /dev_bdvd (disc), update data on /dev_hdd0. Set PS3_HDD0_ROOT to the host
+      * dir that /dev_hdd0 maps into (the one containing game/<title>/). */
+     static const char* hdd0_root = nullptr; static int hdd0_init = 0;
+-    if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
++    if (!hdd0_init) { hdd0_root = PS3_GETENV_ONCE("PS3_HDD0_ROOT"); hdd0_init = 1; }
+     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
+         snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+@@ -153,7 +154,7 @@ static void host_path(char* out, size_t cap, const char* guest)
+      * never creates its media threads. PS3_HDD1_ROOT selects the host dir, the
+      * same convention as PS3_HDD0_ROOT. */
+     static const char* hdd1_root = nullptr; static int hdd1_init = 0;
+-    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
++    if (!hdd1_init) { hdd1_root = PS3_GETENV_ONCE("PS3_HDD1_ROOT"); hdd1_init = 1; }
+     if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
+         snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+@@ -166,7 +167,7 @@ static void host_path(char* out, size_t cap, const char* guest)
+      * load MP3 codec (are you using the correct flash?)" and then crashes.
+      * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
+     if (strncmp(guest, "/dev_flash/", 11) == 0) {
+-        const char* fw = getenv("PS3_DEV_FLASH");
++        const char* fw = PS3_GETENV_ONCE("PS3_DEV_FLASH");
+         if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+         snprintf(out, cap, "%s/%s", fw, guest + 11);
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+@@ -326,16 +327,16 @@ static void cellFsOpen(ppu_context* ctx)
+      * that is not running. */
+     if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
+     { char who[64] = "?";
+-      if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
++      if (PS3_GETENV_ONCE("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
+           fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
+           /* FS_STACK=<substr>: every open funnels through one guest wrapper, so
+            * one caller level says nothing about WHICH subsystem wanted the file.
+            * Dump the guest call chain for the opens that matter. */
+-          { const char* want = getenv("FS_STACK");
++          { const char* want = PS3_GETENV_ONCE("FS_STACK");
+             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
+           } }
+       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+-    if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
++    if (PS3_GETENV_ONCE("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+          * which criMv/criFs function opened the movie, so the reader-attach path
+          * (stream+0x10, never wired => movie opened but never read) can be found. */
+@@ -435,14 +436,14 @@ static void cellFsSdataOpen(ppu_context* ctx)
+ static void cellFsClose(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+-    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
++    if (PS3_GETENV_ONCE("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
+     FILE* f = nullptr;
+     if (fd >= 0 && fd < FS_MAX) {
+         std::lock_guard<std::mutex> hold(g_fd_lock);
+         f = g_files[fd];
+         if (f) {
+-            if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
++            if (g_fd_usm[fd] && PS3_GETENV_ONCE("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
+             __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
+             g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+         }
+@@ -509,7 +510,7 @@ static void cellFsRead(ppu_context* ctx)
+      * the demuxer see EOF and the movie finish, which is what advances the title
+      * to whatever follows the intro. Deliberately a testing knob, not a fix. */
+     { static int efd = -2; static long elim = 0;
+-      if (efd == -2) { const char* e = getenv("PS3_FSLOG_EOF");
++      if (efd == -2) { const char* e = PS3_GETENV_ONCE("PS3_FSLOG_EOF");
+           if (e) { efd = atoi(e); const char* c = strchr(e, 44); elim = c ? atol(c + 1) : 0; }
+           else efd = -1; }
+       if (efd >= 0 && fd == efd && elim > 0 && fpos_before >= elim) {
+@@ -517,18 +518,18 @@ static void cellFsRead(ppu_context* ctx)
+           if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
+           n = 0;
+       } }
+-    if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
++    if (g_fd_usm[fd] && PS3_GETENV_ONCE("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
+     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
+      * lines and they are all spent before a movie ever opens, so it cannot
+      * answer "is the streamer reading the .avi". */
+     { static int wfd = -2;
+-      if (wfd == -2) { const char* e = getenv("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
++      if (wfd == -2) { const char* e = PS3_GETENV_ONCE("PS3_FSLOG_READS"); wfd = e ? atoi(e) : -1; }
+       if (wfd >= 0 && fd == wfd)
+           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
+                   fd, (unsigned long long)nbytes, n, fpos_before); }
+-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(f),ferror(f)); }
++    if (PS3_GETENV_ONCE("PS3_FSLOG")) { static int _fd=0; if(PS3_LOG_FIRST(_fd, 20)) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(f),ferror(f)); }
+ #ifdef _WIN32
+-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
++    if (PS3_GETENV_ONCE("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+ #endif
+     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
+      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
+@@ -540,16 +541,16 @@ static void cellFsRead(ppu_context* ctx)
+       tot+=n;
+       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
+       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
+-      if(PS3_LOG_FIRST(_n, 50) || first_for_fd || getenv("FS_READ_ALL"))
++      if(PS3_LOG_FIRST(_n, 50) || first_for_fd || PS3_GETENV_ONCE("FS_READ_ALL"))
+         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
+                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
+                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+-      if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
++      if (PS3_GETENV_ONCE("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
+           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
+       if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
+           fprintf(stderr,"\n"); } }
+-    if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
++    if (PS3_GETENV_ONCE("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
+         fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
+         uint32_t sp = (uint32_t)ctx->gpr[1];
+         for (uint32_t i = 0; i < 128 && sp + i*4 + 4 <= ppu_vm_size; i++) {
+@@ -574,7 +575,7 @@ static void cellFsWrite(ppu_context* ctx)
+     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, f);
+     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
+      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
+-    if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
++    if (PS3_GETENV_ONCE("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
+         char tmp[256]; uint32_t nn = (uint32_t)(nbytes < 255 ? nbytes : 255);
+         memcpy(tmp, vm_base + buf, nn); tmp[nn] = 0;
+         if (strstr(tmp,"config") || strstr(tmp,"Config") || strstr(tmp,"Mystery") ||
+@@ -617,7 +618,7 @@ static void fs_report_block_size(ppu_context* ctx, uint32_t sec_ptr, uint32_t bl
+ {
+     static uint64_t bs = 0;
+     if (!bs) {
+-        const char* e = getenv("PS3_FS_BLOCK_SIZE");
++        const char* e = PS3_GETENV_ONCE("PS3_FS_BLOCK_SIZE");
+         bs = (e && *e) ? (uint64_t)strtoull(e, nullptr, 0) : 4096ull;
+         if (!bs) bs = 4096ull;
+     }
+@@ -651,7 +652,7 @@ static void cellFsLseek(ppu_context* ctx)
+     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
+     FILE* f = fd_file(fd);
+     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+-    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
++    if (PS3_GETENV_ONCE("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
+     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
+     FS_SEEK64(f, off, worigin);
+@@ -698,14 +699,14 @@ static void cellFsStat(ppu_context* ctx)
+     host_path(hpath, sizeof hpath, gpath);
+     fs_stat64_t st;
+     if (FS_STAT64(hpath, &st) != 0) {
+-        if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
++        if (PS3_GETENV_ONCE("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+     }
+-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
++    if (PS3_GETENV_ONCE("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
+     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
+                                            : (CELL_FS_S_IFREG | 0x1B6);
+     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
+-    if (getenv("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
++    if (PS3_GETENV_ONCE("PS3_FSLOG") && strstr(gpath,".toc")) fprintf(stderr,"[FSDBG] cellFsStat('%s') -> size=0x%llX\n",gpath,(unsigned long long)st.st_size);
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -715,7 +716,7 @@ static void cellFsFstat(ppu_context* ctx)
+     uint32_t sb = (uint32_t)ctx->gpr[4];
+     FILE* f = fd_file(fd);
+     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+-    if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
++    if (PS3_GETENV_ONCE("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
+     int64_t cur = FS_TELL64(f);
+     FS_SEEK64(f, 0, SEEK_END);
+@@ -726,15 +727,15 @@ static void cellFsFstat(ppu_context* ctx)
+      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
+      * by the size it just asked for, capping it makes the title take the read
+      * path. Answers whether the split is size-based -- nothing more. */
+-    { const char* cap = getenv("FS_FSTAT_CAP");
+-      const char* only = getenv("FS_FSTAT_CAP_PATH");
++    { const char* cap = PS3_GETENV_ONCE("FS_FSTAT_CAP");
++      const char* only = PS3_GETENV_ONCE("FS_FSTAT_CAP_PATH");
+       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
+       if (cap) { long long c = strtoll(cap, 0, 0);
+           if (c > 0 && sz > c) {
+               fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
+               sz = c; } } }
+     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
+-    if (getenv("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
++    if (PS3_GETENV_ONCE("PS3_FSLOG")) { static int _n=0; if(PS3_LOG_FIRST(_n, 12)) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+@@ -745,7 +746,7 @@ static void cellFsOpendir(ppu_context* ctx)
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
+     host_path(hpath, sizeof hpath, gpath);
+     DIR* d = opendir(hpath);
+-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
++    if (PS3_GETENV_ONCE("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
+     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
+     int fd = fd_alloc_dir(d);
+     if (fd < 0) { closedir(d); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+@@ -876,7 +877,7 @@ static void cellFsMkdir(ppu_context* ctx)
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     host_path(hpath, sizeof hpath, gpath);
+     int r = host_mkdir_p(hpath);
+-    if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
++    if (PS3_GETENV_ONCE("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+ /* cellFsUnlink(path) / cellFsRmdir(path) (KZ3 patch 4018). Both were stubs that answered CELL_OK and removed
+@@ -1059,7 +1060,7 @@ static void cellFsAioRead(ppu_context* ctx)
+         fs_note_guest_write(buf, n);   /* patch 2078 */
+         err = CELL_OK;
+     }
+-    if (getenv("PS3_FSLOG"))
++    if (PS3_GETENV_ONCE("PS3_FSLOG"))
+         fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
+ 
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index ecd0b21..8a1edd3 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -20,6 +20,7 @@
+ 
+ /* Hoisted: code below was added above the original include block, so these
+  * have to be visible from here rather than 160 lines further down. */
++#include "../../include/ps3emu/env_once.h"
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -3356,7 +3357,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+         uint64_t flags = ctx->gpr[4];
+         int64_t rc = sys_mmapper_allocate_address(ctx);
+         ctx->gpr[3] = (uint64_t)rc;
+-        if (getenv("KZ2_MMAP_LOG"))   /* KZ2 patch 6015 */
++        if (PS3_GETENV_ONCE("KZ2_MMAP_LOG"))   /* KZ2 patch 6015 */
+             fprintf(stderr, "[mmapper] allocate_address(size=0x%X flags=0x%llX align=0x%X) -> 0x%08X rc=0x%llX lr=0x%08X\n",
+                     size, (unsigned long long)flags, align, (out && !rc) ? vm_read32(out) : 0u, (unsigned long long)rc, (uint32_t)ctx->lr);
+         return;
+@@ -3476,7 +3477,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+          * PhyreEngine init-failure fragment, dump the HOST backtrace (RVAs vs
+          * the exe base) so we can map the error-reporter's call chain through
+          * build_boot/flow.map and locate the failing function. */
+-        if (getenv("FLOW_PSSGTRACE") && vm_base && wlen < 256) {
++        if (PS3_GETENV_ONCE("FLOW_PSSGTRACE") && vm_base && wlen < 256) {
+             char t[260]; uint32_t n = wlen < 255 ? wlen : 255;
+             for (uint32_t i = 0; i < n; i++) t[i] = (char)vm_read8(buf + i);
+             t[n] = 0;
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9013d85..7b1185f 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -11,6 +11,7 @@
+  * without hand-written NID literals.
+  */
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
++#include "../../include/ps3emu/env_once.h"
+ #include "ppu_recomp.h"     /* ppu_context */
+ #include "ps3emu/nid.h"     /* ps3_compute_nid */
+ #include <stdint.h>
+@@ -123,7 +124,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
+     uint32_t lwm  = (uint32_t)ctx->gpr[3];
+     uint32_t attr = (uint32_t)ctx->gpr[4];
+     { static long long _n=0; _n++;
+-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
++      if (PS3_GETENV_ONCE("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+         fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
+     uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
+     vm_write32(lwm + 0x00, 0);          /* owner */
+@@ -635,7 +636,7 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
+     uint32_t size       = (uint32_t)ctx->gpr[3];
+     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
+     uint32_t id         = mmapper_new_id(size);
+-    if (getenv("PS3_MEMTRACE"))
++    if (PS3_GETENV_ONCE("PS3_MEMTRACE"))
+         fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                 size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
+     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+@@ -649,7 +650,7 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+     uint32_t size = (uint32_t)ctx->gpr[3];
+     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
+     uint32_t id = mmapper_new_id(size);
+-    if (getenv("PS3_MEMTRACE"))
++    if (PS3_GETENV_ONCE("PS3_MEMTRACE"))
+         fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                 size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, id);
+     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+@@ -757,7 +758,7 @@ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
+ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+ {
+     { static long long _n=0; _n++;
+-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
++      if (PS3_GETENV_ONCE("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
+         fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
+                 (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
+     ctx->gpr[3] = 0;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 2f1a55b..194ef9f 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -12,6 +12,7 @@
+  * embed one), in a small lazily-populated registry.
+  */
+ 
++#include "ps3emu/env_once.h"
+ #include "spu_dma.h"
+ #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
+ #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
+@@ -2573,7 +2574,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+      * woken). Honour the first call, halt on the rest. Each task runs on its own
+      * host thread, so a thread-local count is per task. */
+     static _Thread_local int s_exit_seen = 0;
+-    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
++    if (num == 0 && ctx->image_id == 22 && !PS3_GETENV_ONCE("YDKJ_CRI_EXIT_HALT")) {
+         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
+         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
+@@ -2582,7 +2583,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+         spu_halt(ctx);
+         return;
+     }
+-    if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
++    if (num == 0 && (ctx->image_id != 22 || PS3_GETENV_ONCE("YDKJ_CRI_EXIT_HALT"))) {
+         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
+         return;
+@@ -3191,7 +3192,7 @@ SPU_ABI void spu_indirect_branch(spu_context* ctx)
+      * the taskset from garbage -> waiting!=0 -> wrong resume path -> savedContextLr=0.
+      * Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the
+      * exact point before the entry reads r4, after the kernel's arg setup). */
+-    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !getenv("YDKJ_NO_CRI_R4")) {
++    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !PS3_GETENV_ONCE("YDKJ_NO_CRI_R4")) {
+         static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
+         if (s_r4) {
+             /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every
+@@ -3736,7 +3737,7 @@ SPU_ABI void spu_indirect_branch(spu_context* ctx)
+         /* State-diff oracle: dump full LS + all GPRs at the branch-to-0 so it can
+          * be compared byte-for-byte against the RPCS3 savestate LS of the same
+          * (cri_mpv) task. Path from YDKJ_SPU_LSDUMP, else ./recomp_spu_ls.bin. */
+-        const char* dp = getenv("YDKJ_SPU_LSDUMP");
++        const char* dp = PS3_GETENV_ONCE("YDKJ_SPU_LSDUMP");
+         if (!dp || !*dp) dp = "recomp_spu_ls.bin";
+         FILE* lf = fopen(dp, "wb");
+         if (lf) { fwrite(ctx->ls, 1, SPU_LS_SIZE, lf); fclose(lf);
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index d91d62b..7ce7a9e 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -10,6 +10,7 @@
+  * on every PPU store.
+  */
+ 
++#include "ps3emu/env_once.h"
+ #include <stdlib.h>
+ #include "spu_coherency.h"
+ #include "spu_coh_bitmap.h"   /* upstream #534: g_spu_coh_bits for the inline PPU stores */
+@@ -358,7 +359,7 @@ static void spu_coh_reserve_add(spu_context* ctx)
+         spu_coh_chunk* none = NULL;
+         if (__atomic_compare_exchange_n(&last->next, &none, fresh, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+             unsigned n = __atomic_add_fetch(&s_coh_chunks, 1, __ATOMIC_ACQ_REL);
+-            if (getenv("KZ3_LL_STATS"))
++            if (PS3_GETENV_ONCE("KZ3_LL_STATS"))
+                 fprintf(stderr, "[spu-coh] registry grew to %u slots (spu=0x%X)\n", n * SPU_COH_CHUNK, ctx->spu_id);
+             return;
+         }
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 41e819d..4966f8b 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -15,6 +15,7 @@
+ #ifndef SPU_DMA_H
+ #define SPU_DMA_H
+ 
++#include "../../include/ps3emu/env_once.h"
+ #include "spu_context.h"
+ #include "../../include/ps3emu/log_first.h"
+ #include "spu_coherency.h"
+@@ -1335,7 +1336,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+              * path -> savedContextLr=0. Inject r4 = taskset EA (0x0F000000) here.
+              * u64 pref-doubleword: bytes0-3=0, bytes4-7=0x0F000000 -> _u32[0]=0,
+              * _u32[1]=EA. Gated (default on with CRI_CHAIN unless YDKJ_NO_CRI_R4). */
+-            if (!getenv("YDKJ_NO_CRI_R4")) {
++            if (!PS3_GETENV_ONCE("YDKJ_NO_CRI_R4")) {
+                 /* Use libsre's REAL taskset when we have one. 0x0F000000 was a
+                  * fabricated struct from when cellSpursCreateTask was a no-op;
+                  * handing the policy that address makes it walk a taskset with
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 54fef69..2293b5d 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -5,6 +5,7 @@
+  * gain real bodies in their own milestones. Keeping them as real out-of-line
+  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
+  * place -- later milestones only replace the bodies. */
++#include "ps3emu/env_once.h"
+ #include "spu_context.h"
+ #include "spu_lockstep.h"
+ #include <setjmp.h>
+@@ -56,7 +57,7 @@ void kz3_spu_fma_note(const double s[4], int ftz)
+     }
+     (void)ftz;
+     const unsigned long long n = __atomic_add_fetch(&g_kz3_fma_fb[4], 1, __ATOMIC_RELAXED);
+-    if ((n & ((1u << 18) - 1)) == 0 && getenv("KZ3_SPU_FMASTATS"))
++    if ((n & ((1u << 18) - 1)) == 0 && PS3_GETENV_ONCE("KZ3_SPU_FMASTATS"))
+         fprintf(stderr, "[spu-fma] fallback vectors=%llu lanes: naninf=%llu overflow=%llu subnormal=%llu midpoint=%llu ftz=%d\n",
+                 n, g_kz3_fma_fb[0], g_kz3_fma_fb[1], g_kz3_fma_fb[2], g_kz3_fma_fb[3], g_kz3_spu_slowcg == 0);
+ }
+@@ -163,7 +164,7 @@ __attribute__((constructor)) static void kz3_spu_fastcg_init(void)
+     g_kz3_spu_fastdisp = g_kz3_spu_fastcg_level >= 1039;
+     if (!g_kz3_spu_slowcg && g_kz3_spu_fastcg_level < 1040) g_kz3_spu_slowcg = 2;   /* 1038 paths without FTZ */
+     g_kz3_spu_xr = !(getenv("KZ3_SPU_XR") && *getenv("KZ3_SPU_XR") == '0');
+-    g_kz3_fma_stats = getenv("KZ3_SPU_FMASTATS") && *getenv("KZ3_SPU_FMASTATS") == '1';
++    g_kz3_fma_stats = PS3_GETENV_ONCE("KZ3_SPU_FMASTATS") && *PS3_GETENV_ONCE("KZ3_SPU_FMASTATS") == '1';
+     g_spu_launch_diag = !g_kz3_spu_fastdisp || getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+                         getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN");
+ }
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index c70aee0..8728696 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -5,6 +5,7 @@
+  * spu_<mnemonic> helpers the lifter emits, so interpreted and lifted code are
+  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
+  */
++#include "ps3emu/env_once.h"
+ #include <time.h>
+ #include "spu_interp.h"
+ #include "spu_helpers.h"
+@@ -345,7 +346,7 @@ void spu_trace_call(uint32_t from, uint32_t to) {
+     s_trace_i++;
+ }
+ void spu_trace_dump(uint32_t at) {
+-    if (!getenv("SPU_CALLTRACE")) return;
++    if (!PS3_GETENV_ONCE("SPU_CALLTRACE")) return;
+     fprintf(stderr, "[SPU-TRACE] halt at LS 0x%05X; last %d calls (from->to):\n", at, SPU_TRACE_N);
+     unsigned n = s_trace_i < SPU_TRACE_N ? s_trace_i : SPU_TRACE_N;
+     for (unsigned k = 0; k < n; k++) {
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 8c848cf..6af6e86 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -13,6 +13,7 @@
+ #ifndef SPU_LIFTED_JOB_H
+ #define SPU_LIFTED_JOB_H
+ 
++#include "../../include/ps3emu/env_once.h"
+ #include "spu_context.h"
+ #include "spu_interp.h"
+ #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
+@@ -292,7 +293,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+         }
+     }
+     #undef _LB
+-    if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
++    if (taskset_ctx && PS3_GETENV_ONCE("SPURS_TASKSET_TRACE")) {
+         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
+                 "r4=%08X %08X %08X %08X\n", image_id,
+                 ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
+@@ -312,7 +313,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
+      * and the difference between "parked at its idle poll" and "fell over after
+      * three instructions" is invisible without this. */
+-    if (opts && getenv("SPU_WORKER_TRACE")) {
++    if (opts && PS3_GETENV_ONCE("SPU_WORKER_TRACE")) {
+         fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
+                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
+                 ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
+diff --git a/runtime/spu/spu_raw.c b/runtime/spu/spu_raw.c
+index eee4db9..34f5f5a 100644
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -26,6 +26,7 @@
+  * instead of inventing a second one.
+  */
+ 
++#include "ps3emu/env_once.h"
+ #include "spu_raw.h"
+ #include "spu_context.h"
+ #include "spu_workload.h"
+@@ -210,7 +211,7 @@ void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
+     /* SPU_RAW_DUMP=<path>: write the image exactly as the guest presents it, so a
+      * fingerprint that does not match the registered one can be diffed against the
+      * file the offline extractor produced. */
+-    { const char* dp = getenv("SPU_RAW_DUMP");
++    { const char* dp = PS3_GETENV_ONCE("SPU_RAW_DUMP");
+       if (dp) { FILE* f = fopen(dp, "wb"); if (f) { fwrite(e, 1, len, f); fclose(f);
+                 fprintf(stderr, "[spu-raw] dumped %u bytes to %s%c", len, dp, 10); } } }
+     uint64_t fp = spu_workload_fingerprint(e, len);
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 53d4988..80727c1 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -5,6 +5,7 @@
+  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
+  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
+  */
++#include "ps3emu/env_once.h"
+ #include "spu_workload.h"
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
+@@ -826,7 +827,7 @@ static void spu_async_run(spu_async_job* j)
+              * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
+              * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
+              * run the cri task, to see how much further it gets. Diagnostic only. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
++            if (j->image_id == 22 && PS3_GETENV_ONCE("YDKJ_CRI_TASKSET")) {
+                 /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
+                  * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
+                  * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
+@@ -870,11 +871,11 @@ static void spu_async_run(spu_async_job* j)
+              * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
+              * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
+              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+-            if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
++            if (j->image_id == 22 && !PS3_GETENV_ONCE("YDKJ_NO_CRI_CTX")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+-                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
++                if (g_ydkj_real_taskset_ea && !PS3_GETENV_ONCE("YDKJ_MINIMAL_CTX")) {
+                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                      * so the cri leaf reads valid data instead of my planted guesses. */
+@@ -909,9 +910,9 @@ static void spu_async_run(spu_async_job* j)
+                      * can't be diffed -- sweep candidate values here and read the probe's
+                      * r3. Overrides the plants above so one build tests many values. */
+                     { const char* _e;
+-                      if ((_e=getenv("YDKJ_G1_LSPAT"))) { uint32_t v=(uint32_t)strtoul(_e,0,0);
++                      if ((_e=PS3_GETENV_ONCE("YDKJ_G1_LSPAT"))) { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x27A0,v); LSBE32(0x27A4,v); LSBE32(0x27A8,v); LSBE32(0x27AC,v); }
+-                      if ((_e=getenv("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
++                      if ((_e=PS3_GETENV_ONCE("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
+                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+                             g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+@@ -957,7 +958,7 @@ static void spu_async_run(spu_async_job* j)
+              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+              * a null base, the buffer is never filled (=> an audio HLE gap). */
+             if (j->image_id != 22) {
+-                const char* d = getenv("LBP_TASK_DELAY");
++                const char* d = PS3_GETENV_ONCE("LBP_TASK_DELAY");
+                 if (d && *d) {
+ #ifdef _WIN32
+                     Sleep((unsigned)(atoi(d) * 1000));
+@@ -974,7 +975,7 @@ static void spu_async_run(spu_async_job* j)
+              * Planting it makes the mixer read the real FMOD control block
+              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
++            if (j->image_id != 22 && !PS3_GETENV_ONCE("LBP_NO_TASKSET")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                  * globals, which the next CreateTask clobbers -- the race that made
+@@ -1030,7 +1031,7 @@ static void spu_async_run(spu_async_job* j)
+                     }
+                     fflush(stderr);
+                 }
+-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
++                if (PS3_GETENV_ONCE("LBP_REAL_POLICY") && j->taskset_ea) {
+                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
+                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
+                     /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
+@@ -1062,7 +1063,7 @@ static void spu_async_run(spu_async_job* j)
+                      * (not green) the policy's fuller ctx is the fix (H1); if still
+                      * green, the frame-output gate is Bink-layer (H2). Keeps the
+                      * build_context 0x100 kernel ctx (moduleId "TK") intact. */
+-                    if (getenv("LBP_POLICY_CTX")) {
++                    if (PS3_GETENV_ONCE("LBP_POLICY_CTX")) {
+                         memcpy(ls + 0x2700, real2700, sizeof real2700);
+                         fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
+                     }
+@@ -1081,7 +1082,7 @@ static void spu_async_run(spu_async_job* j)
+              * in a bounded loop until it actually DECODES (a >256B video GET sets
+              * g_cri_video_dma) or we time out. This does NOT fake data: the task
+              * only decodes if the PPU genuinely populated real work meanwhile. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
++            if (j->image_id == 22 && PS3_GETENV_ONCE("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
+ #ifdef _WIN32
+                     Sleep(3);
+@@ -1108,7 +1109,7 @@ static void spu_async_run(spu_async_job* j)
+             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
+              * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
+              * propagated yet). Tests whether the game then advances to draw content. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_WAKE")) {
++            if (j->image_id == 22 && PS3_GETENV_ONCE("YDKJ_CRI_WAKE")) {
+                 extern void ydkj_wake_all_event_flags(void);
+                 ydkj_wake_all_event_flags();
+                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+@@ -1117,7 +1118,7 @@ static void spu_async_run(spu_async_job* j)
+              * ends. A reference dump from real hardware is a full local store,
+              * so the only way to ask "what ELSE is different" -- rather than
+              * checking one guessed word at a time -- is to diff all 256 KB. */
+-            { const char* pfx = getenv("SPU_LS_DUMP");
++            { const char* pfx = PS3_GETENV_ONCE("SPU_LS_DUMP");
+               if (pfx) { char path[512];
+                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
+                   FILE* f = fopen(path, "wb");
+@@ -1202,7 +1203,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+          * programs they are NOT embedded ELFs in the EBOOT, so
+          * tools/extract_spu_images.py cannot find them and this is the only
+          * place the bytes exist. One file per fingerprint. */
+-        { const char* _dir = getenv("SPU_DUMP_MISS");
++        { const char* _dir = PS3_GETENV_ONCE("SPU_DUMP_MISS");
+           if (_dir && *_dir) {
+               static uint64_t _seen[64]; static unsigned _nseen = 0;
+               unsigned _k = 0;
+@@ -1563,7 +1564,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+      * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
+      * dispatched to it, so advancing the active lanes to the published ticket
+      * here is semantically the PM's bookkeeping, batched. Validation gate. */
+-    if (getenv("LBP_SYNC_ACK")) {
++    if (PS3_GETENV_ONCE("LBP_SYNC_ACK")) {
+         extern uint32_t g_barrier_sync_watch;
+         uint32_t b = g_barrier_sync_watch;
+         if (b) {
+@@ -1593,7 +1594,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+      * kernel resumed the task with "no pending work" -- lets it run its post-wait
+      * path (complete its loop / set completion flags) instead of hanging. 0/unset
+      * keeps the block-forever behaviour. Reversible, opt-in. */
+-    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
++    unsigned drain = 0; { const char* e = PS3_GETENV_ONCE("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+     int drained = 0;
+     /* Release the global SPU-serial lock while parked so another SPU task can
+      * run (and possibly signal us); re-acquired before returning to resume. */
+@@ -1659,7 +1660,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+          * persistent worker -- could only ever report a fingerprint you had no
+          * way to resolve. These blobs are not ELFs in the EBOOT, so this dump
+          * is the only place their bytes exist. */
+-        { const char* _dir = getenv("SPU_DUMP_MISS");
++        { const char* _dir = PS3_GETENV_ONCE("SPU_DUMP_MISS");
+           if (_dir && *_dir) {
+               static uint64_t _seen[64]; static unsigned _nseen = 0;
+               unsigned _k = 0;
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 547968a..2968190 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -35,6 +35,7 @@
+  * exact.
+  */
+ 
++#include "ps3emu/env_once.h"
+ #include "spu_coherency.h"
+ #include "spu_workload.h"
+ #include "spu_context.h"
+@@ -298,7 +299,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * its DMA and atomic EAs from these words, so when a job spins on a
+      * lock-line address that is not backed, this is what to read first. */
+     { static int _d = 0;
+-      if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
++      if (PS3_GETENV_ONCE("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
+           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
+           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
+               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
+@@ -309,7 +310,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+            * data (past JH_SIZE) and dump what they point at. The job reads its
+            * parameters from there, so a wild DMA/atomic address usually
+            * originates in one of these blocks. */
+-          if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
++          if (atoi(PS3_GETENV_ONCE("SPURS_JOB_DESCDUMP")) >= 2) {
+               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
+                   uint32_t v = g32(job_ea + o);
+                   if (v < 0x10000u || v >= 0xD0000000u) continue;
+@@ -328,7 +329,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
+      * the user data + that command block so the bail path is attributable. */
+     uint32_t dump_cmd = 0;
+-    if (getenv("SPURS_JOB_DUMP")) {
++    if (PS3_GETENV_ONCE("SPURS_JOB_DUMP")) {
+         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
+         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
+         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
+@@ -433,7 +434,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
+                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
+ 
+-    if (getenv("SPURS_JOB_DUMP")) {
++    if (PS3_GETENV_ONCE("SPURS_JOB_DUMP")) {
+         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
+                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
+         /* Post-run view of the same command block: the game polls result/status

@@ -1,0 +1,39 @@
+KZ2 patch 4021 (diagnostic): KZ2_PAD_TRACE=1 logs each change of what cellPadGetData hands the game
+on port 0 (digital words, left stick Y, the d-pad pressure words, the reading thread, the empty reads since the last
+line). Off by default, at most 4000 lines. For the d-pad after a Keyboard page capture (run kz2-r47-m6).
+
+diff -ruN a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c	2026-10-27 17:33:36.144783463 -0500
++++ b/libs/input/cellPad.c	2026-10-27 17:33:36.155419958 -0500
+@@ -1798,6 +1798,31 @@
+             else                        s_data_fresh[port_no] = 0;
+         }
+     }
++#ifdef _WIN32
++    /* KZ2 patch 4021 (diagnostic): KZ2_PAD_TRACE=1 logs what port 0 hands the game whenever it
++     * changes: digital words, left stick Y, the d-pad pressure words, which thread read it and how many reads came
++     * back empty (len 0) since the last line. Off by default; at most 4000 lines. */
++    if (port_no == 0) {
++        static int tr = -1; static unsigned lines = 0, empty = 0; static u16 last[6] = {0xFFFF};
++        static unsigned long long t0 = 0;
++        if (tr < 0) { const char* e = getenv("KZ2_PAD_TRACE"); tr = (e && e[0] == '1'); t0 = GetTickCount64(); }
++        if (tr && lines < 4000) {
++            if (!data->len) empty++;
++            else {
++                const u16 cur[6] = { data->button[CELL_PAD_BTN_OFFSET_DIGITAL1], data->button[CELL_PAD_BTN_OFFSET_DIGITAL2],
++                                     data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y], data->button[CELL_PAD_BTN_OFFSET_PRESS_UP],
++                                     data->button[CELL_PAD_BTN_OFFSET_PRESS_DOWN], (u16)data->len };
++                if (memcmp(cur, last, sizeof cur)) {
++                    memcpy(last, cur, sizeof cur); lines++;
++                    printf("[pad-trace] t=%.3f tid=%lu len=%u d1=%02X d2=%02X ly=%u p_up=%u p_down=%u setting=0x%X empty-since=%u\n",
++                           (GetTickCount64() - t0) / 1000.0, (unsigned long)GetCurrentThreadId(), cur[5], cur[0], cur[1],
++                           cur[2], cur[3], cur[4], (unsigned)s_port_setting[0], empty);
++                    fflush(stdout); empty = 0;
++                }
++            }
++        }
++    }
++#endif
+     {
+         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */

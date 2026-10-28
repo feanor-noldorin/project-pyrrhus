@@ -1,0 +1,24 @@
+libs/system: cellGameBootCheck reports CELL_GAME_ATTRIBUTE_PATCH when PS3_GAME_ATTR_PATCH=1
+(the 1.29 update EBOOT boots from the installed update, as on a PS3 where BootCheck reports the PATCH attribute;
+the runtime always wrote 0). Off by default.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/system/cellGame.c b/libs/system/cellGame.c
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -357,7 +357,13 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+     uint32_t dir_ea  = (uint32_t)(uintptr_t)dirName;
+ 
+     if (type_ea) vm_write32(type_ea, (uint32_t)s_game_type);
+-    if (attr_ea) vm_write32(attr_ea, 0);
++    /* KZ2 patch 6007: a disc title booted from its installed update reports CELL_GAME_ATTRIBUTE_PATCH (1), which
++     * the title may test before it mounts /dev_hdd0/game/<id>/USRDIR. PS3_GAME_ATTR_PATCH=1 sets it (the port's
++     * main sets it when an update folder is configured); default 0 as before. */
++    { const char* pe = getenv("PS3_GAME_ATTR_PATCH");
++      const u32 attr = (pe && pe[0] == '1') ? 1u : 0u;
++      if (attr_ea) vm_write32(attr_ea, attr);
++      if (attr) printf("[cellGame] BootCheck: attributes=PATCH (PS3_GAME_ATTR_PATCH)\n"); }
+ 
+     if (size_ea) {
+         vm_write32(size_ea + 0, (u32)content_free_kb());

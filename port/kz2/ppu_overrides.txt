@@ -1,0 +1,58 @@
+# PPU functions the host replaces (ps3recomp patch 1018, ppu_lifter --overrides): one guest address per line (hex,
+# 8 digits) plus a comment. The lifter renames the lifted body func_X__lifted and announces PPU_OVERRIDE_X in
+# ppu_overrides.h (patch 3005); tools/build-kz2.sh refuses a lift whose announcements differ from this list.
+# KZ3's list is KZ3 addresses and is not carried over. Host bodies: port/kz2/kz2_ppu_overrides.cpp.
+# One list per EBOOT (tools/lift.sh KZ2_EBOOT_VER): this file is the 1.29 update EBOOT (default);
+# ppu_overrides-101.txt is the v1.01 disc EBOOT. Keep the two in step (same functions, each version's address).
+00A5A7B0  # 1.29 SPU post-processing list loop (RPCS3 wiki patch site 0xA5A7CC inside it); KZ2_SPU_POST, KZ2_POST_LOG
+00045DB0  # 1.29 GCM user-command handler (= v1.01 0x45568, same first 48 bytes): KZ2_USERCMD_LOG
+0054B9D0  # 1.29 post stage Render (vtable slot 5; = v1.01 0x53E930): KZ2_POSTSTAGE_LOG
+0054CE18  # 1.29 post stage Submit (slot 13; = v1.01 0x53FD78): KZ2_POSTSTAGE_LOG
+0054B4E8  # 1.29 post stage Unlock-job setup (= v1.01 0x53E448): KZ2_POSTSTAGE_LOG, registers P with the GCM walker watch
+00078528  # 1.29 Game::ShowPage(game, url, camera): KZ2_PAGE_LOG (v1.01 not mapped)
+002C7688  # 1.29 SVOModule::OpenURL(svo, url): KZ2_PAGE_LOG
+002C4A78  # 1.29 SVOModule slot 17 (Update; consumes the pending url 0x11F24F8/0x11F2504): KZ2_PAGE_LOG
+002C6E38  # 1.29 SVOModule slot 18 (Render): KZ2_PAGE_LOG
+00489970  # 1.29 Browser::OpenPage(browser, url, r5) (name ASSUMPTION): KZ2_PAGE_LOG
+0048D848  # 1.29 Browser::IsReady(browser) (name ASSUMPTION): KZ2_PAGE_LOG
+003ABC40  # 1.29 state query of the object at *0xFE17B0 (IsReady's second condition): KZ2_PAGE_LOG
+0049EA38  # 1.29 "file" protocol handler fetch (CachedJsp lookup, then file stream): KZ2_PAGE_LOG
+0049E5C0  # 1.29 CachedJspResource page lookup(resource, path): KZ2_PAGE_LOG
+0002AF50  # 1.29 file stream open(stream, &path, 1, 0) (logged only inside the fetch): KZ2_PAGE_LOG
+004893A8  # 1.29 browser navigate(url request, flag): KZ2_PAGE_LOG (generic trace)
+00489078  # 1.29 browser load-now (navigate's direct path): KZ2_PAGE_LOG
+00488FB8  # 1.29 browser queue (navigate's deferred path): KZ2_PAGE_LOG
+003ABED0  # 1.29 svo client call made by OpenPage when (+8C)->+38 == 1: KZ2_PAGE_LOG
+0049E820  # 1.29 "file" handler slot 2 (open: state 2 -> 3): KZ2_PAGE_LOG
+0049ED98  # 1.29 "file" handler slot 3 (process; calls the fetch 0x49EA38): KZ2_PAGE_LOG
+0048A660  # 1.29 svo-client listener slot 7 (connection-state callback; creates the "file" handler): KZ2_PAGE_LOG
+0048A520  # 1.29 svo-client listener slot 5: KZ2_PAGE_LOG
+0048A5B0  # 1.29 svo-client listener slot 6: KZ2_PAGE_LOG
+0048A650  # 1.29 svo-client listener slot 8: KZ2_PAGE_LOG
+0048A920  # 1.29 svo-client listener slot 10: KZ2_PAGE_LOG
+0048A948  # 1.29 svo-client listener slot 11: KZ2_PAGE_LOG
+00484170  # 1.29 svo-client listener slot 2: KZ2_PAGE_LOG
+003B7908  # 1.29 SV engine vt[5] Go(engine, url, type) (gate: state +0x99B4 in {0,3,0xD}): KZ2_PAGE_LOG
+003B6220  # 1.29 SV engine request start (fails if +0x99C4 holds a request): KZ2_PAGE_LOG
+003A7198  # 1.29 handler registry walk(registry, scheme), slots 15..0: KZ2_PAGE_LOG (dumps the 16 slots)
+003A8330  # 1.29 url parse/resolve(out, base, url): KZ2_PAGE_LOG
+003A8264  # 1.29 handler lookup(registry, url, listener) -> handler (calls its Open): KZ2_PAGE_LOG
+003B69C0  # 1.29 SV engine call made by 0x3ABED0 before Go: KZ2_PAGE_LOG
+0049E668  # 1.29 SVOLocalFileProvider ctor(this, owner): KZ2_PAGE_LOG
+0049EF10  # 1.29 SVOLocalFileProvider CanHandle(this, scheme): KZ2_PAGE_LOG
+003B8628  # 1.29 SV engine vt[3] IsIdle: KZ2_PAGE_LOG
+008D3398  # 1.29 Havok step setup (seeds the first job): KZ2_HAVOK_LOG (v1.01 not mapped)
+00816828  # 1.29 Havok addJob(out, queue, entry, 0, prio): KZ2_HAVOK_LOG
+008149C8  # 1.29 Havok addJob child variant: KZ2_HAVOK_LOG
+00816F68  # 1.29 Havok getNextJob(queue, wait, out): KZ2_HAVOK_LOG
+008DAD20  # 1.29 Havok type-1 job handler(ctx, queue, buf): KZ2_HAVOK_LOG
+00072FB0  # 1.29 PPU job-fiber scheduler run_all(S, list) (entity update jobs): host fibers, port/kz2/guest_fiber.c; KZ2_FIBER_LOG (v1.01 not mapped)
+00073178  # 1.29 job-fiber wait(S, ptr): switch to the scheduler's host fiber
+000732D8  # 1.29 job-fiber finish(S): next job into the slot, back to the scheduler
+00048AE8  # 1.29 Renderer::WaitLabel(this, idx, value) (label 0x4B poll): host wait on patch 6019; KZ2_LABEL_WAIT=0 = the poll (v1.01 not mapped)
+000826B0  # 1.29 PlayerProfile::SetFunctionButton(this, func, button) (Lua binding): KZ2_PAD_LAYOUT=modern (v1.01 not mapped)
+00079BC8  # 1.29 profile load-or-create at boot (loader 0x79A78): KZ2_PAD_LAYOUT applied to the loaded map
+0007BA60  # 1.29 profile save/load state machine (state obj+0x8): KZ2_PAD_LAYOUT applied when a step finishes
+00082248  # 1.29 input query "function down" (state array, func): KZ2_PAD_LOG
+00082290  # 1.29 input query "function pressed" (state == 3): KZ2_PAD_LOG
+000822F0  # 1.29 input query "function released" (state == 2): KZ2_PAD_LOG

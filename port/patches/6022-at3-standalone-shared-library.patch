@@ -1,0 +1,56 @@
+CMake: option PS3RECOMP_AT3_SHARED builds third_party/at3_standalone as its own shared library.
+
+Why: third_party/at3_standalone is FFmpeg's ATRAC3/ATRAC3plus decoder as extracted by PPSSPP (LGPL-2.1-or-later).
+Linked statically into a port's executable, the executable carries LGPL code the user cannot swap out. With the
+option on, the unmodified sources (and ps3recomp's own MIT at3_bridge.cpp, whose at3p_* functions cellAtrac.c calls)
+become at3_standalone.dll (Windows; at3_standalone.so elsewhere) in the top build directory, next to the executable,
+and ps3recomp_runtime links against it, so the executable imports it by name and a user can replace it.
+
+Default OFF: nothing changes for a port that does not ask for it. Killzone 2 turns it on in port/kz2/CMakeLists.txt.
+The DLL is linked with the toolchain's -static-libgcc/-static-libstdc++ (port/cmake/mingw-w64.cmake), so it
+needs no MinGW runtime DLL beside it.
+
+Verification: Windows build of kz2.exe; objdump -p lists at3_standalone.dll among kz2.exe's imports and only Windows
+system DLLs among at3_standalone.dll's (the RE notes "An earlier change").
+Upstream candidate (general: any port that ships its executable). Written for this port.
+
+diff -ru a/CMakeLists.txt b/CMakeLists.txt
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -78,7 +78,21 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.c
+ # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
+ file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
+ set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+-list(APPEND HLE_SOURCES ${AT3_SOURCES})
++# A port that ships its executable can keep the LGPL decoder in a library of
++# its own (at3_standalone.dll / at3_standalone.so beside the executable,
++# linked dynamically, so a user can replace it) instead of linking it into
++# the runtime. The sources are the same either way.
++option(PS3RECOMP_AT3_SHARED "Build third_party/at3_standalone as its own shared library" OFF)
++if(PS3RECOMP_AT3_SHARED)
++    add_library(at3_standalone SHARED ${AT3_SOURCES})
++    # No "lib" prefix, and next to the executable that loads it.
++    set_target_properties(at3_standalone PROPERTIES PREFIX ""
++        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
++        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
++    message(STATUS "  ATRAC3/3+:    third_party/at3_standalone as a shared library")
++else()
++    list(APPEND HLE_SOURCES ${AT3_SOURCES})
++endif()
+ 
+ # Runtime core (syscalls, PPU, SPU, memory)
+ file(GLOB_RECURSE RUNTIME_SOURCES
+@@ -110,6 +124,9 @@ add_library(ps3recomp_runtime STATIC
+ target_include_directories(ps3recomp_runtime PUBLIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+ )
++if(PS3RECOMP_AT3_SHARED)
++    target_link_libraries(ps3recomp_runtime PUBLIC at3_standalone)
++endif()
+ # KZ3 patch 1056: ppu_memory.h's coherent stores use the striped lock-line lock
+ # (spu_coherency.c); code built outside this target keeps the whole-lock form.
+ target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_LL_STRIPED=1)

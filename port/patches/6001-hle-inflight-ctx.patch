@@ -1,0 +1,32 @@
+ppu_hle: g_hle_inflight_ctx[], the guest context of each in-flight ctx HLE handler, so the
+port watchdog can walk the guest stack of a thread parked in an HLE wait. Diagnostic only; no behaviour change.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -152,6 +152,10 @@ extern "C" const char* g_last_hle_name = "";
+  * set on entry, cleared on every exit path by the guard below. */
+ #define PS3_HLE_INFLIGHT_MAX 64
+ extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
++/* KZ2 patch 6001: the guest context of each in-flight ctx handler, next to its name, so a watchdog can walk the guest
++ * stack (gpr[1] back chain) of a thread parked in an HLE wait. A callback run by an HLE handler (cellSaveData funcStat,
++ * ...) runs on a context the thread registry does not list; this one is the context that made the call. */
++extern "C" struct ppu_context* g_hle_inflight_ctx[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+ 
+ /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
+  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
+@@ -747,10 +751,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+              * a very convincing wrong answer to chase. */
+             g_last_hle_name = g_ctx[i].name;
+             { unsigned t = (unsigned)ctx->thread_id;
+-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
++              if (t < PS3_HLE_INFLIGHT_MAX) { g_hle_inflight[t] = g_ctx[i].name; g_hle_inflight_ctx[t] = ctx; } }
+             g_ctx[i].fn(ctx);
+             { unsigned t = (unsigned)ctx->thread_id;
+-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
++              if (t < PS3_HLE_INFLIGHT_MAX) { g_hle_inflight[t] = nullptr; g_hle_inflight_ctx[t] = nullptr; } }
+             return;
+         } } }
+ 

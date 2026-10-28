@@ -1,0 +1,257 @@
+# Release build: the Inno Setup installer and the portable zip, built on a GitHub Windows runner;
+# adapted from Project Helghast, the Killzone 3 PC port (same author, MIT).
+#
+# Triggers: a pushed tag vMAJOR.MINOR.PATCH (builds, then creates a DRAFT release) and workflow_dispatch (a dry run:
+# builds and uploads the workflow artifact, never publishes). Nothing runs on a push to a branch or on a pull request.
+# Release rules: the version is installer/VERSION and a tag must say the same (tools/release/release_version.py; the
+# same string is in the exe, the launcher, the installer and CITATION.cff); the release is a pre-release while the
+# major version is 0; its title is the tag; SHA256SUMS and one .sha256 per file sit beside the assets; an existing
+# release is never touched, no tag is created, moved or deleted, and no asset is overwritten. The maintainer reads the
+# draft and publishes it.
+#
+# Jobs: nix-parts (Linux, Nix; a Windows runner has none) builds the two LGPL FFmpeg decoder DLLs from
+# tools/runtime/ffmpeg-lgpl-win.nix and stages SDL3.dll from the flake's nixpkgs (the same SDL3 the local build ships);
+# installer (Windows) builds everything else and the two assets, with a read-only token; publish
+# (Linux, tag pushes only) is the one job that may write: it creates the draft release from the installer job's
+# artifact. Artifacts move between jobs with the gh CLI on the runner image (no extra action).
+#
+# Third-party pieces: actions/checkout and actions/upload-artifact (GitHub, MIT), cachix/install-nix-action (Apache-2.0),
+# the gh CLI (MIT, on the image), Inno Setup 6.7.3 (Inno Setup License; the vendor installer, pinned by SHA-256 in
+# tools/release/toolchain.json build_tools, when the image lacks it). Downloads at build time, each pinned by SHA-256 in
+# tools/release/toolchain.json or installer/art/art.json: llvm-mingw (Apache-2.0 WITH LLVM-exception; mingw-w64 and
+# winpthreads licences), the Python embeddable package (PSF), CMake (BSD-3-Clause), Ninja (Apache-2.0), Rajdhani
+# (SIL OFL 1.1). From the flake's nixpkgs (flake.lock): FFmpeg's source (LGPL-2.1-or-later build) and SDL3 (zlib).
+# The licence texts the toolchain step would otherwise download are kept in tools/release/licence-texts/ and are used
+# when their SHA-256 matches the pin, so a slow licence server cannot stop the build.
+# Nothing of the game is used or produced here: the installer carries sources, the toolkit and the toolchain only.
+#
+# Published files: Project-Pyrrhus-setup.exe, Project-Pyrrhus-<version>-portable.zip, a .sha256 for each, SHA256SUMS.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:   # dry run only: no inputs, version = installer/VERSION, publishing is skipped
+
+permissions:
+  contents: read    # default for every job; only the publish job below gets write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nix-parts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b  # v31.11.3
+      - name: FFmpeg LGPL decoders (avcodec, avutil; MinGW-w64 cross build with the flake's nixpkgs)
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          # a path: flake ref (the checkout is shallow and small here; the local build in docs/BUILDING.md uses git+file)
+          nix build --impure -o work/ffmpeg-win --expr \
+            "import ./tools/runtime/ffmpeg-lgpl-win.nix { pkgs = import (builtins.getFlake \"path:$PWD\").inputs.nixpkgs { system = \"x86_64-linux\"; }; }"
+          mkdir -p nix-parts/ffmpeg-win
+          cp -rL work/ffmpeg-win/bin work/ffmpeg-win/share nix-parts/ffmpeg-win/
+      - name: SDL3 (the .#win shell's SDL3.dll and licence, as the local build stages it)
+        run: |
+          nix develop .#win --command python3 tools/release/stage_sdl3.py --out nix-parts/sdl3
+          find nix-parts -type f | sort
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: nix-parts
+          path: nix-parts
+          if-no-files-found: error
+          retention-days: 3
+
+  installer:
+    needs: nix-parts
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read     # gh run download: the nix-parts job's artifact
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    env:
+      INNO_VERSION: "6.7.3"   # WizardStyle dark needs 6.6.0+; 6.7.3 is the version tested under Proton
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash          # Git Bash on the image: the same scripts as the Linux build
+    steps:
+      # Git for Windows checks text files out with CRLF by default: the bash scripts would stop on "\r", and the
+      # ps3recomp patches carry their sources' line ends byte for byte. Keep the repository's bytes.
+      - name: Line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # The scripts call python3; the image has python.exe (a WindowsApps python3 may be the store stub).
+      - name: python3 on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec python "$@"\n' > "$RUNNER_TEMP/bin/python3"
+          chmod +x "$RUNNER_TEMP/bin/python3"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Version (installer/VERSION; a tag must say the same)
+        id: ver
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            python3 tools/release/release_version.py --check --tag "$GITHUB_REF_NAME" || {
+              echo "::error::tag $GITHUB_REF_NAME is not v + installer/VERSION ($(cat installer/VERSION))"; exit 1; }
+          else
+            python3 tools/release/release_version.py --check
+          fi
+          echo "version=$(python3 tools/release/release_version.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Release checks (no download)
+        run: |
+          python3 tools/release/fetch_toolchain.py --check --strict
+          python3 tools/release/test_iss_ispp.py
+
+      - name: Toolkit (ps3recomp at its pinned commit with port/patches applied)
+        run: tools/ps3recomp-patched.sh > /dev/null
+
+      - name: Fonts (Rajdhani Medium + Bold, SIL OFL; hash-checked against installer/art/art.json)
+        run: python3 tools/release/installer_art.py --fetch-fonts
+
+      - name: Toolchain (llvm-mingw, Python, CMake, Ninja; SHA-256 checked)
+        run: python3 tools/release/fetch_toolchain.py
+
+      - name: Launcher (built with the bundled llvm-mingw)
+        run: |
+          B=work/release/toolchain-cache/trees/llvm-mingw/bin
+          # windres runs its preprocessor (gcc/clang) from PATH, so the bundled bin folder goes first
+          export PATH="$PWD/$B:$PATH"
+          CC="$B/x86_64-w64-mingw32-gcc.exe" WINDRES="$B/x86_64-w64-mingw32-windres.exe" \
+            tools/release/build_launcher.sh build/launcher
+
+      - name: FFmpeg decoders and SDL3 (the nix-parts job's artifact)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name nix-parts --dir "$RUNNER_TEMP/nix-parts"
+          mkdir -p work/release
+          cp -r "$RUNNER_TEMP/nix-parts/ffmpeg-win" work/ffmpeg-win
+          # stage_sdl3.py checks the DLL (PE x64) and the zlib licence text again on this side
+          python3 tools/release/stage_sdl3.py --dll "$RUNNER_TEMP/nix-parts/sdl3/SDL3.dll" \
+            --license "$RUNNER_TEMP/nix-parts/sdl3/LICENSE.txt"
+          ls -l work/ffmpeg-win/bin work/release/sdl3
+
+      - name: Assemble the payload
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 tools/release/assemble_payload.py --out build/release-payload --version "$VERSION" \
+            --toolchain work/release/toolchain-cache --launcher "build/launcher/Project Pyrrhus.exe"
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          # Always the pinned version: an older Inno Setup on the image would stop kz2.iss at its 6.6.0 #error.
+          # ISCC.exe carries no ProductVersion; the uninstaller (unins000.exe) next to it does.
+          $dir = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          $iscc = Join-Path $dir "ISCC.exe"
+          $unins = Join-Path $dir "unins000.exe"
+          $have = if ((Test-Path $iscc) -and (Test-Path $unins)) { (Get-Item $unins).VersionInfo.ProductVersion } else { "" }
+          Write-Host "Inno Setup on the image: '$have'"
+          if (-not "$have".StartsWith($env:INNO_VERSION)) {
+            # Official installer, checked against the SHA-256 pinned in tools/release/toolchain.json (build_tools);
+            # a mismatch fails the job before anything is run (no unverified download runs).
+            $pin = (Get-Content tools/release/toolchain.json -Raw | ConvertFrom-Json).build_tools | Where-Object name -eq innosetup
+            if ($pin.version -ne $env:INNO_VERSION) { Write-Error "INNO_VERSION $env:INNO_VERSION != pinned $($pin.version)"; exit 1 }
+            $exe = Join-Path $env:RUNNER_TEMP "innosetup-$($pin.version).exe"
+            Invoke-WebRequest -Uri $pin.url.Replace("{version}", $pin.version) -OutFile $exe
+            $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $pin.sha256) { Write-Error "Inno Setup SHA-256 mismatch: got $got, pinned $($pin.sha256)"; exit 1 }
+            $p = Start-Process $exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER" -Wait -PassThru
+            if ($p.ExitCode) { Write-Error "Inno Setup install exit $($p.ExitCode)"; exit 1 }
+            # /CURRENTUSER installs under %LOCALAPPDATA%\Programs
+            $iscc = Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { Write-Error "ISCC not found"; exit 1 }
+          (Get-Item (Join-Path (Split-Path $iscc) "unins000.exe")).VersionInfo.ProductVersion
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build the installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          & $env:ISCC "/DAppVersion=$env:VERSION" "/DPayload=$PWD\build\release-payload" installer\kz2.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $exe = Get-Item installer\Output\Project-Pyrrhus-setup.exe
+          $h = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # "HASH  NAME" with LF and no BOM, the same bytes as pack_zip.py's .sha256 (sha256sum -c reads both)
+          [IO.File]::WriteAllText("$PWD\installer\Output\Project-Pyrrhus-setup.exe.sha256", "$h  $($exe.Name)`n", (New-Object Text.UTF8Encoding $false))
+          Get-Content installer\Output\Project-Pyrrhus-setup.exe.sha256
+
+      - name: Portable zip (and its .sha256)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 tools/release/pack_zip.py --payload build/release-payload \
+            --out "installer/Output/Project-Pyrrhus-$VERSION-portable.zip"
+          ls -l installer/Output
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: Project-Pyrrhus-${{ steps.ver.outputs.version }}
+          path: |
+            installer/Output/Project-Pyrrhus-setup.exe
+            installer/Output/Project-Pyrrhus-setup.exe.sha256
+            installer/Output/Project-Pyrrhus-*-portable.zip
+            installer/Output/Project-Pyrrhus-*-portable.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # Tag pushes only; a dispatch never publishes. A draft pre-release (major 0) titled with the tag. If a release for the
+  # tag already exists the job fails: nothing is edited, re-uploaded or clobbered, and no tag is touched (--verify-tag
+  # refuses to create one). No checkout: the job runs no repository code.
+  publish:
+    needs: installer
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # gh release create; nothing else is written
+      actions: read     # gh run download: the installer job's artifact
+    steps:
+      - name: Draft release with SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.installer.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF_NAME" = "v$VERSION" ] || { echo "::error::tag $GITHUB_REF_NAME is not v$VERSION"; exit 1; }
+          mkdir assets && cd assets
+          gh run download "$GITHUB_RUN_ID" --name "Project-Pyrrhus-$VERSION" --dir .
+          ls -l
+          zip="Project-Pyrrhus-$VERSION-portable.zip"
+          for f in Project-Pyrrhus-setup.exe "$zip"; do
+            test -s "$f" && test -s "$f.sha256"
+            sha256sum -c "$f.sha256"
+          done
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::error::a release for $GITHUB_REF_NAME already exists; refusing to touch it"; exit 1
+          fi
+          sha256sum Project-Pyrrhus-setup.exe "$zip" > SHA256SUMS
+          cat SHA256SUMS
+          pre=""; case "$VERSION" in 0.*) pre="--prerelease" ;; esac
+          printf '%s\n' "Project Pyrrhus $VERSION. Windows installer and portable zip. Pre-release, partly playable. You need your own Killzone 2 disc dump (US, BCUS98116), the 1.29 update and a decrypted EBOOT made from your own copy; none of them is included or downloaded. SHA-256 sums: SHA256SUMS (and the .sha256 files). See the README for what it does and what goes online." > ../notes.txt
+          gh release create "$GITHUB_REF_NAME" --draft $pre --verify-tag --title "$GITHUB_REF_NAME" --notes-file ../notes.txt \
+            Project-Pyrrhus-setup.exe Project-Pyrrhus-setup.exe.sha256 "$zip" "$zip.sha256" SHA256SUMS

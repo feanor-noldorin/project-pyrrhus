@@ -1,0 +1,389 @@
+KZ2 patch 6024: cellAudio consumes port blocks on a steady 5.333 ms clock, not on the device's demand.
+
+Killzone 2's movie audio (intro, AC3 5.1 through 6023) goes through libmixer's cellSurMixer, linked into the EBOOT: its
+thread _cellsurMixerMain waits for CELL_AUDIO_EVENT_MIX on a queue of two (0x7B2060), reads the port's read index
+(0x7B2148) and writes the next 256 samples AT that index (0x7B21B0, block = index x 8192 bytes, 8 channels), so it has
+one block period to run. The mix thread consumed a block whenever the host device had room; under Proton (winepulse)
+the device asks for 480 frames every 10 ms, so blocks went out two at a time, the second before the mixer thread could
+run: it played as an empty block and the mixer's next write landed on the block after, overwriting the one it had just
+written. The game's own port 0 producer writes further ahead, which is why only the movie crackled (hand playtest
+2026-10-22). Host test tools/runtime/test_audio_pace.sh models it: the old loop with a 30 ms winepulse-like device gives
+5248 empty blocks and 5250 double writes in 11253 blocks; the steady clock none (300 s, device clock +-300 ppm).
+
+Now (libs/audio/audio_pace.h): the PS3 side mixes a block when it is due on the host performance counter, one period
+apart whatever the device does, and keeps the device a cushion ahead (40 ms, at most half its buffer; WASAPI is asked
+for 100 ms instead of 20). The period is trimmed by up to 5 % from how full the device is, so the two clocks cannot
+drift apart (no resampling; the guest sees 5.33 ms +- a few percent); silence fills the cushion at the start and after
+the device ran dry. Without a device it is the plain clock, as before. PS3_AUDIO_DEVICE_PACED=1 restores the old loop.
+Measure: every port counts dropouts (a single all-zero block between two blocks with sound: audio_hole_track), logged
+every 10 s when there were new ones and at PortClose ("port 1 closed after N blocks: K dropouts"). Test aid:
+PS3_AUDIO_FAKE_DEVICE=<period ms> stands in for a missing device (muted Proton runs) with winepulse's demand pattern;
+it never replaces a real device.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): WASAPI buffer 100 ms on 6024's steady clock, #514's 60 ms with the device-paced loop, #514's PS3_AUDIO_BUF_MS override on both; #514's TIME_CRITICAL/MMCSS mix thread and underrun count kept
+
+diff --git a/libs/audio/audio_pace.h b/libs/audio/audio_pace.h
+new file mode 100644
+--- /dev/null
++++ b/libs/audio/audio_pace.h
+@@ -0,0 +1,100 @@
++/*
++ * KZ2 patch 6024: when cellAudio consumes a port block.
++ *
++ * The PS3 audio system reads one 256-sample block of every running port each 5.333 ms, on its own steady clock,
++ * publishes the new read index and sends CELL_AUDIO_EVENT_MIX. A producer that writes the block AT the published read
++ * index (libmixer's cellSurMixer, linked into Killzone 2 for its movie audio: 0x7B2148 reads the index, 0x7B21B0 writes
++ * the block) has exactly one period to wake and fill it. The mixer used to consume blocks whenever the host device had
++ * room: under Proton (winepulse) the device asks every 10 ms for 480 frames, so blocks went out in bursts of two
++ * back to back, the second before the producer could run. That block played empty (a 5.3 ms hole) and the producer's
++ * next write landed on the block after, overwriting what it had just written: the intro movie's crackle.
++ *
++ * Now the PS3 side ticks on its own clock (the host performance counter, one block per period), whatever the device
++ * does, and the device is kept a cushion ahead: a block that is due is mixed and queued; the period is trimmed by a
++ * few percent from how full the device buffer is, so the two clocks cannot drift apart (no resampling, the guest just
++ * sees periods of 5.33 ms +- a few percent). Without a device (muted runs) it is the plain clock.
++ * Pure arithmetic, no platform calls: tools/runtime/test_audio_pace.c drives it with a simulated device and producer.
++ */
++#ifndef PS3RECOMP_AUDIO_PACE_H
++#define PS3RECOMP_AUDIO_PACE_H
++
++#define AUDIO_PACE_BLOCK      256        /* samples per block (CELL_AUDIO_BLOCK_SAMPLES) */
++#define AUDIO_PACE_RATE       48000      /* Hz */
++#define AUDIO_PACE_LATE_US    50000.0    /* more than this behind: drop the backlog instead of mixing it in a burst */
++#define AUDIO_PACE_GAIN       0.05       /* period trim per unit of relative fill error */
++#define AUDIO_PACE_MAX_TRIM   0.05       /* at most +-5 % */
++
++typedef struct {
++    double period_us;     /* nominal block period, 5333.33 us */
++    double due_us;        /* when the next block is due (host clock) */
++    int    started;
++    int    target;        /* device fill to hold, frames (0 = no device) */
++    unsigned long long blocks;
++    unsigned late_drops;  /* backlogs dropped (the mix thread was stalled) */
++    double late_ms;
++} AudioPace;
++
++static inline void audio_pace_init(AudioPace* p, int target_frames)
++{
++    p->period_us = (double)AUDIO_PACE_BLOCK * 1e6 / (double)AUDIO_PACE_RATE;
++    p->due_us = 0.0;
++    p->started = 0;
++    p->target = target_frames > 0 ? target_frames : 0;
++    p->blocks = 0;
++    p->late_drops = 0;
++    p->late_ms = 0.0;
++}
++
++/* The device cushion for a device buffer of `cap` frames: 40 ms, at most half the buffer, at least two blocks. */
++static inline int audio_pace_target_for(int cap)
++{
++    int t = AUDIO_PACE_RATE / 25;                 /* 1920 frames = 40 ms */
++    if (t > cap / 2) t = cap / 2;
++    if (t < 2 * AUDIO_PACE_BLOCK) t = 2 * AUDIO_PACE_BLOCK;
++    return t;
++}
++
++/* One look at the clock. now_us: host time; fill: frames still queued in the device, -1 without one.
++ * Returns 1 when a block is due (mix it, queue *silence frames of silence first, then the block), else 0 and
++ * *wait_us = how long until it is. *silence is nonzero at the start and when the device ran (nearly) dry, to put the
++ * cushion back. */
++static inline int audio_pace_step(AudioPace* p, double now_us, int fill, double* wait_us, int* silence)
++{
++    double step = p->period_us;
++    *silence = 0;
++    *wait_us = 0.0;
++    if (!p->started) { p->started = 1; p->due_us = now_us; }
++    if (now_us < p->due_us) { *wait_us = p->due_us - now_us; return 0; }
++    if (now_us - p->due_us > AUDIO_PACE_LATE_US) {
++        p->late_drops++;
++        p->late_ms += (now_us - p->due_us) / 1000.0;
++        p->due_us = now_us;
++    }
++    if (fill >= 0 && p->target > 0) {
++        double err, trim;
++        if (fill < AUDIO_PACE_BLOCK) *silence = p->target - fill;
++        err = (double)(fill + *silence - p->target) / (double)p->target;
++        trim = err * AUDIO_PACE_GAIN;
++        if (trim > AUDIO_PACE_MAX_TRIM) trim = AUDIO_PACE_MAX_TRIM;
++        if (trim < -AUDIO_PACE_MAX_TRIM) trim = -AUDIO_PACE_MAX_TRIM;
++        step *= 1.0 + trim;   /* device fuller than the cushion: the next block a little later */
++    }
++    p->due_us += step;
++    p->blocks++;
++    return 1;
++}
++
++/* Dropout count for one port, block by block: a single all-zero block between two blocks with sound is a block the
++ * producer did not fill in time (silence in the material lasts longer than 5.3 ms of exact zeros). */
++typedef struct { unsigned char prev_sound, prev2_sound; unsigned holes; } AudioHoleTrack;   /* zero = start */
++
++static inline int audio_hole_track(AudioHoleTrack* h, int block_has_sound)
++{
++    int hole = !h->prev_sound && h->prev2_sound && block_has_sound;
++    if (hole) h->holes++;
++    h->prev2_sound = h->prev_sound;
++    h->prev_sound = (unsigned char)(block_has_sound != 0);
++    return hole;
++}
++
++#endif
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -23,6 +23,7 @@
+ #include <math.h>
+ #include "ps3emu/log_first.h"
+ #include "ps3emu/thread_name.h"
++#include "audio_pace.h"   /* KZ2 patch 6024 */
+ 
+ /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
+  * rather than including sys_event.h to avoid pulling PPU context/syscall
+@@ -156,6 +157,19 @@ static int           s_mix_thread_live = 0;
+ #endif
+ static mutex_t       s_audio_mutex;
+ 
++/* KZ2 patch 6024 (audio_pace.h): the PS3 side ticks on its own clock; PS3_AUDIO_DEVICE_PACED=1 brings back the old
++ * loop that mixed whenever the device had room (for A/B). Dropouts (a single empty block inside sound, see
++ * audio_hole_track) are counted per port always and logged every 10 s when there were any, and at PortClose. */
++static int            s_audio_device_paced = -1;
++static AudioHoleTrack s_port_holes[CELL_AUDIO_PORT_MAX];
++static unsigned       s_port_holes_logged[CELL_AUDIO_PORT_MAX];
++static unsigned long long s_port_blocks[CELL_AUDIO_PORT_MAX];
++static int audio_device_paced(void)
++{
++    if (s_audio_device_paced < 0) s_audio_device_paced = getenv("PS3_AUDIO_DEVICE_PACED") ? 1 : 0;
++    return s_audio_device_paced;
++}
++
+ /* Output mix buffer (stereo, one block worth) */
+ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+ 
+@@ -228,6 +242,10 @@ static u32 audio_backend_queued_samples(void)
+     return 0;
+ }
+ 
++/* KZ2 patch 6024: no device buffer to keep a cushion in here; the clock alone paces. */
++static int  audio_backend_capacity(void) { return 0; }
++static void audio_backend_silence(u32 frames) { (void)frames; }
++
+ #endif /* AUDIO_BACKEND_SDL2 */
+ 
+ #if AUDIO_BACKEND_WASAPI
+@@ -237,6 +255,44 @@ static IAudioRenderClient*  s_wasapi_render = NULL;
+ static HANDLE               s_wasapi_event  = NULL;
+ static UINT32               s_wasapi_buf_frames = 0;
+ 
++/* KZ2 patch 6024, test aid: PS3_AUDIO_FAKE_DEVICE=<period ms> stands in for a missing device (muted test runs: the
++ * sandbox has no audio driver) with a buffer of the size WASAPI was asked for (at least three periods) that the
++ * "device" empties by one period of frames at every period boundary, as winepulse asks for data. Nothing is played.
++ * Only when WASAPI found no device: it never replaces a real one. */
++static int       s_fake_period_ms = -1, s_fake_cap, s_fake_fill;
++static long long s_fake_t0, s_fake_done;
++static unsigned long long s_fake_underruns;
++static int audio_fake_on(void)
++{
++    if (s_fake_period_ms < 0) {
++        const char* e = getenv("PS3_AUDIO_FAKE_DEVICE");
++        s_fake_period_ms = e ? atoi(e) : 0;
++        if (s_fake_period_ms < 0 || s_fake_period_ms > 100) s_fake_period_ms = 0;
++        if (s_fake_period_ms) {
++            LARGE_INTEGER c; QueryPerformanceCounter(&c); s_fake_t0 = c.QuadPart;
++            s_fake_cap = (audio_device_paced() ? 20 : 100) * CELL_AUDIO_SAMPLE_RATE / 1000;
++            if (s_fake_cap < 3 * s_fake_period_ms * CELL_AUDIO_SAMPLE_RATE / 1000)
++                s_fake_cap = 3 * s_fake_period_ms * CELL_AUDIO_SAMPLE_RATE / 1000;
++            printf("[cellAudio] PS3_AUDIO_FAKE_DEVICE: no device; a stand-in takes %d frames every %d ms, buffer %d "
++                   "frames\n", s_fake_period_ms * CELL_AUDIO_SAMPLE_RATE / 1000, s_fake_period_ms, s_fake_cap);
++        }
++    }
++    return s_fake_period_ms > 0 && !s_wasapi_client;
++}
++static void audio_fake_update(void)
++{
++    LARGE_INTEGER c, f; long long periods;
++    QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
++    periods = (c.QuadPart - s_fake_t0) * 1000 / (f.QuadPart * s_fake_period_ms);
++    while (s_fake_done < periods) {
++        const int take = s_fake_period_ms * CELL_AUDIO_SAMPLE_RATE / 1000;
++        s_fake_done++;
++        if (s_fake_fill < take) { if (s_fake_done > 50) s_fake_underruns++; s_fake_fill = 0; }
++        else s_fake_fill -= take;
++    }
++}
++
++
+ static int audio_backend_init(void)
+ {
+     HRESULT hr;
+@@ -281,11 +337,10 @@ static int audio_backend_init(void)
+     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+     wfx.cbSize          = 0;
+ 
+-    /* Event-driven, 60 ms by default (PS3_AUDIO_BUF_MS). The old 20 ms ran
+-     * dry whenever the mixing thread lost the CPU for a moment -- with every
+-     * core busy running SPU/PPU code that was often, and each time is an
+-     * audible stutter (Bink cutscenes most of all). */
+-    REFERENCE_TIME buf_duration = 600000; /* 60 ms in 100 ns units */
++    /* Event-driven. KZ2 patch 6024: 100 ms when the PS3 side runs on its own clock (the device then holds a
++     * 40 ms cushion, audio_pace_target_for); upstream #514's 60 ms with the device-paced loop
++     * (PS3_AUDIO_DEVICE_PACED=1). PS3_AUDIO_BUF_MS=10..500 overrides either. */
++    REFERENCE_TIME buf_duration = audio_device_paced() ? 600000 : 1000000; /* 100 ns units */
+     { const char* e = getenv("PS3_AUDIO_BUF_MS"); const int ms = e ? atoi(e) : 0;
+       if (ms >= 10 && ms <= 500) buf_duration = (REFERENCE_TIME)ms * 10000; }
+     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+@@ -363,6 +418,11 @@ static void audio_backend_shutdown(void)
+ 
+ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+ {
++    if (audio_fake_on()) {   /* KZ2 patch 6024 */
++        s_fake_fill += (int)num_samples;
++        if (s_fake_fill > s_fake_cap) { g_audio_dropped += (unsigned long long)(s_fake_fill - s_fake_cap); s_fake_fill = s_fake_cap; }
++        return;
++    }
+     if (!s_wasapi_render) return;
+ 
+     UINT32 padding = 0;
+@@ -390,9 +450,29 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+     }
+ }
+ 
++/* KZ2 patch 6024: the device buffer in frames (0 = no device) and a run of silence into it (the cushion). */
++static int audio_backend_capacity(void)
++{
++    if (audio_fake_on()) return s_fake_cap;
++    return s_wasapi_client ? (int)s_wasapi_buf_frames : 0;
++}
++static void audio_backend_silence(u32 frames)
++{
++    if (audio_fake_on()) { s_fake_fill += (int)frames; if (s_fake_fill > s_fake_cap) s_fake_fill = s_fake_cap; return; }
++    if (!s_wasapi_render || !frames) return;
++    {
++        UINT32 padding = 0; BYTE* buf = NULL;
++        s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
++        if (frames > s_wasapi_buf_frames - padding) frames = s_wasapi_buf_frames - padding;
++        if (frames && SUCCEEDED(s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, frames, &buf)) && buf)
++            s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, frames, AUDCLNT_BUFFERFLAGS_SILENT);
++    }
++}
++
+ /* Frames the device can take right now; -1 with no device open. */
+ static int audio_backend_room(void)
+ {
++    if (audio_fake_on()) { audio_fake_update(); return s_fake_cap - s_fake_fill; }   /* KZ2 patch 6024 */
+     if (!s_wasapi_client) return -1;
+     UINT32 padding = 0;
+     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+@@ -409,6 +489,7 @@ static int audio_backend_room(void)
+ /* Block until the device has consumed some of its buffer. */
+ static void audio_backend_wait(void)
+ {
++    if (audio_fake_on()) { Sleep(1); return; }   /* KZ2 patch 6024 */
+     if (s_wasapi_event) WaitForSingleObject(s_wasapi_event, 10);
+     else Sleep(1);
+ }
+@@ -553,6 +634,7 @@ static void audio_mix_one_block(void)
+                         p, (unsigned long long)port->read_index, block_idx, map);
+             } } }
+ 
++        int has_sound = 0;   /* KZ2 patch 6024: dropout count */
+         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+             float left, right;
+             if (nch >= 2) {
+@@ -579,9 +661,14 @@ static void audio_mix_one_block(void)
+                 if (left != 0.0f || right != 0.0f) kz3_nz = 1;
+                 if (left >= 0.999f || left <= -0.999f || right >= 0.999f || right <= -0.999f) kz3_pclip++;
+             }
++            if (left != 0.0f || right != 0.0f) has_sound = 1;
+             s_mix_buffer[s * 2 + 0] += left;
+             s_mix_buffer[s * 2 + 1] += right;
+         }
++        if (audio_hole_track(&s_port_holes[p], has_sound) && s_port_holes[p].holes <= 32)   /* KZ2 patch 6024 */
++            fprintf(stderr, "[audio-dropout] port %d block %llu (%.3f s after PortStart)\n", p,
++                    s_port_blocks[p] - 1, (double)(s_port_blocks[p] - 1) * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE);
++        s_port_blocks[p]++;
+         if (kz3_diag) {   /* KZ3 patch 1050: an empty block on a running port = a hole */
+             s_kz3_pclip_int += kz3_pclip;
+             if (kz3_nz) s_kz3_last_nz[p] = s_kz3_blocks;
+@@ -630,6 +717,20 @@ static void audio_mix_one_block(void)
+ 
+     mutex_unlock(&s_audio_mutex);
+ 
++    {   /* KZ2 patch 6024: dropouts per port, every 10 s when there were new ones */
++        static unsigned long long n10;
++        if (++n10 % (10u * CELL_AUDIO_SAMPLE_RATE / CELL_AUDIO_BLOCK_SAMPLES) == 0) {
++            char per[160]; int o = 0;
++            for (int p = 0; p < CELL_AUDIO_PORT_MAX && o < (int)sizeof per - 24; p++)
++                if (s_port_holes[p].holes != s_port_holes_logged[p]) {
++                    o += snprintf(per + o, sizeof per - (size_t)o, " p%d=%u (total %u)", p,
++                                  s_port_holes[p].holes - s_port_holes_logged[p], s_port_holes[p].holes);
++                    s_port_holes_logged[p] = s_port_holes[p].holes;
++                }
++            if (o) fprintf(stderr, "[cellAudio] dropouts in the last 10 s (single empty blocks inside sound):%s\n", per);
++        }
++    }
++
+     /* Clip to [-1.0, 1.0] */
+     for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+         if (s_mix_buffer[i] > 1.0f) { s_mix_buffer[i] = 1.0f; s_kz3_mclip_int += kz3_diag; }
+@@ -704,7 +805,34 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+      * With no device, pace on the performance counter instead. */
+     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+     unsigned long long blocks = 0;
++    /* KZ2 patch 6024: the PS3 side on its own steady clock (audio_pace.h); the old device-driven loop below only with
++     * PS3_AUDIO_DEVICE_PACED=1. */
++    const int device_paced = audio_device_paced();
++    const int cap = audio_backend_capacity();
++    AudioPace pace;
++    unsigned pace_drops = 0;
++    audio_pace_init(&pace, cap > 0 ? audio_pace_target_for(cap) : 0);
++    printf("[cellAudio] block clock: %s (device buffer %d frames, cushion %d)\n",
++           device_paced ? "the device's demand (PS3_AUDIO_DEVICE_PACED)" : "steady 5.333 ms", cap, pace.target);
+     while (s_mix_thread_running) {
++      if (!device_paced) {
++        LARGE_INTEGER now; double wait_us; int silence;
++        const int room = audio_backend_room();
++        QueryPerformanceCounter(&now);
++        if (!audio_pace_step(&pace, (double)now.QuadPart * 1e6 / (double)qf.QuadPart,
++                             room >= 0 && cap > 0 ? cap - room : -1, &wait_us, &silence)) {
++            Sleep(1);
++            continue;
++        }
++        if (pace.late_drops != pace_drops) {   /* KZ3 patch 1050's accounting of the >50 ms stalls */
++            pace_drops = pace.late_drops;
++            s_kz3_late_drops = pace.late_drops; s_kz3_late_ms = (long long)pace.late_ms;
++            if (s_kz3_adiag_on() && s_kz3_late_drops <= 24)
++                fprintf(stderr, "[audio-late] t=%.3f mix thread stalled > 50 ms, backlog dropped (total %.0f ms)\n",
++                        (double)blocks * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE, pace.late_ms);
++        }
++        if (silence > 0) audio_backend_silence((u32)silence);
++      } else {
+         const int room = audio_backend_room();
+         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+ #if AUDIO_BACKEND_WASAPI
+@@ -733,6 +861,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+                 q0.QuadPart = now.QuadPart -
+                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+         }
++      }
+         blocks++;
+         /* Mix and submit one block */
+         audio_mix_one_block();
+@@ -1061,6 +1190,9 @@ s32 cellAudioPortClose(u32 portNum)
+     s_ports[portNum].running = 0;
+ 
+     mutex_unlock(&s_audio_mutex);
++    /* KZ2 patch 6024: the port's dropout count, the measure of the movie-audio crackle */
++    printf("[cellAudio] port %u closed after %llu blocks: %u dropouts (single empty blocks inside sound)\n", portNum,
++           s_port_blocks[portNum], s_port_holes[portNum].holes);
+     return CELL_OK;
+ }
+ 
+@@ -1079,6 +1211,9 @@ s32 cellAudioPortStart(u32 portNum)
+ 
+     mutex_lock(&s_audio_mutex);
+     s_ports[portNum].running = 1;
++    memset(&s_port_holes[portNum], 0, sizeof s_port_holes[portNum]);   /* KZ2 patch 6024 */
++    s_port_holes_logged[portNum] = 0;
++    s_port_blocks[portNum] = 0;
+     mutex_unlock(&s_audio_mutex);
+ 
+     return CELL_OK;

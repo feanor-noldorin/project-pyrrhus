@@ -1,0 +1,236 @@
+KZ2 patch 7002: WWS job log, KZ2_JOB_LOG=N (seconds): per window, the job modules the WWS policy
+module entered ([kz2-job], by image id and the census name the port's spu_workloads.c provides) and the DMA PUTs per
+image ([kz2-put]: count, bytes, EA range, RSX local vs main memory). Diagnostic only, off by default.
+Also [kz2-jobdesc] dumps of the job descriptor state (workload, code-buffer GET EA, command list, PM
+variables) for the first entry of each known module and for unknown modules; entries below LS 0x4000 counted too.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/diag/kz2_joblog.c b/runtime/diag/kz2_joblog.c
+new file mode 100644
+--- /dev/null
++++ b/runtime/diag/kz2_joblog.c
+@@ -0,0 +1,187 @@
++/* KZ2 patch 7002: WWS job log. KZ2_JOB_LOG=N (seconds, 0/unset = off): every N s, one [kz2-job]
++ * line per job module that ran in the window (entries counted where the WWS policy module, image 2, branches to
++ * the module's entry), and one [kz2-put] line per image that issued DMA PUTs (count, bytes, lowest/highest EA, split
++ * into RSX local memory (EA >= 0xC0000000) and main memory). Names come from the port's registration TU
++ * (g_kz2_spu_image_name, set by the generated spu_workloads.c). Diagnostic only.
++ * Also [kz2-jobdesc] dumps for the first entry of every known module and for the first 8 entries (then powers
++ * of two) of an unknown one: workload id, code buffer, the image-2 GET that filled the code buffer page (its EA is
++ * the job binary's EA), the last 8 PM GETs below LS 0x4000 (command list, job headers), the command list at LS
++ * 0xC00, the policy module variables 0x1300-0x1460 and the command list the job header at LS 0x1420 points to (read from guest
++ * memory at dump time, so it may already hold the next job's commands). [kz2-nullget]: an image-2 GET from EA < 0x10000
++ * into LS >= 0x4000 (first 4, then powers of two) with the same dump. Entries are also counted when the job entry is below 0x4000 (link 0x32C0,
++ * the return address of KZ2 1.29's `bisl $r0,$r5` at PM LS 0x32BC). */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include "../spu/spu_context.h"
++
++#define KJ_MAX 512
++int g_kz2_joblog = -1;
++const char* (*g_kz2_spu_image_name)(int image_id) = 0;
++static volatile long s_job[KJ_MAX], s_job_tot[KJ_MAX];
++static volatile long s_put[KJ_MAX][2], s_put_bytes[KJ_MAX][2];
++static volatile uint32_t s_put_lo[KJ_MAX][2], s_put_hi[KJ_MAX][2];
++static volatile unsigned long long s_next_ms, s_t0;
++static volatile long s_printing;
++extern unsigned long long ps3_ms_now(void);
++
++/* Per SPU (spu_id & 7): the last image-2 GET into each 1 KB LS page from 0x4000, and a ring of the last 8 GETs
++ * below 0x4000. Racy by design (diagnostic). */
++static uint32_t s_pg_ea[8][256], s_pg_sz[8][256];
++static uint32_t s_lo_lsa[8][8], s_lo_ea[8][8], s_lo_sz[8][8], s_lo_n[8];
++static volatile long s_dumped[KJ_MAX], s_unk_n, s_nullget;
++
++static const char* kj_name(int i)
++{
++    const char* n = (g_kz2_spu_image_name && i > 0) ? g_kz2_spu_image_name(i) : 0;
++    return n ? n : "?";
++}
++
++static void kj_flush(unsigned long long now)
++{
++    if (__sync_val_compare_and_swap(&s_printing, 0, 1) != 0) return;
++    if (now < s_next_ms) { s_printing = 0; return; }
++    s_next_ms = now + (unsigned long long)g_kz2_joblog * 1000u;
++    double t = (now - s_t0) / 1000.0;
++    for (int i = 0; i < KJ_MAX; i++) {
++        long n = __atomic_exchange_n(&s_job[i], 0, __ATOMIC_RELAXED);
++        if (n) fprintf(stderr, "[kz2-job] t=%.1fs img %d %s entries=%ld total=%ld\n", t, i, kj_name(i), n, s_job_tot[i]);
++    }
++    for (int i = 0; i < KJ_MAX; i++)
++        for (int k = 0; k < 2; k++) {
++            long n = __atomic_exchange_n(&s_put[i][k], 0, __ATOMIC_RELAXED);
++            if (!n) continue;
++            long b = __atomic_exchange_n(&s_put_bytes[i][k], 0, __ATOMIC_RELAXED);
++            fprintf(stderr, "[kz2-put] t=%.1fs img %d %s %s puts=%ld bytes=%ld ea 0x%08X..0x%08X\n", t, i, kj_name(i),
++                    k ? "rsx-local" : "main", n, b, s_put_lo[i][k], s_put_hi[i][k]);
++            s_put_lo[i][k] = 0xFFFFFFFFu; s_put_hi[i][k] = 0;
++        }
++    fflush(stderr);
++    s_printing = 0;
++}
++
++static int kj_init(void)
++{
++    if (g_kz2_joblog >= 0) return g_kz2_joblog;
++    const char* e = getenv("KZ2_JOB_LOG");
++    int s = e ? atoi(e) : 0;
++    for (int i = 0; i < KJ_MAX; i++) for (int k = 0; k < 2; k++) s_put_lo[i][k] = 0xFFFFFFFFu;
++    s_t0 = ps3_ms_now(); s_next_ms = s_t0 + (unsigned long long)(s > 0 ? s : 0) * 1000u;
++    if (s > 0) fprintf(stderr, "[kz2-job] on: %d s windows (KZ2 patch 7002)\n", s);
++    g_kz2_joblog = s > 0 ? s : 0;
++    return g_kz2_joblog;
++}
++
++static uint32_t kj_be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++
++static void kj_hex(char* o, size_t cap, const uint8_t* ls, uint32_t lsa, uint32_t n)
++{
++    size_t k = 0;
++    for (uint32_t i = 0; i < n && k + 10 < cap; i += 4)
++        k += (size_t)snprintf(o + k, cap - k, "%s%08X", i && !(i & 15) ? " |" : "", kj_be32(&ls[(lsa + i) & 0x3FFFF]));
++    o[k] = 0;
++}
++
++static void kj_dump(spu_context* ctx, int img, uint32_t cb, uint32_t link, long n)
++{
++    const uint8_t* ls = ctx->ls;
++    unsigned s = ctx->spu_id & 7u, pg = (cb >> 10) & 0xFF;
++    char h[640];
++    double t = (ps3_ms_now() - s_t0) / 1000.0;
++    fprintf(stderr, "[kz2-jobdesc] t=%.1fs img %d %s n=%ld spu=%u wid=%u pc=0x%05X link=0x%05X cb=0x%05X "
++            "codeGET ea=0x%08X size=0x%X\n", t, img, kj_name(img), n, s, kj_be32(&ls[0x1DC]), ctx->pc & 0x3FFFF,
++            link, cb, s_pg_ea[s][pg], s_pg_sz[s][pg]);
++    kj_hex(h, sizeof h, ls, cb, 0x30);
++    fprintf(stderr, "[kz2-jobdesc]   code@cb %s\n", h);
++    size_t k = 0; h[0] = 0;
++    for (unsigned j = 0; j < 8 && k + 40 < sizeof h; j++) {
++        unsigned r = (s_lo_n[s] - 8 + j) & 7u;
++        if (!s_lo_sz[s][r]) continue;
++        k += (size_t)snprintf(h + k, sizeof h - k, " %05X<-%08X/%X", s_lo_lsa[s][r], s_lo_ea[s][r], s_lo_sz[s][r]);
++    }
++    fprintf(stderr, "[kz2-jobdesc]   gets(lsa<-ea/size, oldest first)%s\n", h);
++    kj_hex(h, sizeof h, ls, 0xC00, 0x80);
++    fprintf(stderr, "[kz2-jobdesc]   LS 0xC00 %s\n", h);
++    kj_hex(h, sizeof h, ls, 0x1300, 0x80);
++    fprintf(stderr, "[kz2-jobdesc]   LS 0x1300 %s\n", h);
++    kj_hex(h, sizeof h, ls, 0x1380, 0x80);
++    fprintf(stderr, "[kz2-jobdesc]   LS 0x1380 %s\n", h);
++    kj_hex(h, sizeof h, ls, 0x1400, 0x60);
++    fprintf(stderr, "[kz2-jobdesc]   LS 0x1400 %s\n", h);
++    {   /* job header at LS 0x1420 (KZ2 1.29 PM): word 0 = [u16 command-list bytes][u16 type], word 1 = command-list EA */
++        extern uint8_t* vm_base;
++        uint32_t w0 = kj_be32(&ls[0x1420]), ea = kj_be32(&ls[0x1424]), sz = w0 >> 16;
++        if (sz > 0x100) sz = 0x100;
++        if (vm_base && sz && ((ea >= 0x10000u && ea + sz < 0x0F000000u) || (ea >= 0x40000000u && ea + sz < 0x50000000u))) {
++            size_t k2 = 0; h[0] = 0;
++            for (uint32_t i = 0; i + 4 <= sz && k2 + 12 < sizeof h; i += 4)
++                k2 += (size_t)snprintf(h + k2, sizeof h - k2, "%s%08X", i && !(i & 7) ? " " : "", kj_be32(vm_base + ea + i));
++            fprintf(stderr, "[kz2-jobdesc]   cmdlist ea=0x%08X now: %s\n", ea, h);
++        } else fprintf(stderr, "[kz2-jobdesc]   cmdlist ea=0x%08X size=0x%X not dumped\n", ea, w0 >> 16);
++    }
++    fflush(stderr);
++}
++
++/* Called for every image-2 DMA GET while the log is on (spu_dma.h, after the copy). */
++void kz2_joblog_get(spu_context* spu, uint32_t lsa, uint32_t ea, uint32_t size)
++{
++    if (kj_init() <= 0) return;
++    unsigned s = spu->spu_id & 7u;
++    lsa &= 0x3FFFF;
++    if (lsa >= 0x4000 && ea < 0x10000u) {   /* a GET from the NULL page into the job area */
++        long u = __atomic_add_fetch(&s_nullget, 1, __ATOMIC_RELAXED);
++        if (u <= 4 || (u & (u - 1)) == 0) {
++            fprintf(stderr, "[kz2-nullget] n=%ld spu=%u pc=0x%05X lr=0x%05X lsa=0x%05X ea=0x%08X size=0x%X resident_ovl=%d\n", u, s,
++                    spu->pc & 0x3FFFF, spu->gpr[0]._u32[0] & 0x3FFFF, lsa, ea, size, spu->resident_ovl);
++            kj_dump(spu, -1, kj_be32(&spu->ls[0x1320]) & 0x3FFFF, spu->gpr[0]._u32[0] & 0x3FFFF, u);
++        }
++    }
++    if (lsa >= 0x4000) { s_pg_ea[s][lsa >> 10] = ea; s_pg_sz[s][lsa >> 10] = size; return; }
++    if (lsa == 0x80 || lsa == 0x100) return;   /* lock-line GETLLAR buffers / SPURS line copy */
++    unsigned r = s_lo_n[s]++ & 7u;
++    s_lo_lsa[s][r] = lsa; s_lo_ea[s][r] = ea; s_lo_sz[s][r] = size;
++}
++
++/* Called by spu_indirect_branch for image-2 branches: counts the policy module's call of a job module's entry (link inside the
++ * PM 0xA00-0x3FFF, target = code buffer LS[0x1320] + header +0x10; below LS 0x4000 only with the job-call link). */
++void kz2_joblog_entry(spu_context* ctx)
++{
++    if (kj_init() <= 0) return;
++    uint32_t link = ctx->gpr[0]._u32[0] & 0x3FFFF;
++    if (link < 0xA00 || link >= 0x4000) return;
++    if ((ctx->pc & 0x3FFFF) < 0x4000 && link != 0x32C0) return;
++    const uint8_t* ls = ctx->ls;
++    uint32_t cb = kj_be32(&ls[0x1320]) & 0x3FFFF;
++    if (cb + 0x30 > 0x40000) return;
++    uint32_t eo = kj_be32(&ls[cb + 0x10]);
++    if ((ctx->pc & 0x3FFFF) != ((cb + eo) & 0x3FFFF)) return;
++    extern int spu_overlay_match_sig(const uint8_t hdr[16]);
++    int img = spu_overlay_match_sig(&ls[cb]);
++    if (img <= 0 || img >= KJ_MAX) img = 0;   /* 0 = unknown module */
++    __atomic_add_fetch(&s_job[img], 1, __ATOMIC_RELAXED);
++    long n = __atomic_add_fetch(&s_job_tot[img], 1, __ATOMIC_RELAXED);
++    if (img == 0) {
++        long u = __atomic_add_fetch(&s_unk_n, 1, __ATOMIC_RELAXED);
++        if (u <= 8 || (u & (u - 1)) == 0) kj_dump(ctx, img, cb, link, n);
++    } else if (__sync_val_compare_and_swap(&s_dumped[img], 0, 1) == 0) {
++        kj_dump(ctx, img, cb, link, n);
++    }
++    unsigned long long now = ps3_ms_now();
++    if (now >= s_next_ms) kj_flush(now);
++}
++
++/* Called for every DMA PUT while the log is on (spu_dma.h). Image: the resident job module inside the policy module. */
++void kz2_joblog_put(spu_context* spu, uint32_t ea, uint32_t size)
++{
++    if (kj_init() <= 0) return;
++    int i = spu->image_id;
++    if (i == 2 && spu->resident_ovl > 0 && (spu->pc & 0x3FFFF) >= 0x4000) i = spu->resident_ovl;
++    if (i <= 0 || i >= KJ_MAX) return;
++    int k = ea >= 0xC0000000u;
++    __atomic_add_fetch(&s_put[i][k], 1, __ATOMIC_RELAXED);
++    __atomic_add_fetch(&s_put_bytes[i][k], (long)size, __ATOMIC_RELAXED);
++    if (ea < s_put_lo[i][k]) s_put_lo[i][k] = ea;
++    if (ea + size > s_put_hi[i][k]) s_put_hi[i][k] = ea + size;
++    unsigned long long now = ps3_ms_now();
++    if (now >= s_next_ms) kj_flush(now);
++}
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -3059,6 +3059,11 @@ SPU_ABI void spu_indirect_branch(spu_context* ctx)
+      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
+      * masking is a no-op for already-valid targets. */
+     ctx->pc &= SPU_LS_MASK;
++    /* KZ2 patch 7002: the WWS policy module's call of a job module (image 2, target in the code buffer, link in
++     * the policy module) is counted by the job log (also below LS 0x4000 with the job-call link 0x32C0); g_kz2_joblog
++     * < 0 until the first call reads KZ2_JOB_LOG. */
++    { extern int g_kz2_joblog; extern void kz2_joblog_entry(spu_context*);
++      if (__builtin_expect(g_kz2_joblog != 0, 0) && ctx->image_id == 2) kz2_joblog_entry(ctx); }
+     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
+      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
+      * enforce the preserve-all-registers hardware contract here -- the first
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -651,6 +651,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+           } }
+         /* GET: main memory -> local store */
+         memcpy(ls_ptr, ea_ptr, size);
++        { extern int g_kz2_joblog; extern void kz2_joblog_get(spu_context*, uint32_t, uint32_t, uint32_t);   /* KZ2 patch 7002 */
++          if (g_kz2_joblog && spu->image_id == 2) kz2_joblog_get(spu, lsa, (uint32_t)ea, size); }
+         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+          * dword = the completion-word EA arriving in a job buffer. */
+         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+@@ -741,6 +743,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+              * hashing, libs/video); null until cellGcmInit installs it (spu_set_guest_write_hook). */
+             { extern void (*g_spu_guest_write_hook)(uint32_t ea, uint32_t size);   /* spu_coherency.c */
+               if (g_spu_guest_write_hook) g_spu_guest_write_hook((uint32_t)ea, size); }
++            { extern int g_kz2_joblog; extern void kz2_joblog_put(spu_context*, uint32_t, uint32_t);   /* KZ2 patch 7002 */
++              if (g_kz2_joblog) kz2_joblog_put(spu, (uint32_t)ea, size); }
+             uint32_t a0 = (uint32_t)ea & ~127u;
+             uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+             int span_reserved = 0;

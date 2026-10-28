@@ -1,0 +1,33 @@
+name: Performance report
+description: Low or uneven frame rate, stutter, long loads
+labels: [performance, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The first level ran at 23.3 frames per second in one scripted run (the PS3 runs it at 30); that is known, see [docs/KNOWN_ISSUES.md](https://github.com/undecuple/project-pyrrhus/blob/main/docs/KNOWN_ISSUES.md). Reports are most useful when they give a number on your hardware, a stall, a long load or memory use. No game files, saves or keys.
+  - type: textarea
+    id: what
+    attributes:
+      label: What is slow, and when?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Port build
+      description: "Release number, or the commit of the build you ran."
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: "OS (Windows, or Linux with the Proton version), CPU, RAM, GPU and driver version."
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: "Attach the newest log file next to the exe, with your user name and folder paths removed."

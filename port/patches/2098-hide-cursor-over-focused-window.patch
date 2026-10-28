@@ -1,0 +1,155 @@
+KZ2 patch 2098: hide the mouse pointer over the focused game window (WM_SETCURSOR), show it again on focus loss.
+
+A tester's hand play (2026-10-22) and every frame of its screen recordings showed the Windows arrow over the game: nothing
+hid it (the window class sets IDC_ARROW). WM_SETCURSOR with an HTCLIENT hit on the focused game window now sets no
+cursor, in windowed, borderless and fullscreen alike; over the title bar or borders and while another window has the
+focus, DefWindowProc shows the arrow. WM_ACTIVATE applies the new state at once (WM_SETCURSOR only comes with mouse
+movement); WM_KILLFOCUS puts the arrow back. RSX_CURSOR=1 keeps the arrow. The decision is a pure function in
+rsx_cursor.h (host test tools/runtime/test_cursor.sh). No ClipCursor and no raw input: mouse look is not wired
+(keyboard and mouse is backlog). KZ2_TEST_DISPLAY gets two steps for tests: `mouse` (pointer to the client
+centre) and `cursor` (logs GetCursor(): HIDDEN or SHOWN, focus, pointer over the client area). Under Xwayland (a Wine session on a Wayland desktop) whether a hidden Wine cursor reaches the
+Wayland pointer is not verified (an earlier change checked it under Xvfb only).
+--- /dev/null
++++ b/libs/video/rsx_cursor.h
+@@ -0,0 +1,15 @@
++/* KZ2 patch 2098: the mouse cursor over the game window (pure decision, host test tools/runtime/test_cursor.c).
++ * The pointer is hidden while it is over the client area of the focused game window, in every display mode
++ * (windowed, borderless, fullscreen); over the title bar or the borders, or when another window has the focus, the
++ * normal arrow shows. RSX_CURSOR=1 keeps the arrow everywhere. No ClipCursor or raw input: mouse look is not wired. */
++#ifndef RSX_CURSOR_H
++#define RSX_CURSOR_H
++
++/* hit_client: the WM_SETCURSOR hit test is HTCLIENT; focused: the game window is the foreground window;
++ * keep_arrow: RSX_CURSOR=1. -> 1 = hide the pointer (SetCursor(NULL)), 0 = leave it to DefWindowProc. */
++static inline int rsx_cursor_hidden(int hit_client, int focused, int keep_arrow)
++{
++    return hit_client && focused && !keep_arrow;
++}
++
++#endif
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_cursor.h b/libs/video/rsx_cursor.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_cursor.h
+@@ -0,0 +1,15 @@
++/* KZ2 patch 2098: the mouse cursor over the game window (pure decision, host test tools/runtime/test_cursor.c).
++ * The pointer is hidden while it is over the client area of the focused game window, in every display mode
++ * (windowed, borderless, fullscreen); over the title bar or the borders, or when another window has the focus, the
++ * normal arrow shows. RSX_CURSOR=1 keeps the arrow everywhere. No ClipCursor or raw input: mouse look is not wired. */
++#ifndef RSX_CURSOR_H
++#define RSX_CURSOR_H
++
++/* hit_client: the WM_SETCURSOR hit test is HTCLIENT; focused: the game window is the foreground window;
++ * keep_arrow: RSX_CURSOR=1. -> 1 = hide the pointer (SetCursor(NULL)), 0 = leave it to DefWindowProc. */
++static inline int rsx_cursor_hidden(int hit_client, int focused, int keep_arrow)
++{
++    return hit_client && focused && !keep_arrow;
++}
++
++#endif
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "rsx_null_backend.h"
++#include "rsx_cursor.h"   /* patch 2098 */
+ #include <stdio.h>
+ #include <string.h>
+ #include "../../runtime/ps3_log.h"
+@@ -225,6 +226,7 @@ static int rsx_dm_wndmsg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res
+ /* KZ2_TEST_DISPLAY="S:action,S:action,...": at S seconds after the window opened, `altenter` (a WM_SYSKEYDOWN
+  * VK_RETURN with the Alt bit, posted, so the window procedure's own path runs), `windowed|borderless|fullscreen` (as
+  * the Options row), `fit|stretch`, `bilinear|nearest`, `resize=WxH` (client size, windowed), `log`. */
++static int rsx_cursor_test_step(const char* act);   /* patch 2098: `mouse` and `cursor` test steps */
+ static void rsx_dm_script_step(void)
+ {
+     double t;
+@@ -253,6 +255,7 @@ static void rsx_dm_script_step(void)
+                 rsx_dm_log_client("test resize");
+             }
+         } else if (!strcmp(act, "log")) rsx_dm_log_client("test log");
++        else if (rsx_cursor_test_step(act)) { }
+         else if (rsx_dm_parse(act) >= 0) rsx_display_set_mode(rsx_dm_parse(act));
+         else if (rsx_dm_parse_scaling(act) >= 0) rsx_display_set_scaling(rsx_dm_parse_scaling(act), -1);
+         else if (rsx_dm_parse_filter(act) >= 0) rsx_display_set_scaling(-1, rsx_dm_parse_filter(act));
+@@ -293,9 +296,75 @@ static void rsx_dm_init_window(void)
+     fflush(stdout);
+ }
+ 
++/* KZ2 patch 2098: hide the mouse pointer over the focused game window's client area (rsx_cursor.h). */
++static int rsx_cursor_keep_arrow(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("RSX_CURSOR"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++static int rsx_cursor_over_client(HWND hwnd)
++{
++    POINT p;
++    RECT rc;
++    if (!GetCursorPos(&p) || !ScreenToClient(hwnd, &p) || !GetClientRect(hwnd, &rc)) return 0;
++    return PtInRect(&rc, p) ? 1 : 0;
++}
++static int rsx_cursor_msg(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, LRESULT* res)
++{
++    static int s_logged;
++    switch (msg) {
++    case WM_SETCURSOR:
++        if ((HWND)wp == hwnd &&
++            rsx_cursor_hidden(LOWORD(lp) == HTCLIENT, GetForegroundWindow() == hwnd, rsx_cursor_keep_arrow())) {
++            SetCursor(NULL);
++            if (!s_logged) { s_logged = 1; printf("[cursor] pointer hidden over the game window (RSX_CURSOR=1 keeps it)\n"); }
++            *res = TRUE;
++            return 1;
++        }
++        return 0;
++    case WM_ACTIVATE:   /* no WM_SETCURSOR until the mouse moves: apply the new state now */
++        if (LOWORD(wp) != WA_INACTIVE) {
++            if (rsx_cursor_hidden(rsx_cursor_over_client(hwnd), 1, rsx_cursor_keep_arrow())) SetCursor(NULL);
++        } else {
++            SetCursor(LoadCursor(NULL, IDC_ARROW));
++        }
++        return 0;   /* DefWindowProc still runs (focus handling) */
++    case WM_KILLFOCUS:
++        SetCursor(LoadCursor(NULL, IDC_ARROW));
++        return 0;
++    }
++    return 0;
++}
++
++/* KZ2_TEST_DISPLAY steps (patch 2098): `mouse` puts the pointer on the client centre (Wine then sends
++ * WM_SETCURSOR as for a real move), `cursor` logs what this thread's cursor is now (GetCursor: NULL = hidden). */
++static int rsx_cursor_test_step(const char* act)
++{
++    HWND h = s_state.hwnd;
++    if (!strcmp(act, "mouse")) {
++        RECT rc;
++        POINT c;
++        GetClientRect(h, &rc);
++        c.x = (rc.left + rc.right) / 2; c.y = (rc.top + rc.bottom) / 2;
++        ClientToScreen(h, &c);
++        SetCursorPos(c.x, c.y);
++        return 1;
++    }
++    if (!strcmp(act, "cursor")) {
++        HCURSOR cur = GetCursor();
++        printf("[cursor] test: cursor %s (handle %p), game window %s, pointer over the client area %s\n",
++               cur ? "SHOWN" : "HIDDEN", (void*)cur, GetForegroundWindow() == h ? "focused" : "not focused",
++               rsx_cursor_over_client(h) ? "yes" : "no");
++        return 1;
++    }
++    return 0;
++}
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     LRESULT sized;
++    if (rsx_cursor_msg(hwnd, msg, wp, lp, &sized)) return sized;   /* patch 2098 */
+     if (rsx_dm_wndmsg(hwnd, msg, wp, lp, &sized)) return sized;   /* patch 2095 */
+     /* patch 2062's aspect-keeping drag and maximize: windowed only (patch 2095) */
+     if (s_dm_applied == RSX_DM_WINDOWED && rsx_win_size_msg(hwnd, msg, wp, lp, &sized)) return sized;

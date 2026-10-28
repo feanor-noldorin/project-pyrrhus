@@ -1,0 +1,65 @@
+gcm/live-draw: a draw that samples its own render target reads it even when other surfaces share the address
+(LD_NO_SELF_EXACT=1 old).
+
+Symptom (Killzone 2, in-level pause menu): the whole screen goes white with a dark vignette within a few frames of
+pressing Start; the HUD crosshair stays; the game keeps running.
+
+Cause: the colour grade (Killzone 2 1.29, fragment program at loc 1 0x002D5980) draws into the 2560x720 lit-scene
+target at 0x1E30000 and samples that same target (unit 0, A8R8G8B8 2560x720) plus the depth and a 64x64 depth-by-value
+LUT in main memory. The texture-to-surface lookup skips the bound target and takes the best other surface at the
+address; only when there is none does it fall back to the target's feedback copy. While paused, the game also renders
+into 0x1E30000 as a 320x180 surface (bloom chain) and a 1280x720 one (the final composite), so the grade found one of
+those, sampled last frame's picture, and graded it again each frame. The picture converges to the LUT's brightest near entry
+(248, 255, 233), the vignette comes after it. Seen in kz2-r41-pause3 (draw dump frame 4459): the grade's input at
+0x1E30000 2560x720 has mean RGB (29, 38, 46) before the draw, the composite input after it is flat (248, 255, 233).
+
+Fix: a texture whose address and size are the bound target's is a self-read: it takes the feedback copy whatever
+else shares the address (the size rule the lookup already applies, now including the target). Other aliases keep
+the old rule. "[self-read]" logs the first redirections (and a count every 65536). In kz2-r41-pause4 the first one
+is at frame 4429 (flip 4430 at 174.6 s, Start pressed at pad time 175 s), none before the pause: the alias exists
+only while paused. Written for this port.
+Host test: none (the rule sits in the walker's bind loop; verified in Proton, see the runtime notes).
+Upstream candidate (any title whose pass reads its target while another surface sits at the same address).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -13663,7 +13663,35 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                   ncall++;
+               }
+           } }
+-        if (!zeta_pref) { u32 best_gen = 0;
++        /* KZ2 patch 2097: a texture that IS the bound render target (same address and the target's own size) reads
++         * the target, through the feedback copy below, even when other surfaces share the address. The loop
++         * skips the target, so with another surface at the address (Killzone 2's pause screen: its final
++         * composite makes a 1280x720 surface at 0x1E30000, the 2560x720 lit-scene target of the colour grade
++         * that reads itself) the grade sampled that other surface, last frame's graded picture, and graded it
++         * again every frame until the screen was the LUT's white end. LD_NO_SELF_EXACT=1 = old behaviour. */
++        int self_exact = 0;
++        { static int off = -1;
++          if (off < 0) off = getenv("LD_NO_SELF_EXACT") ? 1 : 0;
++          const surface_t* tg = target < g.n_surfaces ? &g.surfaces[target] : NULL;
++          self_exact = !off && !zeta_pref && tg && tg->location == t.location && tg->offset == t.offset &&
++                       tg->w == t.width && tg->h == t.height;
++          if (self_exact) {
++              static u32 nlog; static u64 nredir;
++              int other = -1;
++              for (u32 i = 0; i < g.n_surfaces; i++)
++                  if (i != target && g.surfaces[i].location == t.location && g.surfaces[i].offset == t.offset) other = (int)i;
++              if (other >= 0) {
++                  nredir++;
++                  if (nlog < 16 || (nredir & 0xFFFFu) == 0) {
++                      nlog++;
++                      fprintf(stderr, "[self-read] f=%u unit %u tex %u:0x%08X %ux%u fmt=0x%02X is target %u: feedback "
++                              "copy, not surface[%d] %ux%u (%llu redirected)\n", g_ld_frames, u, t.location, t.offset,
++                              t.width, t.height, t.format, target, other, g.surfaces[other].w, g.surfaces[other].h,
++                              (unsigned long long)nredir);
++                  }
++              }
++          } }
++        if (!zeta_pref && !self_exact) { u32 best_gen = 0;
+           for (u32 i = 0; i < g.n_surfaces; i++) {
+               const surface_t* sf_i = &g.surfaces[i];
+               if (sf_i->location != t.location || sf_i->offset != t.offset ||

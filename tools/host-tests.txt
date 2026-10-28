@@ -1,0 +1,24 @@
+# Host tests: no game data, no network.
+nix develop .#re --command python3 tools/test_core158.py
+nix develop .#re --command python3 tools/assets/test_profile_edit.py
+nix develop .#re --command python3 tools/release/test_installer_art.py
+nix develop .#re --command python3 tools/release/test_firstrun_check.py
+nix develop .#re --command python3 tools/release/test_firstrun.py
+nix develop .#re --command python3 tools/release/test_lift_fixups.py
+nix develop .#re --command python3 tools/release/test_launch.py
+nix develop .#re --command python3 tools/release/test_assemble_payload.py
+nix develop .#re --command python3 tools/release/test_pack_zip.py
+nix develop .#re --command python3 tools/release/test_version_check.py
+nix develop .#re --command python3 tools/release/test_fetch_toolchain.py
+nix develop .#re --command python3 tools/release/test_website.py
+nix develop .#re --command python3 tools/release/test_stage_sdl3.py
+nix develop .#re --command tools/sandbox.sh -- python3 tools/spu/test_ib_guess.py
+nix develop .#re --command python3 tools/release/test_spu_step.py
+nix develop .#re --command python3 tools/release/test_rpcs3_import.py
+nix develop .#re --command tools/sandbox.sh -- python3 tools/spu/test_getenv_once.py
+nix develop .#re --command python3 tools/release/test_vm_test.py
+nix develop .#re --command python3 tools/release/test_release_version.py
+nix develop .#re --command python3 tools/release/test_iss_ispp.py
+nix develop .#re --command python3 tools/release/test_workflows.py
+nix develop .#re --command python3 tools/release/test_version_agree.py
+nix develop .#re --command python3 tools/release/test_install_rules.py

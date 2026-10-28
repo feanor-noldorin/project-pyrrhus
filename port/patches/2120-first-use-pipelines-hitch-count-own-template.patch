@@ -1,0 +1,149 @@
+KZ2 patch 2120: count first-use hitches and keep every session's pipeline template.
+
+Runtime an earlier change (first-use shader stutter). Hand play stalls 0.2-0.9 s in the first minute of each area: every new
+pipeline is built while the walker waits (patch 2058 awaits each asynchronous build, max-in-flight 1, ~70 ms per
+pipeline; 170 builds in the first minute of Corinth River in the maintainer's 2026-10-22 log). Patch 2071's template prewarm
+removes them on a first play, but KZ2 shipped no template and had no way to grow one from real sessions.
+
+1. rsx_pace.h (patch 2072): the [pace] line ends with slow100=<intervals of 100 ms or more in the window>, and every
+   such interval prints `[hitch] t=<ms since first present> dt=<ms>`, so a run can be cut at the level start.
+2. rsx_live_draw.c (patch 2071's ld_pt_start): with LD_PSO_TEMPLATE_OUT unset, the export is on and writes
+   <shader cache dir>\pso-template-own.bin, read back first so it grows across sessions (as pso_keys.bin does).
+   LD_PSO_TEMPLATE_OUT=<file> keeps KZ3's behaviour (this session only); LD_PSO_TEMPLATE_OUT=0 turns it off.
+   tools/runtime/pso_template.py merges the files of several sessions into the shipped pso-template.bin.
+3. rsx_pso_template.h + rsx_live_draw.c: the record carries two inputs of the pipeline key it lacked, the WPOS flip
+   height (KZ2 patch 2090) and the VP branch bits (upstream #485); without them every pipeline that used either failed
+   the prewarm's key recompute (kz2-r47-b1: 247 "key mismatch" against 168 built from a 607-pipeline template). The
+   record is 564 bytes now; a template of the old size is refused by its header.
+
+diff --git a/libs/video/rsx_pace.h b/libs/video/rsx_pace.h
+--- a/libs/video/rsx_pace.h
++++ b/libs/video/rsx_pace.h
+@@ -7,7 +7,8 @@
+  * wall time counted from the first present: the first window may be partial (it starts at the second present),
+  * every later one ends at the first present on or after k * 10000 ms and is reported then.
+  *
+- *   [pace] t=<ms since first present> n=<frames> p50=<ms> p99=<ms> max=<ms> sd=<ms> low1=<fps>
++ *   [pace] t=<ms since first present> n=<frames> p50=<ms> p99=<ms> max=<ms> sd=<ms> low1=<fps> slow100=<frames>
++ *   [hitch] t=<ms since first present> dt=<ms>          (KZ2 patch 2120: one line per interval of 100 ms or more)
+  *
+  * p50/p99: the bucket midpoint of the smallest bucket whose cumulative count reaches ceil(q * n) (+-0.125 ms).
+  * max: exact. sd: population standard deviation of the intervals (sum, sum of squares). low1 = 1000 / mean of
+@@ -20,6 +21,7 @@
+ #define RSX_PACE_BUCKET_MS   0.25
+ #define RSX_PACE_BUCKETS     1000              /* 0 .. 250 ms; index RSX_PACE_BUCKETS = overflow */
+ #define RSX_PACE_WINDOW_MS   10000.0
++#define RSX_PACE_SLOW_MS     100.0             /* KZ2 patch 2120: a visible hitch (3 frames at 30 fps) */
+ 
+ typedef struct rsx_pace {
+     unsigned hist[RSX_PACE_BUCKETS + 1];
+@@ -27,12 +29,13 @@
+     double sum, sumsq, max, ovf_sum;
+     double prev_ms, start_ms, next_report_ms;
+     int started;
++    unsigned slow;   /* KZ2 patch 2120: intervals of RSX_PACE_SLOW_MS or more in this window */
+ } rsx_pace;
+ 
+ static inline void rsx_pace_reset_window(rsx_pace* p)
+ {
+     for (int i = 0; i <= RSX_PACE_BUCKETS; i++) p->hist[i] = 0;
+-    p->n = 0; p->sum = p->sumsq = p->max = p->ovf_sum = 0.0;
++    p->n = 0; p->slow = 0; p->sum = p->sumsq = p->max = p->ovf_sum = 0.0;
+ }
+ 
+ static inline double rsx_pace_quantile(const rsx_pace* p, double q)
+@@ -71,8 +74,8 @@
+     const double mean = p->sum / (double)p->n;
+     double var = p->sumsq / (double)p->n - mean * mean;
+     if (var < 0.0) var = 0.0;
+-    return snprintf(buf, cap, "[pace] t=%.0f n=%u p50=%.2f p99=%.2f max=%.2f sd=%.2f low1=%.2f", t_ms, p->n,
+-                    rsx_pace_quantile(p, 0.50), rsx_pace_quantile(p, 0.99), p->max, sqrt(var), rsx_pace_low1(p));
++    return snprintf(buf, cap, "[pace] t=%.0f n=%u p50=%.2f p99=%.2f max=%.2f sd=%.2f low1=%.2f slow100=%u", t_ms, p->n,
++                    rsx_pace_quantile(p, 0.50), rsx_pace_quantile(p, 0.99), p->max, sqrt(var), rsx_pace_low1(p), p->slow);
+ }
+ 
+ /* One call per successful Present. now_ms: monotonic milliseconds. Prints (stderr) at a window boundary. */
+@@ -91,6 +94,10 @@
+     p->hist[b]++; p->n++;
+     p->sum += dt; p->sumsq += dt * dt;
+     if (dt > p->max) p->max = dt;
++    if (dt >= RSX_PACE_SLOW_MS) {   /* KZ2 patch 2120: each hitch with its time, so a run can be cut at any point */
++        p->slow++;
++        fprintf(stderr, "[hitch] t=%.0f dt=%.0f%c", now_ms - p->start_ms, dt, 10);
++    }
+     if (now_ms >= p->next_report_ms) {
+         char line[200];
+         rsx_pace_format(p, now_ms - p->start_ms, line, sizeof line);
+diff --git a/libs/video/rsx_pso_template.h b/libs/video/rsx_pso_template.h
+--- a/libs/video/rsx_pso_template.h
++++ b/libs/video/rsx_pso_template.h
+@@ -60,6 +60,12 @@
+     uint32_t unnorm_dim[16][2];
+     uint8_t  attrs[16];
+     uint32_t rs[RSX_PT_RS_WORDS];
++    /* KZ2 patch 2120: two more inputs of the walker's pipeline key that the record lacked, so every pipeline that used
++     * them failed the prewarm's key recompute ("key mismatch": 247 of 607 in kz2-r47-b1): the WPOS flip height of
++     * KZ2 patch 2090 (0 = none) and upstream #485's VP branch bits (meaningful when the VP uses BRB/CLB). The record
++     * grows to 564 bytes, so a template of the old size is refused (rec_size), never misread. */
++    uint32_t wpos_flip;
++    uint32_t vp_branch_bits;
+ } rsx_pt_rec;
+ #pragma pack(pop)
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8738,6 +8738,8 @@
+     }
+     r->rs_words = (u32)(sizeof(render_state_t) / 4u);
+     memcpy(r->rs, xi->rs, sizeof(render_state_t));
++    r->wpos_flip = xi->wpos_flip;                                        /* KZ2 patch 2120 */
++    r->vp_branch_bits = xi->vp_branch_bits_used ? xi->vp_branch_bits : 0u;
+     memcpy(r->shadow_zfunc, xi->shadow_zfunc, 16);
+     memcpy(r->argb_remap, xi->argb_remap, sizeof r->argb_remap);
+     memcpy(r->unnorm_dim, xi->unnorm_dim, sizeof r->unnorm_dim);
+@@ -8841,9 +8843,11 @@
+     xi.unnorm_mask = r->unnorm_mask; xi.unnorm_dim = unn; xi.gamma_mask = r->gamma_mask;
+     xi.argb_mask = r->argb_mask; xi.argb_remap = remap; xi.srgb_out = r->srgb_out;
+     xi.fp_const_count = (u32)fc; xi.fp_alpha_ref = 0;
+-    /* Upstream #485: a template record has no branch bits; a VP that uses them is keyed with 0, so a
+-     * record made under other bits is refused below (key mismatch) and built by the walker instead. */
+-    xi.vp_branch_bits_used = rsx_vp_uses_branch_bits(vp->bytes, r->vp_instrs * 16); xi.vp_branch_bits = 0;
++    /* Upstream #485: the walker keys a VP that uses BRB/CLB by its branch bits; KZ2 patch 2120's records carry them
++     * (before, they were keyed with 0 here and every such record failed the key check below). */
++    xi.vp_branch_bits_used = rsx_vp_uses_branch_bits(vp->bytes, r->vp_instrs * 16);
++    xi.vp_branch_bits = xi.vp_branch_bits_used ? r->vp_branch_bits : 0u;   /* KZ2 patch 2120: the record carries them */
++    xi.wpos_flip = ld_wpos_origin_on() ? r->wpos_flip : 0u;                 /* KZ2 patch 2120 (patch 2090's flip) */
+     /* KZ2 patch 2088: the walker keys pipelines of antialiased targets by their sample grid; the record carries it. */
+     xi.wpos_aa = ld_wpos_aa_on() ? (r->flags >> RSX_PT_WPOS_AA_SHIFT) & 0xFFFFu : 0u;
+     xi.deriv_flip = (r->flags & RSX_PT_FLAG_DDY_FLIP) && ld_ddy_origin_on() ? 1u : 0u;   /* KZ2 patch 2096 */
+@@ -9031,9 +9035,27 @@
+     g_pt.started = 1;
+     { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_pt.qpf = f.QuadPart; g_pt.t0 = ld_pt_qpc(); }
+     const char* o = getenv("LD_PSO_TEMPLATE_OUT");
+-    if (o && *o && snprintf(g_pt.out_path, sizeof g_pt.out_path, "%s", o) < (int)sizeof g_pt.out_path) {
++    /* KZ2 patch 2120: with LD_PSO_TEMPLATE_OUT unset, every session adds its pipelines to <shader cache dir>\
++     * pso-template-own.bin (records of earlier sessions are read back first, so the file grows across sessions like
++     * pso_keys.bin). Hashes and numeric state only (rsx_pso_template.h); merged from players' and test sessions
++     * (tools/runtime/pso_template.py) it becomes the shipped template that prewarms a first play.
++     * LD_PSO_TEMPLATE_OUT=0 turns the export off. */
++    int own = 0;
++    if ((!o || !*o) && g_ld_shader_disk_dir[0] &&
++        snprintf(g_pt.out_path, sizeof g_pt.out_path, "%s\\pso-template-own.bin", g_ld_shader_disk_dir) < (int)sizeof g_pt.out_path)
++        own = 1;
++    else if (o && *o && !(o[0] == '0' && !o[1]) && snprintf(g_pt.out_path, sizeof g_pt.out_path, "%s", o) < (int)sizeof g_pt.out_path)
++        own = 2;
++    if (own) {
+         g_pt.out_on = 1; g_pt.last_write = ld_pt_qpc();
+-        fprintf(stderr, "[pso-template] export on: '%s'\n", g_pt.out_path);
++        if (own == 1) {
++            rsx_pt_rec* prev = NULL; u32 np = 0, nd = 0;
++            if (rsx_pt_read(g_pt.out_path, &prev, &np, &nd, NULL) == 0 && np) {
++                g_pt.out = prev; g_pt.n_out = g_pt.cap_out = np;
++                for (u32 j = 0; j < np; j++) rsx_pt_set_add(&g_pt.seen, prev[j].key);
++            } else free(prev);
++        }
++        fprintf(stderr, "[pso-template] export on: '%s' (%u pipelines from earlier sessions)\n", g_pt.out_path, g_pt.n_out);
+     }
+     const char* i = getenv("LD_PSO_TEMPLATE");
+     char def[1024];

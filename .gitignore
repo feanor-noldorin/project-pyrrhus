@@ -1,0 +1,41 @@
+# Only ported work is committed: our code, tools, docs, recovered schemas/numbers.
+# The original game (disc dump, decrypted binaries, extracted assets) never enters git.
+/Game/
+/Game
+/work/
+*.psarc
+*.BIK
+*.bik
+*.elf
+*.self
+*.sprx
+*.prx
+*.core
+*.corestream
+EBOOT.BIN
+*.PUP
+
+*.gpr
+*.rep/
+
+# Nix / build outputs
+result
+result-*
+/build/
+__pycache__/
+*.pyc
+.direnv/
+
+
+# Sony packages, licenses and save data (anywhere in the tree)
+*.pkg
+*.PKG
+*.rap
+*.RAP
+*.edat
+*.EDAT
+*.sdat
+*.SDAT
+PARAM.PFD
+PARAM.SFO
+savefile-*.zip

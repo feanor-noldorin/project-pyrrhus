@@ -1,0 +1,150 @@
+gcm/live-draw: diagnostics for surfaces of several sizes at one address and for antialiased targets (all off by default).
+
+Written for Killzone 2's white half-screen (the causes were patches 2088 and 2089, not the two
+colour surfaces at 0x7B0000 this was written to examine).
+- LD_ALIAS_SIZE_LOG=N: texture binds and presents that resolve to a live surface of another size than declared, or
+  whose texture or draw-target address holds two or more live surfaces (declared size, format and pitch, the draw's
+  target, the surface picked and every candidate with its create/draw generations), and draw targets that are
+  antialiased, wider than the window, or share their address (clip, aa grid, pitch, SURFACE_FORMAT, viewport,
+  scissor and clip registers); one line per new combination, at most N lines each.
+- LD_DRAW_INPUTS_VPW=<w>: with LD_DRAW_INPUTS (patch 2043) also select the draws whose viewport width is w (a pass
+  whose index in the frame varies).
+- The "[surfsz] new live surface" line names the frame.
+
+Verification: Killzone 2 under Proton.
+v0.17.0 rebase (ps3recomp a6d76c8): context only (#399 PS3_LOG_FIRST log caps and other upstream context); diff regenerated.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 95fee00..93844d4 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5509,6 +5509,59 @@ static DXGI_FORMAT ld_color_dxgi(u32 color_format)
+                                                           : DXGI_FORMAT_R8G8B8A8_UNORM;
+ }
+ 
++/* KZ2 patch 2087 diagnostic (LD_ALIAS_SIZE_LOG=N, off by default): surfaces are keyed on (address, size, format)
++ * (surface_get), so one address can hold several live surfaces of different sizes. Log the texture binds and the
++ * presents that resolve to a live surface of another size than declared, or of an address that holds two or more
++ * live surfaces: declared size and format, the draw's target, the surface picked and every candidate with its
++ * generations (create / last draw). One line per new (what, address, declared size, target, pick), at most N lines. */
++static int ld_alias_size_log_n(void)
++{
++    static int n = -1;
++    if (n < 0) { const char* e = getenv("LD_ALIAS_SIZE_LOG"); n = e ? atoi(e) : 0; }
++    return n;
++}
++static void ld_alias_size_note(const char* what, u32 location, u32 offset, u32 tw, u32 th, u32 tfmt, u32 tpitch,
++                               u32 target, int picked)
++{
++    const int cap = ld_alias_size_log_n();
++    static int logged;
++    static u64 seen[512];
++    static u32 n_seen;
++    if (logged >= cap) return;
++    u32 n_at = 0;
++    for (u32 i = 0; i < g.n_surfaces; i++)
++        if (g.surfaces[i].tex && g.surfaces[i].location == location && g.surfaces[i].offset == offset) n_at++;
++    const int mismatch = picked >= 0 && (u32)picked < g.n_surfaces &&
++                         (g.surfaces[picked].w != tw || g.surfaces[picked].h != th);
++    u32 n_tat = 0;   /* surfaces at the draw target's address */
++    if (target < g.n_surfaces)
++        for (u32 i = 0; i < g.n_surfaces; i++)
++            if (g.surfaces[i].tex && g.surfaces[i].location == g.surfaces[target].location &&
++                g.surfaces[i].offset == g.surfaces[target].offset) n_tat++;
++    if (n_at < 2 && !mismatch && n_tat < 2) return;
++    const u64 key = ((u64)offset << 32) ^ ((u64)tw << 20) ^ ((u64)th << 8) ^ ((u64)(target & 0xFFu) << 48) ^
++                    (u64)(u32)(picked + 2) ^ ((u64)(what[0]) << 56) ^ ((u64)(tfmt & 0xFFu) << 40);
++    for (u32 k = 0; k < n_seen; k++) if (seen[k] == key) return;
++    if (n_seen < 512) seen[n_seen++] = key;
++    logged++;
++    char buf[512]; int k = 0;
++    for (u32 i = 0; i < g.n_surfaces && k < (int)sizeof(buf) - 96; i++) {
++        const surface_t* sf = &g.surfaces[i];
++        if (!sf->tex || sf->location != location || sf->offset != offset) continue;
++#if !defined(YZ_PERF_CLEAN)
++        k += snprintf(buf + k, sizeof(buf) - (size_t)k, " [%u]%ux%u fmt%d create=%u draw=%u", i, sf->w, sf->h,
++                      (int)sf->fmt, sf->last_create_generation, sf->last_draw_generation);
++#else
++        k += snprintf(buf + k, sizeof(buf) - (size_t)k, " [%u]%ux%u fmt%d", i, sf->w, sf->h, (int)sf->fmt);
++#endif
++    }
++    const surface_t* tg = target < g.n_surfaces ? &g.surfaces[target] : NULL;
++    fprintf(stderr, "[alias-size] f=%u %s%s %u:0x%08X fmt=0x%02X %ux%u pitch=%u target=%d(%u:0x%X %ux%u) -> %d;%s\n",
++            g_ld_frames, what, mismatch ? " SIZE-MISMATCH" : "", location, offset, tfmt, tw, th, tpitch,
++            tg ? (int)target : -1, tg ? tg->location : 0u, tg ? tg->offset : 0u, tg ? tg->w : 0u, tg ? tg->h : 0u,
++            picked, buf);
++}
++
+ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+                        DXGI_FORMAT want_fmt)
+ {
+@@ -5570,8 +5623,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     slot = g.n_surfaces;
+     { static u32 new_logs = 0;
+       if (PS3_LOG_FIRST(new_logs, 24))
+-          fprintf(stderr, "[surfsz] new live surface %u:0x%X %ux%u (slot %u)\n",
+-                  location, offset, want_w, want_h, slot); }
++          fprintf(stderr, "[surfsz] new live surface %u:0x%X %ux%u (slot %u, frame %u)\n",   /* frame: KZ2 2087 */
++                  location, offset, want_w, want_h, slot, g_ld_frames); }
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+@@ -6296,6 +6349,25 @@ static u32 current_surface(void)
+                                  sf.clip_w, sf.clip_h,
+                                  ld_color_dxgi(sf.color_format));
+     if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
++    if (slot != LD_INVALID_SURFACE && ld_alias_size_log_n()) {   /* KZ2 patch 2087 diagnostic: draws into aliased targets */
++        u32 n_at = 0;
++        for (u32 i = 0; i < g.n_surfaces; i++)
++            if (g.surfaces[i].tex && g.surfaces[i].location == sf.color_location[0] &&
++                g.surfaces[i].offset == sf.color_offset[0]) n_at++;
++        static u64 seen[128]; static u32 n_seen, logged;
++        const u32 fmt = rsx_dsp_reg(&g.rsx, 0x0208), vph = rsx_dsp_reg(&g.rsx, 0x0A00), sch = rsx_dsp_reg(&g.rsx, 0x08C0);
++        const u64 key = ((u64)slot << 56) ^ ((u64)fmt << 24) ^ (u64)vph ^ ((u64)sch << 12) ^ ((u64)sf.color_pitch[0] << 40);
++        int dup = 0;
++        for (u32 k = 0; k < n_seen; k++) if (seen[k] == key) dup = 1;
++        if ((n_at >= 2 || sf.aa_sx != 1u || sf.clip_w > g.width) && !dup && logged < (u32)ld_alias_size_log_n()) {
++            if (n_seen < 128) seen[n_seen++] = key;
++            logged++;
++            fprintf(stderr, "[alias-size] f=%u target slot %u %u:0x%08X clip %ux%u aa %ux%u pitch %u surface-format 0x%08X "
++                    "viewport-h 0x%08X scissor-h 0x%08X clip-h 0x%08X\n", g_ld_frames, slot, sf.color_location[0],
++                    sf.color_offset[0], sf.clip_w, sf.clip_h, sf.aa_sx, sf.aa_sy, sf.color_pitch[0], fmt, vph, sch,
++                    rsx_dsp_reg(&g.rsx, 0x0200));
++        }
++    }
+     return slot;
+ }
+ 
+@@ -11607,6 +11679,9 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+                          want_n++; } } }
+         int want = 0;
+         for (int wi = 0; wi < want_n; wi++) if (surf_ok && want_i[wi] <= (long)sel && (long)sel <= want_hi[wi]) want = 1;
++        { static long vpw_sel = -2;   /* KZ2 patch 2087 diagnostic: LD_DRAW_INPUTS_VPW=<w> also selects draws with that viewport width */
++          if (vpw_sel == -2) { const char* e = getenv("LD_DRAW_INPUTS_VPW"); vpw_sel = e ? atol(e) : -1; }
++          if (vpw_sel > 0 && surf_ok) { rsx_dsp_viewport wv; rsx_dsp_get_viewport(&g.rsx, &wv); if ((long)wv.w == vpw_sel) want = 1; } }
+         /* Patch 2044: frame 0 = the first full frame after the gated draw dump started (the frame number of a
+          * moment in a level differs from run to run; the frame-relative index is stable within a few draws). */
+         const int want_frame = want_f > 0 ? (u32)want_f == frame
+@@ -13362,6 +13437,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                   best_gen = sf_i->last_draw_generation;
+               }
+           } }
++        if (ld_alias_size_log_n())   /* KZ2 patch 2087 diagnostic */
++            ld_alias_size_note("bind", t.location, t.offset, t.width, t.height, t.format, t.pitch, target,
++                               zeta_pref ? -2 : sampled);
+         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+          * framebuffer. Placed here rather than in fetch_batches because that
+          * function is not on this draw's path -- probing it printed nothing at
+@@ -16298,6 +16376,10 @@ static void ld_present_body(u32 buffer_id)
+             }
+         }
+     }
++    if (target != LD_INVALID_SURFACE && ld_alias_size_log_n())   /* KZ2 patch 2087 diagnostic */
++        ld_alias_size_note("present", g.display_buffers[buffer_id].location, g.display_buffers[buffer_id].offset,
++                           g.display_buffers[buffer_id].width, g.display_buffers[buffer_id].height, 0u,
++                           g.display_buffers[buffer_id].pitch, LD_INVALID_SURFACE, (int)target);
+     if (target == LD_INVALID_SURFACE && buffer_id < 8 &&
+         g.display_buffers[buffer_id].valid && g.display_buffers[buffer_id].resolve_src > 0 &&
+         (u32)g.display_buffers[buffer_id].resolve_src <= g.n_surfaces)

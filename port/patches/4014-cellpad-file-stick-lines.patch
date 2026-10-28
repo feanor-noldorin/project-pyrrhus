@@ -1,0 +1,69 @@
+Port patch 4014: PAD_FILE stick lines. The closed-loop PAD_FILE (a driver outside the process writes a button mask
+into a file each time it wants a press) also takes "S LX LY RX RY SECONDS": the sticks held for SECONDS of wall time,
+in PAD_SCRIPT's -1..1 scale. A driver that reads frames can then steer (turn, walk, strafe) as well as press. Several
+lines per read; the file is emptied after any accepted line. Off unless PAD_FILE is set.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1521,9 +1521,17 @@ skip_inject: ;
+      *   echo 0x4000 > pad.txt    # CROSS
+      *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
+      *                            # long hold; the default is 40)
++     *
++     * Port patch 4014: a line "S LX LY RX RY SECONDS" holds the sticks (-1..1,
++     * 0 centred, LY/RY -1 = up, as PAD_SCRIPT) for SECONDS of wall time, so a
++     * driver can steer as well as press. The file may hold several lines (one
++     * stick line and one button line, say); all are taken in one read, the
++     * last of each kind wins, and the file is emptied. A new stick line
++     * replaces the running hold; "S 0 0 0 0 0" releases it.
+      */
+     { static int s_pf = -1; static char pf_path[512];
+       static unsigned held_mask = 0; static int held_n = 0;
++      static unsigned char pf_ax[4]; static int pf_ax_on = 0, pf_ax_was = 0; static unsigned long long pf_until = 0;   /* 4014 */
+       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
+                       s_pf = (e && *e) ? 1 : 0;
+                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
+@@ -1531,22 +1539,36 @@ skip_inject: ;
+           if (held_n <= 0) {
+               FILE* f = fopen(pf_path, "rb");
+               if (f) {
+-                  char buf[64]; buf[0] = 0;
+-                  if (fgets(buf, sizeof buf, f)) {
++                  char buf[128]; int took = 0;
++                  while (fgets(buf, sizeof buf, f)) {
+                       char* rest;
++                      double v[5];
++                      if (buf[0] == 'S' && sscanf(buf + 1, "%lf %lf %lf %lf %lf", &v[0], &v[1], &v[2], &v[3], &v[4]) == 5) {
++                          for (int k = 0; k < 4; k++) pf_ax[k] = pad_script_axis(v[k], 0);   /* 3006's mapping */
++                          pf_until = GetTickCount64() + (unsigned long long)(v[4] > 0 ? v[4] * 1000.0 : 0);
++                          pf_ax_on = v[4] > 0; took = 1;
++                          printf("[cellPad] PAD_FILE sticks l=(%u,%u) r=(%u,%u) for %.2fs\n",
++                                 pf_ax[0], pf_ax[1], pf_ax[2], pf_ax[3], v[4]); fflush(stdout);
++                          continue;
++                      }
+                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
+                       int n = (int)strtol(rest, 0, 0);
+-                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
++                      if (m) { held_mask = m; held_n = n > 0 ? n : 40; took = 1;
+                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                   }
+                   fclose(f);
+-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
++                  if (took) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+               }
+           }
+           if (held_n > 0) { held_n--;
+               const unsigned hm = (s_remap_sig[0] || s_remap_sig[1]) ? prm_apply_mask(&s_remap[pad_remap_family(s_port_dev[0])], held_mask) : held_mask;   /* 4013 */
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(hm & 0xFF);
+               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((hm >> 8) & 0xFF); }
++          /* 4014: the stick hold, then back to centre once (a host pad's own values stay untouched otherwise) */
++          if (pf_ax_on && GetTickCount64() >= pf_until) pf_ax_on = 0;
++          if (pf_ax_on) { hs->analog_lx = pf_ax[0]; hs->analog_ly = pf_ax[1]; hs->analog_rx = pf_ax[2]; hs->analog_ry = pf_ax[3];
++                          hs->connected = 1; pf_ax_was = 1; }
++          else if (pf_ax_was) { pf_ax_was = 0; hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128; }
+       } }
+ 
+     /* Analog sticks */

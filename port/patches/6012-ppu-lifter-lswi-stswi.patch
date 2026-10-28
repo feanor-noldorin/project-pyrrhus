@@ -1,0 +1,51 @@
+ppu_lifter: implement lswi/stswi (Load/Store String Word Immediate). They were emitted as /* TODO */ no-ops; SN's
+compiler copies small fixed-size char arrays with an lswi/stswi pair (8 pairs in the Killzone 2 1.29 EBOOT). In the SV
+client's URL parser (@0x3A7F44) the scheme "file" was never copied, the scheme came out empty, no protocol handler
+matched and the front-end start page never loaded. General lifter fix, upstream candidate.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1910,6 +1910,40 @@ class PPULifter:
+                 return (f"{{ uint64_t _ea = ctx->gpr[{base}] + {disp}; {body} }}")
+             return f"/* {mn} unhandled operands: {insn.operands} */;"
+ 
++        # ------- Load/Store String Word Immediate (Book I 3.3.6) -------
++        # lswi rT,rA,NB / stswi rS,rA,NB: n = NB (0 means 32) bytes at EA = (rA|0), packed big-endian into the low
++        # words of rT, rT+1, ... (wrapping r31 -> r0); lswi clears each register first (the unused low bytes of the
++        # last one stay 0). Previously a /* TODO */ no-op: SN's compiler copies small fixed-size char arrays with an
++        # lswi/stswi pair (Killzone 2 SV client URL parser @0x3A7F44: the scheme "file" was never copied, so no
++        # protocol handler matched and the menu page never loaded).
++        if mn in ("lswi", "stswi") and len(ops) == 3:
++            r_t, r_a = _reg_idx(ops[0]), _reg_idx(ops[1])
++            try:
++                nb = int(str(ops[2]), 0)
++            except ValueError:
++                nb = -1
++            if str(r_t).isdigit() and str(r_a).isdigit() and 0 <= nb < 32:
++                n = nb or 32
++                ea = "0" if int(r_a) == 0 else f"(uint32_t)ctx->gpr[{r_a}]"
++                parts = []
++                for k in range(n):
++                    reg = (int(r_t) + k // 4) % 32
++                    sh = 24 - 8 * (k % 4)
++                    if mn == "lswi":
++                        if k % 4 == 0:
++                            parts.append(f"_w[{k // 4}] = 0;")
++                        parts.append(f"_w[{k // 4}] |= (uint32_t)vm_read8(_ea + {k}) << {sh};")
++                    else:
++                        parts.append(f"vm_write8(_ea + {k}, (uint8_t)((uint32_t)ctx->gpr[{reg}] >> {sh}));")
++                if mn == "lswi":
++                    # read every byte before writing a register (rA may be among the targets: invalid form, but
++                    # keep EA stable)
++                    regs = (n + 3) // 4
++                    parts.append(" ".join(f"ctx->gpr[{(int(r_t) + j) % 32}] = (uint64_t)_w[{j}];" for j in range(regs)))
++                    return f"{{ uint32_t _ea = {ea}; uint32_t _w[8]; {' '.join(parts)} }}"
++                return f"{{ uint32_t _ea = {ea}; {' '.join(parts)} }}"
++            return f"/* {mn} unhandled operands: {insn.operands} */;"
++
+         # ------- Stores -------
+         store_map = {
+             "stb": "vm_write8", "stbu": "vm_write8",

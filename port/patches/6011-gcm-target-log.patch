@@ -1,0 +1,75 @@
+KZ2 patch 6011: KZ2_TGT_LOG=<flips> prints, per window of flips, every surface the 3D path
+draws into or clears (colour targets by the 0x220 mask, zeta, local/main). Diagnostic only, off by default.
+v0.17.0 rebase (ps3recomp a6d76c8): context only (#399 PS3_LOG_FIRST log caps and other upstream context); diff regenerated.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): both sides kept
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 5165e00..c9652e8 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1468,6 +1468,48 @@ static void nv3089_blit_body(void)
+  * BLEND_COLOR, BLEND_EQUATION, COLOR_MASK (= FORMAT 0x101) and
+  * STENCIL_TEST_ENABLE (ASSUMPTION: without visible effect on live-draw).
+  * -----------------------------------------------------------------------*/
++/* KZ2 patch 6011, KZ2_TGT_LOG=<flips>: which surfaces the 3D path draws into or clears. Every CLEAR (0x1D94) and
++ * every BEGIN_END(prim) adds one to each bound colour target (by 0x220 mask, offsets 0x210/0x218/0x288/0x28C,
++ * DMA contexts 0x194/0x18C/0x1B4/0x1B8) and the zeta target (0x214/0x198); one table per <flips> flips, at most
++ * 24 tables. Answers "does anything but the copy draw ever write the display buffers" over a whole run. */
++static void kz2_tgt_note(u32 subch, u32 m, u32 v, int flip)
++{
++    static int every = -1; static u32 off[5], ctx[5] = {0xFEED0000u, 0xFEED0000u, 0xFEED0000u, 0xFEED0000u, 0xFEED0000u}, mask = 1;
++    static struct { u32 key, draws, clears, zeta; } t[32]; static int nt, tables; static u32 flips, from;
++    if (every < 0) { const char* e = getenv("KZ2_TGT_LOG"); every = e ? atoi(e) : 0; }
++    if (every <= 0 || tables >= 24) return;
++    if (flip) {
++        if (++flips - from < (u32)every) return;
++        printf("[kz2-tgt] flips %u..%u:", from, flips - 1);
++        for (int i = 0; i < nt; i++)
++            printf(" %s0x%07X d%u c%u%s", (t[i].key >> 31) ? "main:" : "", t[i].key & 0x7FFFFFFFu, t[i].draws, t[i].clears,
++                   t[i].zeta ? "(zeta)" : "");
++        printf("%c", 10); fflush(stdout);
++        nt = 0; from = flips; tables++;
++        return;
++    }
++    if (subch > 1) return;
++    switch (m) {
++    case 0x210: off[0] = v; return; case 0x218: off[1] = v; return; case 0x288: off[2] = v; return;
++    case 0x28C: off[3] = v; return; case 0x214: off[4] = v; return; case 0x220: mask = v; return;
++    case 0x194: ctx[0] = v; return; case 0x18C: ctx[1] = v; return; case 0x1B4: ctx[2] = v; return;
++    case 0x1B8: ctx[3] = v; return; case 0x198: ctx[4] = v; return;
++    case 0x1D94: case 0x1808: break;
++    default: return;
++    }
++    if (m == 0x1808 && v == 0) return;
++    int on[5] = {0, 0, 0, 0, 1};
++    if (mask == 1) on[0] = 1; else if (mask == 2) on[1] = 1;
++    else if (mask >= 0x10) { on[0] = on[1] = 1; on[2] = (mask & 4) != 0; on[3] = (mask & 8) != 0; }
++    for (int k = 0; k < 5; k++) {
++        if (!on[k]) continue;
++        const u32 key = (off[k] & 0x7FFFFFFFu) | ((ctx[k] & 1u) << 31);
++        int i = 0; while (i < nt && !(t[i].key == key && t[i].zeta == (k == 4))) i++;
++        if (i == nt) { if (nt == 32) continue; t[nt].key = key; t[nt].draws = t[nt].clears = 0; t[nt].zeta = (k == 4); nt++; }
++        if (m == 0x1D94) t[i].clears++; else t[i].draws++;
++    }
++}
++
+ static u32 s_subch_obj[8];
+ static u8  s_subch_obj_set[8];
+ static struct {
+@@ -2954,6 +2996,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+             extern s32 cellGcmSetFlipCommand(u32 bufferId);
+             s_fifo_getoff += 4;
+             gcm_fifo_flip_resets_state(&s_state);
++            kz2_tgt_note(0, 0, 0, 1);   /* patch 6011: one table per KZ2_TGT_LOG flip words */
+             /* Count the flip WORDS the title actually writes into the FIFO,
+              * separately from the presents that result. When a title stops
+              * appearing on screen the first question is which side stopped:
+@@ -3304,6 +3347,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                   if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
+                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
+                               m, vm_read32(dea)); }
++                kz2_tgt_note(subch, m, vm_read32(dea), 0);   /* patch 6011 */
+                 if (subch == 7 && m == 0x0B00u) {
+                     extern void rsx_raise_user_cmd(u32 arg);
+                     rsx_raise_user_cmd(vm_read32(dea));

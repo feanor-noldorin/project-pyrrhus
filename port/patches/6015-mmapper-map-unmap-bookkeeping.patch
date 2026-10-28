@@ -1,0 +1,155 @@
+sys_mmapper map/unmap/free memory: bookkeeping, unmap's mem_id out-parameter, alias/move warnings, a trace.
+
+Symptom: Killzone 2 (1.29) runs its own page heap on sys_mmapper: it reserves 0x20000000..0x2FFFFFFF
+(sys_mmapper_allocate_address at 0x1F3B8; a second 256 MB reservation with flags 0x208 at 0x72BD8) and maps and
+unmaps 1 MB pages there (0x11FF4 / 0x11D74), and 0x72BD8 maps one 64 KB block at several addresses. In the flat VM
+sys_mmapper_map_memory, unmap_memory and free_memory were plain CELL_OK stubs: unmap never wrote the mem_id it
+returns, an id mapped at two addresses does not share bytes, and an id re-mapped elsewhere does not carry its
+contents. Nothing recorded which of these the game actually does.
+Fix: keep an addr -> mem_id table; unmap writes the id mapped at addr into *r4. Always (first 16 each): a WARNING
+line when an id is mapped at a second address while still mapped (alias) or at a different address than the one it
+was last unmapped from (move). Diagnostics, off by default: KZ2_MMAP_LOG=<n> logs the first n map/unmap/free calls
+with the caller, and every sys_mmapper_allocate_address (lv2 330 in the loader); KZ2_MMAP_MOVE=1 saves a block's
+bytes at unmap and copies them to the new address on a move, so contents follow the id as on the PS3.
+
+Verification: Killzone 2 under Proton.
+v0.17.0 rebase (ps3recomp a6d76c8): 6015 allocate_address log moved after #296's sys_mmapper_allocate_address (address read back from *out).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 0e60f86..ecd0b21 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3352,8 +3352,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+     }
+     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
+                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
++        uint32_t size = (uint32_t)ctx->gpr[3], align = (uint32_t)ctx->gpr[5], out = (uint32_t)ctx->gpr[6];
++        uint64_t flags = ctx->gpr[4];
+         int64_t rc = sys_mmapper_allocate_address(ctx);
+         ctx->gpr[3] = (uint64_t)rc;
++        if (getenv("KZ2_MMAP_LOG"))   /* KZ2 patch 6015 */
++            fprintf(stderr, "[mmapper] allocate_address(size=0x%X flags=0x%llX align=0x%X) -> 0x%08X rc=0x%llX lr=0x%08X\n",
++                    size, (unsigned long long)flags, align, (out && !rc) ? vm_read32(out) : 0u, (unsigned long long)rc, (uint32_t)ctx->lr);
+         return;
+     }
+     case 337: {   /* sys_mmapper_search_and_map(u32 start_addr, u32 mem_id,
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index d1f67ac..9013d85 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -656,6 +656,102 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ 
++/* KZ2 patch 6015: sys_mmapper_map_memory / unmap_memory / free_memory bookkeeping. The flat VM still backs every
++ * address with the same bytes, so map/unmap stay no-ops for the data; what changes:
++ *  - unmap writes the mem_id that was mapped at addr into *r4 (lv2 contract; the old stub left it unwritten);
++ *  - KZ2_MMAP_LOG=<n> logs the first n map/unmap/free calls with the caller (lr);
++ *  - always (first 16 each): a WARNING when a mem_id is mapped at a second address while still mapped (aliasing: on
++ *    the PS3 both addresses show the same bytes, here they do not) and when a mem_id is mapped at a different address
++ *    than the one it was last unmapped from (its old contents do not follow it here);
++ *  - KZ2_MMAP_MOVE=1 (off by default, experiment): unmap saves the block's bytes on the host and a move copies them
++ *    to the new address, so the contents follow the mem_id as on the PS3. */
++#define MMAP_TRK 1024
++struct mmap_trk { uint32_t addr, id, flags, live; };
++static mmap_trk s_mmap[MMAP_TRK];          /* addr -> id, live mappings plus the last unmapped address per id */
++static uint32_t s_mmap_last_unmap[256];    /* id - 0x1000 -> last address it was unmapped from (0 = never) */
++static uint8_t* s_mmap_save[256];          /* KZ2_MMAP_MOVE: bytes saved at unmap, per id */
++static volatile long s_mmap_lock = 0;
++static int mmap_move_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ2_MMAP_MOVE"); on = (e && *e == '1') ? 1 : 0; }
++    return on;
++}
++static void mmap_lock(void)   { while (__sync_lock_test_and_set(&s_mmap_lock, 1)) { } }
++static void mmap_unlock(void) { __sync_lock_release(&s_mmap_lock); }
++static long mmap_log_left(void)
++{
++    static long left = -1;
++    if (left < 0) { const char* e = getenv("KZ2_MMAP_LOG"); left = e ? strtol(e, nullptr, 0) : 0; }
++    return left;
++}
++static int mmap_log_take(void)
++{
++    static long used = 0;
++    if (used >= mmap_log_left()) return 0;
++    used++;
++    return 1;
++}
++static void sys_mmapper_map_memory_hle(ppu_context* ctx)
++{
++    uint32_t addr = (uint32_t)ctx->gpr[3], id = (uint32_t)ctx->gpr[4], flags = (uint32_t)ctx->gpr[5];
++    uint32_t size = ps3_mmapper_block_size(id);
++    uint32_t alias = 0, moved_from = 0;
++    mmap_lock();
++    int slot = -1;
++    for (int i = 0; i < MMAP_TRK; i++) {
++        if (s_mmap[i].live && s_mmap[i].id == id && s_mmap[i].addr != addr) alias = s_mmap[i].addr;
++        if (slot < 0 && (!s_mmap[i].live || s_mmap[i].addr == addr)) slot = i;
++    }
++    if (slot >= 0) { s_mmap[slot].addr = addr; s_mmap[slot].id = id; s_mmap[slot].flags = flags; s_mmap[slot].live = 1; }
++    uint32_t idx = id - 0x1000u;
++    if (idx < 256 && s_mmap_last_unmap[idx] && s_mmap_last_unmap[idx] != addr) moved_from = s_mmap_last_unmap[idx];
++    mmap_unlock();
++    if (mmap_log_take())
++        fprintf(stderr, "[mmapper] map_memory(addr=0x%08X id=0x%X size=0x%X flags=0x%X) lr=0x%08X\n",
++                addr, id, size, flags, (uint32_t)ctx->lr);
++    static int n_alias = 0, n_move = 0;
++    if (alias && n_alias++ < 16)
++        fprintf(stderr, "[mmapper] WARNING alias: id 0x%X mapped at 0x%08X while still mapped at 0x%08X (flags=0x%X lr=0x%08X): "
++                "the flat VM does not share these bytes\n", id, addr, alias, flags, (uint32_t)ctx->lr);
++    if (moved_from && !alias) {
++        int move_on = mmap_move_on() && idx < 256 && s_mmap_save[idx];
++        if (n_move++ < 16)
++            fprintf(stderr, "[mmapper] WARNING move: id 0x%X mapped at 0x%08X, last unmapped from 0x%08X (size 0x%X lr=0x%08X)%s\n",
++                    id, addr, moved_from, size, (uint32_t)ctx->lr, move_on ? ": copying" : "");
++        if (move_on && size) memcpy(vm_base + addr, s_mmap_save[idx], size);
++    }
++    ctx->gpr[3] = 0;
++}
++static void sys_mmapper_unmap_memory_hle(ppu_context* ctx)
++{
++    uint32_t addr = (uint32_t)ctx->gpr[3], out = (uint32_t)ctx->gpr[4];
++    uint32_t id = 0;
++    mmap_lock();
++    for (int i = 0; i < MMAP_TRK; i++)
++        if (s_mmap[i].live && s_mmap[i].addr == addr) { id = s_mmap[i].id; s_mmap[i].live = 0; break; }
++    if (id && id - 0x1000u < 256) s_mmap_last_unmap[id - 0x1000u] = addr;
++    mmap_unlock();
++    if (id && id - 0x1000u < 256 && mmap_move_on()) {
++        uint32_t size = ps3_mmapper_block_size(id);
++        uint8_t** sv = &s_mmap_save[id - 0x1000u];
++        if (size && !*sv) *sv = (uint8_t*)malloc(size);
++        if (size && *sv) memcpy(*sv, vm_base + addr, size);
++    }
++    if (mmap_log_take())
++        fprintf(stderr, "[mmapper] unmap_memory(addr=0x%08X) -> id 0x%X lr=0x%08X\n", addr, id, (uint32_t)ctx->lr);
++    if (out && id) vm_write32(out, id);
++    ctx->gpr[3] = 0;   /* as before, also for an address this table does not know */
++}
++static void sys_mmapper_free_memory_hle(ppu_context* ctx)
++{
++    uint32_t id = (uint32_t)ctx->gpr[3];
++    if (mmap_log_take())
++        fprintf(stderr, "[mmapper] free_memory(id=0x%X) lr=0x%08X\n", id, (uint32_t)ctx->lr);
++    if (id - 0x1000u < 256) { mmap_lock(); s_mmap_last_unmap[id - 0x1000u] = 0; mmap_unlock(); }
++    ctx->gpr[3] = 0;
++}
++
+ /* A handful of CRT helpers the early boot tends to hit; accept and continue. */
+ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
+ static void sys_lwmutex_destroy_counted(ppu_context* ctx)
+@@ -1149,7 +1245,7 @@ extern "C" void ppu_sysprx_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("sys_ppu_thread_exit"),        "sys_ppu_thread_exit",        hle_ppu_thread_exit);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory"), "sys_mmapper_allocate_memory", sys_mmapper_allocate_memory);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_allocate_memory_from_container"), "sys_mmapper_allocate_memory_from_container", sys_mmapper_allocate_memory_from_container);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     crt_ok);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   crt_ok);
+-    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    crt_ok);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_map_memory"),     "sys_mmapper_map_memory",     sys_mmapper_map_memory_hle);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_unmap_memory"),   "sys_mmapper_unmap_memory",   sys_mmapper_unmap_memory_hle);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mmapper_free_memory"),    "sys_mmapper_free_memory",    sys_mmapper_free_memory_hle);
+ }

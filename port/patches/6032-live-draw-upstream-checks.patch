@@ -1,0 +1,209 @@
+KZ2 patch 6032 (diagnostic, LD_UPCHK=1): live-draw checks against upstream ps3recomp PRs #501, #502, #504 and #508.
+
+Runtime an earlier change asked which of four upstream fixes for the shared Vulkan/Metal engine also apply to the D3D12 live
+draw. With LD_UPCHK=1 the bind loop counts every depth-format texture bind (DEPTH24_D8/_FLOAT, DEPTH16/_FLOAT) by
+format, CONTROL1 crossbar and serving path (zeta snapshot, zeta window of patch 2063, CPU decode, colour surface);
+counts depth snapshots and zeta windows created and retired, the texture cache size and all textures retired (#502:
+a per-frame leak shows as a growing live count); counts compressed (DXT) textures that matched a render target (#508);
+and counts vertex fetches whose base + offset is at or past 0x10000000 (#504; fetch_attr here, the compact plan in
+rsx_vertex_compact.c, which counts without the switch). A summary "[upchk]" line every 512 frames; first examples as
+"[upchk] ex". Off: one cached getenv per bound unit.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): HEAD's rsx_dsp_resolve_vertex_offset plus the raw-sum diagnostic
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3045,9 +3045,81 @@ void rsx_live_draw_flush(void)
+     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+ }
+ 
++/* KZ2 patch 6032 (diagnostic, LD_UPCHK=1): checks of the live draw against upstream PRs #501, #502, #504 and #508.
++ * #501: every bind of a depth-format texture (DEPTH24_D8/_FLOAT, DEPTH16/_FLOAT) is counted by format, crossbar
++ *       (CONTROL1 remap) and the path that served it: zeta snapshot, zeta window (2063), CPU decode, colour surface.
++ * #502: depth snapshots and zeta windows created and retired, the texture cache size and textures retired, so a
++ *       per-frame leak shows as a live count that keeps growing.
++ * #504: vertex array fetches whose base + offset sum is at or past 0x10000000 (fetch_attr and the compact plan).
++ * #508: binds of a compressed (DXT1/23/45) texture that matched a render target (colour surface or feedback copy).
++ * A summary line every 512 frames ("[upchk]"), first examples as "[upchk] ex". Off: no cost but one cached getenv. */
++static int ld_upchk_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("LD_UPCHK") ? 1 : 0;
++    return on;
++}
++enum { UPCHK_SNAP = 0, UPCHK_ZWIN, UPCHK_DECODE, UPCHK_SURF, UPCHK_NPATH };
++typedef struct { u32 fmt, remap, path; u64 n; } ld_upchk_row;
++static ld_upchk_row g_upchk_rows[48];
++static u32 g_upchk_nrows;
++static u64 g_upchk_snap_new, g_upchk_snap_ret, g_upchk_zwin_new, g_upchk_zwin_ret, g_upchk_retired;
++static u64 g_upchk_dxt_surf, g_upchk_vtx_hi;
++extern unsigned long long rsx_vc_hi_sum_n;   /* rsx_vertex_compact.c (patch 6032) */
++static void ld_upchk_depth_bind(const rsx_dsp_texture* t, u32 path)
++{
++    const u32 base = t->format & 0x9Fu;
++    if (base < 0x90u || base > 0x93u) return;
++    const u32 rm = (t->remap & 0xFFFFu) ? (t->remap & 0xFFFFu) : 0xAAE4u;
++    for (u32 i = 0; i < g_upchk_nrows; i++)
++        if (g_upchk_rows[i].fmt == base && g_upchk_rows[i].remap == rm && g_upchk_rows[i].path == path) {
++            g_upchk_rows[i].n++; return; }
++    if (g_upchk_nrows < 48) {
++        ld_upchk_row* r = &g_upchk_rows[g_upchk_nrows++];
++        r->fmt = base; r->remap = rm; r->path = path; r->n = 1;
++        fprintf(stderr, "[upchk] ex depth bind fmt=0x%02X remap=0x%04X path=%u %u:0x%08X %ux%u frame=%u\n",
++                base, rm, path, t->location, t->offset, t->width, t->height, g_ld_frames);
++    }
++}
++static void ld_upchk_dxt_surface(const rsx_dsp_texture* t, int surf)
++{
++    const u32 base = t->format & 0x9Fu;
++    if (base != 0x86u && base != 0x87u && base != 0x88u) return;
++    if (g_upchk_dxt_surf++ < 8)
++        fprintf(stderr, "[upchk] ex dxt-as-target fmt=0x%02X %u:0x%08X %ux%u -> surface %d frame=%u\n",
++                base, t->location, t->offset, t->width, t->height, surf, g_ld_frames);
++}
++static void ld_upchk_vtx_hi(u32 loc, u32 base, u32 off)
++{
++    if (g_upchk_vtx_hi++ < 8)
++        fprintf(stderr, "[upchk] ex vertex sum >= 0x10000000 loc=%u base=0x%08X offset=0x%08X frame=%u\n",
++                loc, base, off, g_ld_frames);
++}
++static void ld_upchk_tick(void)
++{
++    static u32 last;
++    if (g_ld_frames / 512u == last) return;
++    last = g_ld_frames / 512u;
++    static const char* pn[UPCHK_NPATH] = {"snap", "zwin", "decode", "surface"};
++    u32 zw_live = 0;
++    for (u32 i = 0; i < g.n_zdepths; i++)
++        for (u32 j = 0; j < LD_ZWIN_PER; j++) if (g.zdepths[i].win[j].tex) zw_live++;
++    u32 snap_live = 0;
++    for (u32 i = 0; i < g.n_zdepths; i++) if (g.zdepths[i].snapshot) snap_live++;
++    fprintf(stderr, "[upchk] frame=%u zetas=%u snap new=%llu ret=%llu live=%u zwin new=%llu ret=%llu live=%u "
++            "texcache=%u retired=%llu dxt-as-target=%llu vtx-hi=%llu+%llu\n", g_ld_frames, g.n_zdepths,
++            (unsigned long long)g_upchk_snap_new, (unsigned long long)g_upchk_snap_ret, snap_live,
++            (unsigned long long)g_upchk_zwin_new, (unsigned long long)g_upchk_zwin_ret, zw_live, g.n_textures,
++            (unsigned long long)g_upchk_retired, (unsigned long long)g_upchk_dxt_surf,
++            (unsigned long long)g_upchk_vtx_hi, (unsigned long long)rsx_vc_hi_sum_n);
++    for (u32 i = 0; i < g_upchk_nrows; i++)
++        fprintf(stderr, "[upchk]   depth fmt=0x%02X remap=0x%04X %s n=%llu\n", g_upchk_rows[i].fmt,
++                g_upchk_rows[i].remap, pn[g_upchk_rows[i].path], (unsigned long long)g_upchk_rows[i].n);
++}
+ static void retire_texture(ID3D12Resource* tex)
+ {
+     if (!tex) return;
++    g_upchk_retired++;   /* patch 6032 */
+     if (g.n_retired_textures >= MAX_RETIRED_TEXTURES)
+         ld_flush(LD_FLUSH_RETIRE_QUEUE);
+     g.retired_textures[g.n_retired_textures++] = tex;
+@@ -6666,6 +6738,7 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
+             z->location, z->offset, z->snapshot_w, z->snapshot_h, nw, nh);
+     /* The open command list may still read the old one. */
+     retire_texture(z->snapshot);
++    g_upchk_snap_ret++; g_upchk_snap_new++;   /* patch 6032 */
+     z->snapshot = snap;
+     z->snapshot_w = nw;
+     z->snapshot_h = nh;
+@@ -6724,6 +6797,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+         }
+         if (old->snapshot) {
+             retire_texture(old->snapshot);
++            g_upchk_snap_ret++;   /* patch 6032 */
+             old->snapshot = NULL;
+         }
+     }
+@@ -6797,6 +6871,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+                 (unsigned long)snapshot_hr);
+         z->snapshot = NULL;
+     } else {
++        g_upchk_snap_new++;   /* patch 6032 */
+         z->snapshot_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+         srv_write_depth_source(SRV_DEPTH_SOURCE_BASE + slot, z->tex);
+         srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->snapshot);
+@@ -6942,7 +7017,7 @@ static int zdepth_window(u32 i, u32 w, u32 h)
+         k = 0;
+         for (u32 j = 1; j < LD_ZWIN_PER; j++)
+             if (!z->win[j].tex || (z->win[k].tex && z->win[j].used < z->win[k].used)) k = j;
+-        if (z->win[k].tex) retire_texture(z->win[k].tex);   /* the open command list may still read it */
++        if (z->win[k].tex) { retire_texture(z->win[k].tex); g_upchk_zwin_ret++; }   /* the open command list may still read it */
+         z->win[k].tex = NULL;
+         D3D12_HEAP_PROPERTIES hp = {0};
+         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -6962,6 +7037,7 @@ static int zdepth_window(u32 i, u32 w, u32 h)
+             return -1;
+         }
+         z->win[k].tex = t; z->win[k].w = w; z->win[k].h = h; z->win[k].gen = z->snap_gen - 1u;
++        g_upchk_zwin_new++;   /* patch 6032 */
+         srv_write_zdepth(SRV_ZWIN_BASE + i * LD_ZWIN_PER + k, t);
+         static u32 n_log;
+         if (n_log++ < 16)
+@@ -10403,6 +10479,8 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
+         if (at + elem_size > dc.inl_bytes) return 0;
+         p = dc.inl + at;
+     } else {
++        if (base + (u64)a.offset >= 0x10000000ull && ld_upchk_on())   /* patch 6032: #504 */
++            ld_upchk_vtx_hi(a.location, base, a.offset);
+         p = guest_ptr(
+             a.location,
+             rsx_dsp_resolve_vertex_offset(base, a.offset) + source_element * stride,
+@@ -13975,6 +14053,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                         "zslot=%u self=%d\n", g_ld_frames, rsx_dsp_reg(&g.rsx, 0x1D60), g.surfaces[target].location,
+                         g.surfaces[target].offset, u, t.offset, sampled, zeta_pref, current_zslot, self_zeta_read);
+         }
++        if (ld_upchk_on()) {   /* patch 6032: #508, #501 */
++            ld_upchk_tick();
++            const int self = sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
++                             g.surfaces[target].offset == t.offset;
++            if (sampled >= 0 || self) {
++                ld_upchk_dxt_surface(&t, self ? -1 - (int)target : sampled);
++                ld_upchk_depth_bind(&t, UPCHK_SURF);
++            }
++        }
+         if (sampled < 0 && !zeta_pref && g.surfaces[target].location == t.location &&
+             g.surfaces[target].offset == t.offset) {
+             /* Reads its own render target: sample a copy of it. */
+@@ -14066,6 +14153,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 const int zw = zdepth_window((u32)sampled_depth, t.width, t.height);   /* patch 2063 */
+                 slots[u] = zw >= 0 ? (u32)zw : SRV_ZDEPTH_BASE + sampled_depth;
+                 g_ld_zdepth_srv_binds++;
++                if (ld_upchk_on()) ld_upchk_depth_bind(&t, zw >= 0 ? UPCHK_ZWIN : UPCHK_SNAP);   /* patch 6032 */
+                 int seen = 0;
+                 for (u32 k = 0; k < n_zdepth_used; k++)
+                     if (zdepth_used[k] == (u32)sampled_depth) seen = 1;
+@@ -14073,6 +14161,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
+             } else {
+                 LDW_T0(tex_t0);
++                if (ld_upchk_on()) ld_upchk_depth_bind(&t, UPCHK_DECODE);   /* patch 6032 */
+                 slots[u] = texture_srv_slot(&t);
+                 LDW_ADD(RSX_PERF_W_TEX_T, tex_t0);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -3,9 +3,13 @@
+ #include "rsx_vertex_formats.h"
+ 
+ #include <limits.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* KZ2 patch 6032 (diagnostic): vertex array sums at or past 0x10000000 (upstream #504 check). */
++unsigned long long rsx_vc_hi_sum_n;
++
+ /* Patch 2051: RSX_PERF_GPU=1 also times rsx_vertex_fetch_many per source type
+  * (QPC ticks, vertices, slots); index = the NV4097 type, 0 = other slow path (unmapped/divided), 8 = default value, 9 = unknown, printed with the [perf-gpu] line. */
+ long long (*rsx_vtx_prof_clock)(void);   /* set by RSX_PERF_GPU=1; NULL = off */
+@@ -334,6 +338,11 @@ void rsx_vertex_fetch_plan_prepare(
+ 
+         const u64 prefix = rsx_dsp_resolve_vertex_offset(
+             plan->base_offset, fetch->desc.offset);
++        if ((u64)plan->base_offset + (u64)fetch->desc.offset >= 0x10000000ull) {   /* KZ2 patch 6032 (diagnostic): the sums #504 wraps */
++            if (rsx_vc_hi_sum_n++ < 8)
++                fprintf(stderr, "[upchk] ex compact vertex sum >= 0x10000000 loc=%u base=0x%08X offset=0x%08X\n",
++                        fetch->desc.location, plan->base_offset, fetch->desc.offset);
++        }
+         const u64 start = prefix + (u64)first * fetch->stride;
+         const u64 end =
+             prefix + (u64)last * fetch->stride + fetch->elem_size;

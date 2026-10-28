@@ -1,0 +1,145 @@
+KZ3 patch 2058: no draw is skipped while its PSO builds; keycap uploads change only prompt-cell texels.
+Menu text corruption (live run 2026-10-14: main/campaign menu lists blank, capital C missing; stray glyphs
+in "For less"): patch 2048 skipped every draw whose PSO was still building. KZ3 renders its text once per glyph
+(stencil-then-cover) into the glyph cache at 0x3A00000 and samples it from there, so a glyph whose draws were
+skipped stayed blank, or kept the glyph that held the slot before. The keycap atlas (0x042A9180, the menu prompt
+atlas, not a font) was a coincidence: KZ3_KEYCAPS=0 runs on a cold PSO cache lose the same glyphs.
+rsx_live_draw.c: a pending PSO entry is waited for (ld_apso_await: the worker wakes the walker through the
+condition variable after each finished build); [pso-async] prints awaited= / await= / max= instead of
+skipped-draws=. LD_PSO_ASYNC=0 still builds on the walker thread.
+rsx_keycaps.h: the caps are drawn into a full-size overlay, then each touched BC3 block is encoded once: freely when
+all 16 texels are in cells, else keeping its endpoints and the indices of the texels outside every cell, so those
+decode exactly as before (2039 re-encoded shared blocks: 2,030 HUD and 73 menu texels outside the cells changed, up
+to 156 / 223 levels, measured on the real atlases). BC3 colour blocks decode in four-colour mode always (2039 used
+BC1's c0 <= c1 rule). Host test tools/smoke/test_keycaps.sh case 8 (flips).
+
+From KZ3 dabb17c3 port/patches/2058-pso-await-keycap-cells-exact.patch (KZ3's last ps3recomp v0.15.0 stack), imported by KZ2.
+KZ2: the rsx_keycaps.h hunks (KZ3 2039 keycap atlas, not carried) are dropped; the PSO await part is whole.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 795e60e..74971a3 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7432,10 +7432,13 @@ static ID3D12PipelineState* build_pso(
+  * and the game's Gfx jobs stalled ~6 s on the RSX label. With LD_PSO_ASYNC=1 the walker still decompiles and looks
+  * the blobs up (memory, then the disk cache), then hands the HLSL, render state and layout to worker threads
+  * (LD_PSO_ASYNC_THREADS, default 3) that compile the missing blobs and create the PSO (through the 2031 pipeline
+- * library). Until the PSO is back the key's entry is pending (pso NULL): its draws are skipped (counted as
+- * drop{pso}), as RPCS3's asynchronous shader mode does; a visible pop-in of a frame or a few. The walker merges
+- * finished builds at its next PSO lookup: blobs into the memory and disk caches, the key into pso_keys.bin, the PSO
+- * into its entry. Statistics: [pso-async] every 256 frames while builds ran. */
++ * library). Until the PSO is back the key's entry is pending (pso NULL). An earlier version skipped its draws (as RPCS3's
++ * asynchronous shader mode); a later test found that this loses draws for good on targets the game renders once and
++ * keeps (the glyph cache: blank menu lists, missing capitals), so the walker now waits for the build
++ * (ld_apso_await) and no draw is skipped; the miss costs the walker the build time again, as LD_PSO_ASYNC=0. The
++ * walker merges finished builds at its next PSO lookup: blobs into the memory and disk caches, the key into
++ * pso_keys.bin, the PSO into its entry. Statistics: [pso-async] every 256 frames while builds ran (awaited = draws
++ * that waited, await = their total wait). */
+ typedef struct ld_apso_job {
+     struct ld_apso_job* next;
+     u64 key, vs_hash, ps_hash;
+@@ -7460,7 +7463,8 @@ static struct {
+     HANDLE sem;
+     ld_apso_job *q_head, *q_tail, *done;
+     volatile LONG done_flag, in_flight;
+-    u64 submitted, finished, failed, skipped_draws, compile_us, create_us, latency_us, max_latency_us, merged;
++    u64 submitted, finished, failed, compile_us, create_us, latency_us, max_latency_us, merged;
++    u64 awaits, await_us, max_await_us;   /* walker waits for a pending build (no draw is skipped) */
+     u32 max_in_flight;
+ } g_apso;
+ 
+@@ -7536,8 +7540,9 @@ static DWORD WINAPI ld_apso_worker(LPVOID arg)
+         j->create_us = (unsigned)((q2.QuadPart - q1.QuadPart) * 1000000 / f.QuadPart);
+         EnterCriticalSection(&g_apso.cs);
+         j->next = g_apso.done; g_apso.done = j;
+-        LeaveCriticalSection(&g_apso.cs);
+         InterlockedExchange(&g_apso.done_flag, 1);
++        LeaveCriticalSection(&g_apso.cs);
++        WakeAllConditionVariable(&g_apso.cv);   /* a walker may wait for this build (ld_apso_await) */
+     }
+     return 0;
+ }
+@@ -7643,15 +7648,37 @@ static void ld_apso_drain(void)
+     }
+ }
+ 
++/* the walker waits for the pending build of g.psos[idx] and returns its PSO (NULL only when the build
++ * failed). Draws are never skipped while a build is in flight: a skipped draw is lost for good when its target
++ * keeps its content across frames. KZ3's text is such a target: glyphs are rendered once (stencil-then-cover) into
++ * the glyph cache at 0x3A00000 and sampled from there afterwards, so a glyph whose draws were skipped stayed blank
++ * (whole menu lists, capital C/A) or kept the glyph that held its slot before (arrows in "For less"). */
++static ID3D12PipelineState* ld_apso_await(u32 idx)
++{
++    LARGE_INTEGER t0, t1, f; QueryPerformanceCounter(&t0);
++    ld_apso_drain();
++    if (!g.psos[idx].pending) return g.psos[idx].pso;
++    while (g.psos[idx].pending) {
++        EnterCriticalSection(&g_apso.cs);
++        while (!g_apso.done) SleepConditionVariableCS(&g_apso.cv, &g_apso.cs, INFINITE);
++        LeaveCriticalSection(&g_apso.cs);
++        ld_apso_drain();
++    }
++    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
++    const u64 us = (u64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
++    g_apso.awaits++; g_apso.await_us += us; if (us > g_apso.max_await_us) g_apso.max_await_us = us;
++    return g.psos[idx].pso;
++}
++
+ static void ld_apso_stat_print(void)
+ {
+     if (!g_apso.submitted) return;
+     fprintf(stderr, "[pso-async] frame=%u submitted=%llu finished=%llu failed=%llu in-flight=%ld max-in-flight=%u "
+-                    "skipped-draws=%llu worker compile=%.1f ms create=%.1f ms latency avg=%.1f max=%.1f ms"
++                    "awaited=%llu await=%.1f ms max=%.1f ms worker compile=%.1f ms create=%.1f ms latency avg=%.1f max=%.1f ms"
+                     " compiles-owned=%llu deduped=%llu waits=%llu in-flight-blobs=%u\n",
+             g_ld_frames, (unsigned long long)g_apso.submitted, (unsigned long long)g_apso.finished,
+             (unsigned long long)g_apso.failed, (long)g_apso.in_flight, g_apso.max_in_flight,
+-            (unsigned long long)g_apso.skipped_draws, g_apso.compile_us / 1e3, g_apso.create_us / 1e3,
++            (unsigned long long)g_apso.awaits, g_apso.await_us / 1e3, g_apso.max_await_us / 1e3, g_apso.compile_us / 1e3, g_apso.create_us / 1e3,
+             g_apso.finished ? g_apso.latency_us / 1e3 / (double)g_apso.finished : 0.0, g_apso.max_latency_us / 1e3,
+             (unsigned long long)g_apso.tab.owned, (unsigned long long)g_apso.tab.deduped,
+             (unsigned long long)g_apso.waits, g_apso.tab.count);
+@@ -8162,8 +8189,8 @@ static ID3D12PipelineState* get_pso(
+             g_ld_profile.total.pso_hits++;
+ #endif
+             if (g.psos[i].preloaded) { g.psos[i].preloaded = 0; g_ld_pl_used++; }
+-            if (g.psos[i].pending) g_apso.skipped_draws++;   /* patch 2048: build in flight, draw skipped */
+             LDW_ADD(RSX_PERF_W_PSO_FIND_T, gp_t3);
++            if (g.psos[i].pending) return ld_apso_await(i);   /* wait, never skip */
+             return g.psos[i].pso;
+         }
+     }
+@@ -8312,7 +8339,7 @@ static ID3D12PipelineState* get_pso(
+     int apso_pending = 0;   /* patch 2048 */
+     if (vi > 0 && fi > 0 && ld_apso_on() &&
+         ld_apso_submit(vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key)) {
+-        apso_pending = 1; g_apso.skipped_draws++;
++        apso_pending = 1;
+     } else if (vi > 0 && fi > 0) {
+         LDW_T0(bp_t0);
+         pso = build_pso(
+@@ -8347,6 +8374,7 @@ static ID3D12PipelineState* get_pso(
+     g.psos[g.n_psos].pso = pso;
+     g.psos[g.n_psos].pending = (u8)apso_pending;   /* patch 2048 */
+     g.n_psos++;
++    if (apso_pending) return ld_apso_await(g.n_psos - 1u);   /* the draw waits for its build */
+     return pso;
+ }
+ 
+diff --git a/libs/video/rsx_pso_async.h b/libs/video/rsx_pso_async.h
+index 8b002ac..ae37079 100644
+--- a/libs/video/rsx_pso_async.h
++++ b/libs/video/rsx_pso_async.h
+@@ -2,8 +2,8 @@
+  * (LD_PSO_ASYNC), kept apart from the D3D12 code so a host test can check it with no GPU
+  * (tools/smoke/test_pso_async.c).
+  *
+- * 1. Pending entries. A PSO cache entry whose build is in flight has pso == NULL and pending = 1: a lookup returns
+- *    NULL, so the draw is skipped. When the build is back, RSX_APSO_MERGE finds the key's pending entry and stores
++ * 1. Pending entries. A PSO cache entry whose build is in flight has pso == NULL and pending = 1: a lookup waits for
++ *    the build (ld_apso_await; earlier versions skipped the draw). When the build is back, RSX_APSO_MERGE finds the key's pending entry and stores
+  *    the PSO (or NULL for a failed build) and clears pending; with no pending entry for the key the caller releases
+  *    the PSO.
+  * 2. In-flight shader compiles (dedupe). Several jobs often need the same VS or PS blob before any of them is back.

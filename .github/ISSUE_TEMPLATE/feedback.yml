@@ -1,0 +1,11 @@
+name: Feedback or question
+description: A question, a correction to the docs, or general feedback
+labels: [feedback, needs-triage]
+body:
+  - type: textarea
+    id: text
+    attributes:
+      label: Your question or feedback
+      description: "If a statement in the README or docs looks wrong or unverified, quote it here."
+    validations:
+      required: true

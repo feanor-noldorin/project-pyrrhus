@@ -1,0 +1,115 @@
+
+
+Rebased on ps3recomp v0.15.0: partly absorbed, PR290 registry list has no duplicate slots, atomic event_status kept, PR289 machine status taken.
+
+Rebased on ps3recomp v0.18.0 (partly upstream): every event_status raise/ack site takes #492's SPU_EVENT_SET/CLEAR; spu_event_raise/ack kept as wrappers on them; the SPURS ready-count/registry atomics and KZ3_SPU_RACE_OLD kept
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2198,7 +2198,13 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
+             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
+             int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
+-            if (*rdy) (*rdy)--;
++            /* KZ3 patch 1052: the PPU updates this guest byte atomically
++             * (cellSpursReadyCountStore/Swap/CompareAndSwap); a bare (*rdy)--
++             * could write back a stale count over a concurrent kick. */
++            if (spu_race_old()) { if (*rdy) (*rdy)--; }
++            else { u8 o = __atomic_load_n(rdy, __ATOMIC_ACQUIRE);
++              while (o && !__atomic_compare_exchange_n(rdy, &o, (u8)(o - 1), 0,
++                                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {} }
+             if (sig & (0x8000u >> wid))
+                 vm_write32(ea + SPURS_WKL_SIGNAL1,
+                            (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1239,7 +1239,7 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+     case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
+     case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
+     case SPU_RdSigNotify2:  return ctx->ch_sig_notify[1].count != 0;
+-    case SPU_RdEventStat:   return (ctx->event_status & ctx->event_mask) != 0;
++    case SPU_RdEventStat:   return (spu_event_load(ctx) & ctx->event_mask) != 0;
+     default:                return 1;   /* non-blocking channels: always ready */
+     }
+ }
+@@ -1402,7 +1402,7 @@ static u128 spu_rdch_impl(spu_context* ctx, uint32_t channel)
+         break;
+     }
+     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
+-    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = ctx->event_status; break;
++    case SPU_RdEventStat:   spu_resv_lost_poll(ctx); v = spu_event_load(ctx); break;
+     /* CBEA 9.8: numeric bit 0 is interrupt-enable, independent of run status.
+      * This runtime models nonisolated SPUs, so the isolation bit stays clear. */
+     case SPU_RdMachStat:    v = ctx->int_enable & 1u; break;
+@@ -1599,7 +1599,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+      * lost-reservation poll, so the two now agree by construction. */
+     case SPU_RdEventStat:
+         spu_resv_lost_poll(ctx);
+-        return (ctx->event_status & ctx->event_mask) != 0;
++        return (spu_event_load(ctx) & ctx->event_mask) != 0;
+     case MFC_RdTagStat:      return 1;  /* synchronous: status always ready */
+     /* Stall-and-notify status is a single-value channel: count is 1 while a
+      * newly-stalled tag is pending to be read, else 0. The wwsjob interrupt
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -455,6 +455,22 @@ typedef struct spu_context {
+ #define SPU_EVENT_CLEAR(c, b) __atomic_fetch_and(&(c)->event_status, ~(uint32_t)(b), __ATOMIC_SEQ_CST)
+ #endif
+ 
++/* KZ3 patch 1052: event_status raises and acks are atomic. Upstream #492 does the same with
++ * SPU_EVENT_SET / SPU_EVENT_CLEAR (taken at every site); these wrappers remain for KZ2 code. The
++ * ready-count and registry parts of 1052 keep KZ3_SPU_RACE_OLD=1 (pre-1052 bare writes, A/B only). */
++static inline int spu_race_old(void)
++{
++    static int s = -1;   /* per TU; read once */
++    if (s < 0) { const char* e = getenv("KZ3_SPU_RACE_OLD"); s = (e && *e == '1') ? 1 : 0; }
++    return s;
++}
++static inline void spu_event_raise(spu_context* ctx, uint32_t bits) { SPU_EVENT_SET(ctx, bits); }
++static inline void spu_event_ack(spu_context* ctx, uint32_t bits)   { SPU_EVENT_CLEAR(ctx, bits); }
++static inline uint32_t spu_event_load(const spu_context* ctx)
++{
++    return __atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE);
++}
++
+ /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
+  * base) that the HLE kernel plants as exitToKernelAddr / selectWorkloadAddr in
+  * the SpursKernelContext. A policy module branching to them is performing a
+@@ -1063,7 +1079,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+             if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
+             spu_task_launch_check((ctx), (void*)_tf);          \
+             if ((ctx)->int_enable &&                            \
+-                ((ctx)->event_status & (ctx)->event_mask))      \
++                (spu_event_load(ctx) & (ctx)->event_mask))      \
+                 _tf = spu_take_interrupt((ctx), _tf);          \
+             else if (__builtin_expect(g_spu_irqwait_diag != 0, 0) && \
+                      (ctx)->int_enable)                         \
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -1811,6 +1811,22 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
+ {
+     switch (channel) {
+     case MFC_RdTagStat:
++        /* KZ3 patch 1052: count "a list is parked at a stall-and-notify element,
++         * its stall is not yet read (list_stall_stat), but SN is not pending":
++         * nothing will ever resume that list (the lost-wakeup signature). With
++         * the atomic event_status writes it must stay 0; the count is printed
++         * at the first hits and every power of two (no env switch: one load and
++         * a test on a path that already reads the tag status). */
++        if (spu->list_stall_stat && (spu->list_stall_mask & spu->mfc_tag_mask) &&
++            !(spu_event_load(spu) & 0x2u)) {
++            static volatile unsigned long s_sn_lost;   /* per TU: spu_channels.c is the reader */
++            unsigned long n = ++s_sn_lost;
++            if (n <= 4 || (n & (n - 1)) == 0)
++                fprintf(stderr, "[sn-lost] n=%lu img=%d pc=0x%05X tagmask=0x%X parked=0x%X "
++                        "sstat=0x%X evstat=0x%X emask=0x%X\n", n, spu->image_id,
++                        spu->pc & SPU_LS_MASK, spu->mfc_tag_mask, spu->list_stall_mask,
++                        spu->list_stall_stat, spu_event_load(spu), spu->event_mask);
++        }
+         return spu->mfc_tag_status;
+     case MFC_RdTagMask:
+         return spu->mfc_tag_mask;

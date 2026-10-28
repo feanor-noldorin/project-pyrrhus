@@ -1,0 +1,34 @@
+KZ2 patch 7001: _cellSpursAttributeInitialize (NID 0x95180230) reads its arguments in the SDK order
+(attr, revision, sdkVersion, nSpus, spuPriority, ppuPriority, exitIfNoWork); the original handler took r4
+(revision, 2) as nSpus. KZ2 1.29: main instance nSpus 5, LowPriority 1, 0x9F7154 4.
+
+The SDK order (= upstream PR #310) is now the DEFAULT (measured 2.97 flips/s vs 1.81 with the
+old reading, no stuck lanes). KZ2_SPURS_NSPUS2=1 keeps the old reading (revision as nSpus, both instances nSpus=2)
+for A/B runs. KZ2_SPURS_ATTR_SDK is gone (ignored).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 7d47f61..f749b63 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -716,8 +716,17 @@ s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                   u32 sdkVersion, s32 nSpus, s32 spuPriority,
+                                   s32 ppuPriority, u8 exitIfNoWork)
+ {
+-    (void)revision;
+-    (void)sdkVersion;
++    /* KZ2 patch 7001: upstream PR #310 reads the SDK order above (KZ2: main instance nSpus 5,
++     * LowPriority 1) and that is the default; it measured 2.97 flips/s against 1.81 for the old reading
++     * (revision as nSpus, both instances 2). KZ2_SPURS_NSPUS2=1 restores the old reading for A/B runs. */
++    static int s_n2 = -1;
++    if (s_n2 < 0) { const char* e = getenv("KZ2_SPURS_NSPUS2"); s_n2 = (e && *e == '1') ? 1 : 0; }
++    if (s_n2) {
++        return cellSpursAttributeInitialize(attr, (s32)revision, (s32)sdkVersion,
++                                            nSpus, (u8)spuPriority);
++    }
++    printf("[cellSpurs] _AttributeInitialize(revision=%u sdk=0x%X nSpus=%d spuPrio=%d ppuPrio=%d exit=%u) [7001]\n",
++           revision, sdkVersion, nSpus, spuPriority, ppuPriority, (unsigned)exitIfNoWork);
+     return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
+                                         ppuPriority, exitIfNoWork);
+ }

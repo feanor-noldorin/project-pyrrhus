@@ -1,0 +1,286 @@
+KZ2 patch 6025 (diagnostic): lv2 mutex owner on a timed-out lock, mutexes held at thread exit, PS3_MUTEX_TRACE.
+
+Skipping Killzone 2's intro sometimes paused 17 to 34 s: the main thread's lock helper 0x9F6DB0 takes the movie
+stream's mutex with a 0x400000 us timeout and goes on without it when that times out; four to eight such locks timed
+out in a row (PS3_SCBLOCK_PROF: syscall 102 blocked 4194 ms, ret 0x8001000B, tid 1). This names the holder: a timed
+lock that gives up logs the owner thread and count; a thread that exits while it owns a mutex is logged (lv2 does not
+release it), each with the mutex's last eight operations (thread, op, guest lr); PS3_MUTEX_TRACE=<id> logs every lock, trylock, unlock and sys_cond_wait release/re-take of one mutex.
+First 24 lines of each kind; nothing else changes.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): sys_mutex.c taken as the patch side whole; upstream's sys_mutex.c changes are #474 (MUTEX_WATCH=2 reporter, POSIX only) and #490 (destroy EBUSY on a held mutex or waiters), the latter part of 6027's destroy rules
+
+diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
+--- a/runtime/syscalls/sys_cond.c
++++ b/runtime/syscalls/sys_cond.c
+@@ -153,6 +153,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     while (*tail) tail = &(*tail)->next;
+     *tail = &waiter;
+     int depth = m->lock_count;
++    { extern void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr);
++      sys_mutex_note(c->mutex_id, 'W', ctx->thread_id, (uint32_t)ctx->lr); }
++    { extern int sys_mutex_traced(uint32_t id);   /* KZ2 patch 6025: PS3_MUTEX_TRACE */
++      if (sys_mutex_traced(c->mutex_id))
++          fprintf(stderr, "[mutex-trace] cond_wait(cond %u, %llu us) releases %u by %llu lr 0x%08X depth %d\n",
++                  LV2_ARG_U32(ctx, 0), (unsigned long long)timeout, c->mutex_id, (unsigned long long)ctx->thread_id,
++                  (uint32_t)ctx->lr, depth); }
+     m->owner_tid = 0;
+     m->lock_count = 0;
+     for (int i = 0; i < depth; ++i) guest_unlock(m);
+@@ -203,6 +210,12 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+     m->owner_tid = ctx->thread_id;
+     m->lock_count = depth;
++    { extern void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr);
++      sys_mutex_note(c->mutex_id, 'R', ctx->thread_id, (uint32_t)ctx->lr); }
++    { extern int sys_mutex_traced(uint32_t id);   /* KZ2 patch 6025 */
++      if (sys_mutex_traced(c->mutex_id))
++          fprintf(stderr, "[mutex-trace] cond_wait re-took %u by %llu result 0x%08X\n", c->mutex_id,
++                  (unsigned long long)ctx->thread_id, (uint32_t)result); }
+     return result;
+ }
+ 
+diff --git a/runtime/syscalls/sys_mutex.c b/runtime/syscalls/sys_mutex.c
+--- a/runtime/syscalls/sys_mutex.c
++++ b/runtime/syscalls/sys_mutex.c
+@@ -8,10 +8,7 @@
+ #include "../memory/vm.h"
+ #include <string.h>
+ #include <stdio.h>
+-#include <stdlib.h>   /* getenv */
+-#ifndef _WIN32
+-#include <unistd.h>   /* sleep: MUTEX_WATCH=2 reporter */
+-#endif
++#include <stdlib.h>
+ 
+ /* ---------------------------------------------------------------------------
+  * Globals
+@@ -163,22 +160,6 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_ESRCH;
+     }
+ 
+-    /* lv2 refuses to destroy a mutex that is held or has waiters (EBUSY).
+-     * Destroying it anyway freed the host mutex under a thread blocked on it,
+-     * and the next sys_mutex_create in the same slot initialised a new one
+-     * over it: everyone else then used the new mutex and the blocked thread
+-     * waited on the dead one for good. */
+-    if (m->lock_count > 0 || __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST) > 0) {
+-        static int n = 0;
+-        if (n++ < 16)
+-            fprintf(stderr, "[mutex] destroy of mutex %u '%.8s' refused: owner tid=%llu "
+-                    "count=%d waiters=%d (EBUSY)\n", mutex_id, m->name,
+-                    (unsigned long long)m->owner_tid, m->lock_count,
+-                    __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST));
+-        mtx_table_unlock();
+-        return (int64_t)(int32_t)CELL_EBUSY;
+-    }
+-
+ #ifdef _WIN32
+     DeleteCriticalSection(&m->cs);
+     if (m->wait_handle) CloseHandle(m->wait_handle);
+@@ -197,58 +178,60 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
+  * r3 = mutex_id
+  * r4 = timeout_usec (0 = infinite)
+  * -----------------------------------------------------------------------*/
+-#ifndef _WIN32
+-/* MUTEX_WATCH=2 bookkeeping: who is blocked on which mutex since when. */
+-#define MUTEX_WATCH_SLOTS 64
+-static struct { volatile int used; uint64_t tid; uint32_t id, lr; struct timespec t0; }
+-    s_mw[MUTEX_WATCH_SLOTS];
+-
+-static void* mutex_watch_reporter(void* arg)
++/* KZ2 patch 6025 (diagnostic): name the owner when a timed lock gives up, and the mutexes a thread still owns when
++ * it exits (lv2 does not release them; a later timed lock then times out every time), with that mutex's last eight
++ * operations (thread, op, guest lr: the caller of the game's lock helper). First 24 of each. */
++static void mutex_name(const sys_mutex_info* m, char out[9]) { memcpy(out, m->name, 8); out[8] = 0; }
++typedef struct { uint32_t tid, lr; char op; } MutexOp;
++static MutexOp  s_mx_ring[SYS_MUTEX_MAX][8];
++static uint8_t  s_mx_ring_n[SYS_MUTEX_MAX];
++void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr)   /* L lock, T trylock, U unlock, W/R cond_wait */
+ {
+-    (void)arg;
+-    for (;;) {
+-        sleep(5);
+-        struct timespec now;
+-        clock_gettime(CLOCK_MONOTONIC, &now);
+-        for (int i = 0; i < MUTEX_WATCH_SLOTS; i++) {
+-            if (!s_mw[i].used) continue;
+-            long waited = (long)(now.tv_sec - s_mw[i].t0.tv_sec);
+-            if (waited < 5) continue;
+-            const sys_mutex_info* m = &g_sys_mutexes[s_mw[i].id - 1];
+-            fprintf(stderr, "[mutex] tid=%llu blocked %lds on mutex %u '%.8s' lr=0x%08X; "
+-                    "owner tid=%llu count=%d\n",
+-                    (unsigned long long)s_mw[i].tid, waited, s_mw[i].id, m->name,
+-                    s_mw[i].lr, (unsigned long long)m->owner_tid, m->lock_count);
+-        }
+-    }
+-    return NULL;
++    if (!id || id > SYS_MUTEX_MAX) return;
++    MutexOp* o = &s_mx_ring[id - 1][s_mx_ring_n[id - 1]++ & 7];
++    o->tid = (uint32_t)tid; o->lr = lr; o->op = op;
+ }
+-
+-static int mutex_watch_enter(uint64_t tid, uint32_t id, uint32_t lr)
++static void mutex_ring_print(uint32_t id)
+ {
+-    static int started = 0;
+-    if (!__atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) {
+-        pthread_t t;
+-        if (pthread_create(&t, NULL, mutex_watch_reporter, NULL) == 0) pthread_detach(t);
++    char b[400]; int n = 0;
++    for (int k = 0; k < 8; k++) {
++        const MutexOp* o = &s_mx_ring[id - 1][(s_mx_ring_n[id - 1] + k) & 7];
++        if (o->op) n += snprintf(b + n, sizeof b - (size_t)n, " %c:%u@%08X", o->op, o->tid, o->lr);
+     }
+-    for (int i = 0; i < MUTEX_WATCH_SLOTS; i++) {
+-        int expected = 0;
+-        if (__atomic_compare_exchange_n(&s_mw[i].used, &expected, 2, 0,
+-                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+-            s_mw[i].tid = tid; s_mw[i].id = id; s_mw[i].lr = lr;
+-            clock_gettime(CLOCK_MONOTONIC, &s_mw[i].t0);
+-            __atomic_store_n(&s_mw[i].used, 1, __ATOMIC_SEQ_CST);
+-            return i;
++    fprintf(stderr, "[mutex] %u last ops (oldest first):%s\n", id, b);
++}
++void sys_mutex_report_owned(uint64_t tid)
++{
++    static int said = 0;
++    for (int i = 0; i < SYS_MUTEX_MAX && said < 24; i++) {
++        const sys_mutex_info* m = &g_sys_mutexes[i];
++        if (m->active && m->lock_count > 0 && m->owner_tid == tid) {
++            char n[9]; mutex_name(m, n); said++;
++            fprintf(stderr, "[mutex] thread %llu exits holding mutex %d '%s' (count %d)\n", (unsigned long long)tid,
++                    i + 1, n, m->lock_count);
++            mutex_ring_print((uint32_t)(i + 1));
+         }
+     }
+-    return -1;
++}
++static void mutex_timeout_log(const sys_mutex_info* m, uint32_t id, const ppu_context* ctx, uint64_t timeout_us)
++{
++    static int said = 0;
++    if (said < 24) {
++        char n[9]; mutex_name(m, n); said++;
++        fprintf(stderr, "[mutex] lock(%u '%s', %llu us) timed out in thread %llu (lr 0x%08X): owner thread %llu, count %d\n",
++                id, n, (unsigned long long)timeout_us, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr,
++                (unsigned long long)m->owner_tid, m->lock_count);
++        if (said <= 2) mutex_ring_print(id);
++    }
+ }
+ 
+-static void mutex_watch_leave(int slot)
++/* PS3_MUTEX_TRACE=<id>: every lock, trylock, unlock (and sys_cond_wait's release and re-take) of that mutex. */
++int sys_mutex_traced(uint32_t id)
+ {
+-    if (slot >= 0) __atomic_store_n(&s_mw[slot].used, 0, __ATOMIC_SEQ_CST);
++    static long t = -1;
++    if (t < 0) { const char* e = getenv("PS3_MUTEX_TRACE"); t = e ? strtol(e, NULL, 0) : 0; }
++    return t && (uint32_t)t == id;
+ }
+-#endif
+ 
+ int64_t sys_mutex_lock(ppu_context* ctx)
+ {
+@@ -268,7 +251,6 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_EDEADLK;
+     }
+ 
+-    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);   /* see sys_mutex_destroy */
+ #ifdef _WIN32
+     if (timeout_us == 0) {
+         /* Infinite wait */
+@@ -284,7 +266,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+         int64_t deadline = lv2_usec_deadline(timeout_us);
+         while (!TryEnterCriticalSection(&m->cs)) {
+             if (lv2_deadline_passed(deadline)) {
+-                __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
++                mutex_timeout_log(m, mutex_id, ctx, timeout_us);   /* KZ2 patch 6025 */
+                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
+             }
+             if (timeout_us < 1000) SwitchToThread();
+@@ -292,32 +274,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+         }
+     }
+ #else
+-    static int s_watch = -1;
+-    if (s_watch < 0) { const char* e = getenv("MUTEX_WATCH"); s_watch = e ? atoi(e) : 0; }
+-    if (timeout_us == 0 && s_watch == 2) {
+-        /* MUTEX_WATCH=2: the wait stays a real blocking lock (the polling of
+-         * =1 changes the timing enough to hide some hangs), and a reporter
+-         * thread names every waiter older than 5 s and the mutex's owner. */
+-        int slot = mutex_watch_enter(caller_tid, mutex_id, (uint32_t)ctx->lr);
+-        pthread_mutex_lock(&m->mtx);
+-        mutex_watch_leave(slot);
+-    } else if (timeout_us == 0 && s_watch) {
+-        /* MUTEX_WATCH=1: an infinite lock waits in 5 s slices and says who it
+-         * is waiting on, so a guest deadlock names its two threads. */
+-        unsigned waited = 0;
+-        for (;;) {
+-            struct timespec ts;
+-            clock_gettime(CLOCK_REALTIME, &ts);
+-            ts.tv_sec += 5;
+-            if (pthread_mutex_timedlock(&m->mtx, &ts) == 0) break;
+-            waited += 5;
+-            fprintf(stderr, "[mutex] tid=%llu waiting %us on mutex %u '%.8s' "
+-                    "owner tid=%llu count=%u lr=0x%08X\n",
+-                    (unsigned long long)caller_tid, waited, mutex_id, m->name,
+-                    (unsigned long long)m->owner_tid, (unsigned)m->lock_count,
+-                    (uint32_t)ctx->lr);
+-        }
+-    } else if (timeout_us == 0) {
++    if (timeout_us == 0) {
+         pthread_mutex_lock(&m->mtx);
+     } else {
+         struct timespec ts;
+@@ -330,15 +287,17 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+         }
+         int rc = pthread_mutex_timedlock(&m->mtx, &ts);
+         if (rc == ETIMEDOUT) {
+-            __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+             return (int64_t)(int32_t)CELL_ETIMEDOUT;
+         }
+     }
+ #endif
+-    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+ 
+     m->owner_tid = caller_tid;
+     m->lock_count++;
++    sys_mutex_note(mutex_id, 'L', caller_tid, (uint32_t)ctx->lr);
++    if (sys_mutex_traced(mutex_id))
++        fprintf(stderr, "[mutex-trace] lock %u by %llu lr 0x%08X count %d\n", mutex_id, (unsigned long long)caller_tid,
++                (uint32_t)ctx->lr, m->lock_count);
+     return CELL_OK;
+ }
+ 
+@@ -400,6 +359,10 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
+ 
+     m->owner_tid = caller_tid;
+     m->lock_count++;
++    sys_mutex_note(mutex_id, 'T', caller_tid, (uint32_t)ctx->lr);
++    if (sys_mutex_traced(mutex_id))
++        fprintf(stderr, "[mutex-trace] trylock %u by %llu lr 0x%08X count %d\n", mutex_id, (unsigned long long)caller_tid,
++                (uint32_t)ctx->lr, m->lock_count);
+     return CELL_OK;
+ }
+ 
+@@ -421,6 +384,10 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
+ 
+     uint64_t caller_tid = ctx->thread_id;
+ 
++    if (sys_mutex_traced(mutex_id))
++        fprintf(stderr, "[mutex-trace] unlock %u by %llu lr 0x%08X (owner %llu count %d)\n", mutex_id,
++                (unsigned long long)caller_tid, (uint32_t)ctx->lr, (unsigned long long)m->owner_tid, m->lock_count);
++    sys_mutex_note(mutex_id, m->owner_tid == caller_tid ? 'U' : 'u', caller_tid, (uint32_t)ctx->lr);
+     if (m->owner_tid != caller_tid) {
+         /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
+          * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -637,6 +637,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
+     uint64_t tid = ctx->thread_id;
+     fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
+             (unsigned long long)tid, (unsigned long long)status);
++    { extern void sys_mutex_report_owned(uint64_t tid); sys_mutex_report_owned(tid); }   /* KZ2 patch 6025 */
+ 
+     table_lock();
+     ppu_thread_info* t = find_thread(tid);

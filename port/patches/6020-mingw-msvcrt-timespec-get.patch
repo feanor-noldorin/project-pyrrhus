@@ -1,0 +1,77 @@
+MinGW on msvcrt: timespec_get / TIME_UTC for SPU_INTERP_STATS (spu_interp.c) and SPU_JOBPROF (spu_workload.c).
+
+Symptom: ps3recomp v0.17.0 (a6d76c8) does not build for Killzone 2 (remote build): spu_interp.c:520
+"implicit declaration of function 'timespec_get'" and "'TIME_UTC' undeclared" (upstream c08d1d8 moved
+SPU_INTERP_STATS to timespec_get; spu_workload.c's SPU_JOBPROF uses it too). Cause: KZ2's MinGW-w64 gcc targets
+msvcrt (__MSVCRT_VERSION__ 0x600, no _UCRT), whose <time.h> has no C11 timespec_get; the UCRT has it. Fix: a small
+header, runtime/platform/mingw_timespec_get.h, included by both files after <time.h> (and after <windows.h> in
+spu_workload.c): on msvcrt MinGW only, TIME_UTC and a timespec_get from QueryPerformanceCounter (monotonic, not UTC;
+both callers only subtract two readings). Other toolchains are unchanged. Upstream candidate (general).
+Verification: x86_64-w64-mingw32-gcc -fsyntax-only on both files; the remote build of kz2.exe.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): both sides kept
+
+diff --git a/runtime/platform/mingw_timespec_get.h b/runtime/platform/mingw_timespec_get.h
+new file mode 100644
+index 0000000..1fa2c84
+--- /dev/null
++++ b/runtime/platform/mingw_timespec_get.h
+@@ -0,0 +1,34 @@
++/* C11 timespec_get for MinGW-w64 on msvcrt. The UCRT has timespec_get and TIME_UTC; msvcrt.dll does not, and
++ * MinGW's <time.h> declares neither there, so SPU_INTERP_STATS (spu_interp.c) and SPU_JOBPROF (spu_workload.c) did
++ * not compile. Both only subtract two readings, so this returns QueryPerformanceCounter time (monotonic, not UTC).
++ * Include after <time.h> and, if the file uses it, after <windows.h>. */
++#ifndef PS3RECOMP_MINGW_TIMESPEC_GET_H
++#define PS3RECOMP_MINGW_TIMESPEC_GET_H
++#include <time.h>
++#if defined(__MINGW32__) && !defined(_UCRT) && !defined(TIME_UTC)
++#define TIME_UTC 1
++#ifdef _WINDOWS_   /* <windows.h> is in: use its prototypes */
++static inline long long ps3_tsg_counter(long long* freq)
++{
++    LARGE_INTEGER c, f; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
++    *freq = f.QuadPart; return c.QuadPart;
++}
++#else
++__declspec(dllimport) int __stdcall QueryPerformanceCounter(long long* c);
++__declspec(dllimport) int __stdcall QueryPerformanceFrequency(long long* f);
++static inline long long ps3_tsg_counter(long long* freq)
++{
++    long long c; QueryPerformanceFrequency(freq); QueryPerformanceCounter(&c); return c;
++}
++#endif
++static inline int ps3_timespec_get(struct timespec* ts, int base)
++{
++    long long f = 1, c = ps3_tsg_counter(&f);
++    if (f <= 0) f = 1;
++    ts->tv_sec = (time_t)(c / f);
++    ts->tv_nsec = (long)((c % f) * 1000000000LL / f);
++    return base;
++}
++#define timespec_get ps3_timespec_get
++#endif
++#endif
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 72f78cb..c70aee0 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -10,6 +10,7 @@
+ #include "spu_helpers.h"
+ #include <stdio.h>
+ #include <stdlib.h>
++#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW (SPU_INTERP_STATS) */
+ 
+ /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
+  * into each generated spu_recomp.h — declared here to stay header-independent. */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 7bd2503..3ea4450 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -24,6 +24,7 @@
+ 
+ static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
+                                      uint32_t owner_ea);   /* below */
++#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW (SPU_JOBPROF) */
+ 
+ /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
+  * real video-payload GET (>256B from a non-context EA) = it actually decoded,

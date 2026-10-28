@@ -1,0 +1,26 @@
+# Adapted from Project Helghast (the Killzone 3 PC port, same author, MIT).
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{c,h,cpp,py,sh,nix}]
+indent_style = space
+indent_size = 4
+
+[*.{nix,yml,yaml,json}]
+indent_size = 2
+
+[*.iss]
+indent_style = space
+indent_size = 2
+
+[*.patch]
+trim_trailing_whitespace = false
+
+[tools/release/licence-texts/*]
+trim_trailing_whitespace = false
+insert_final_newline = false

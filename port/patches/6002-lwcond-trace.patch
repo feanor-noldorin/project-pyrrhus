@@ -1,0 +1,74 @@
+ppu_sysprx: PS3_LWCOND_TRACE=<ea>[,...]|all logs sys_lwcond wait/wakeup/signal/signal_all/signal_to with thread, lr and
+waiter count (FIOS op wait that never wakes). Diagnostic only, off by default.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -442,6 +442,28 @@ static void sys_lwcond_create(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
++/* KZ2 patch 6002: PS3_LWCOND_TRACE=<ea>[,<ea>...] (or "all") logs every wait, wakeup and signal on those lwconds with
++ * the guest thread, its lr and the waiter count, to find a lost or misdirected wakeup. Off by default. */
++static int lwc_traced(uint32_t lwcond)
++{
++    static const char* e = (const char*)-1;
++    if (e == (const char*)-1) e = getenv("PS3_LWCOND_TRACE");
++    if (!e || !*e) return 0;
++    if (!strcmp(e, "all")) return 1;
++    for (const char* q = e; *q; ) {
++        char* end; unsigned long v = strtoul(q, &end, 0);
++        if (end == q) break;
++        if ((uint32_t)v == lwcond) return 1;
++        q = end; while (*q == ',' || *q == ' ') q++;
++    }
++    return 0;
++}
++static void lwc_trace(const char* what, uint32_t lwcond, ppu_context* ctx, long waiters, uint32_t arg)
++{
++    if (!lwc_traced(lwcond)) return;
++    fprintf(stderr, "[LWC] %s ea=0x%08X tid=%llu lr=0x%08X waiters=%ld arg=0x%X\n", what, lwcond,
++            ctx ? (unsigned long long)ctx->thread_id : 0ull, ctx ? (uint32_t)ctx->lr : 0u, waiters, arg);
++}
+ static void lwcond_wake(uint32_t lwcond, int all)
+ {
+ #ifdef _WIN32
+@@ -464,16 +486,25 @@ static void lwcond_wake(uint32_t lwcond, int all)
+     (void)lwcond; (void)all;
+ #endif
+ }
+-static void sys_lwcond_signal(ppu_context* ctx)     { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { lwcond_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
++#ifdef _WIN32
++#define LWC_WAITERS(ea) (lwc_slot(ea) ? lwc_slot(ea)->waiters : -1L)
++#else
++#define LWC_WAITERS(ea) (-1L)
++#endif
++static void sys_lwcond_signal(ppu_context* ctx)     { lwc_trace("signal", (uint32_t)ctx->gpr[3], ctx, LWC_WAITERS((uint32_t)ctx->gpr[3]), 0);
++                                                      lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_trace("signal_all", (uint32_t)ctx->gpr[3], ctx, LWC_WAITERS((uint32_t)ctx->gpr[3]), 0);
++                                                      lwcond_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
+ /* signal_to(lwcond, ppu_thread_id): wakes one waiter; which one is not modelled. */
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_trace("signal_to", (uint32_t)ctx->gpr[3], ctx, LWC_WAITERS((uint32_t)ctx->gpr[3]), (uint32_t)ctx->gpr[4]);
++                                                      lwcond_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+     uint64_t timeout_us = ctx->gpr[4];
+     uint32_t lwmutex = vm_read32(lwcond + LWC_MUTEX);
+     uint32_t result = 0;
++    lwc_trace("wait", lwcond, ctx, LWC_WAITERS(lwcond), (uint32_t)timeout_us);
+ #ifdef _WIN32
+     struct LwmSlot* ms = lwm_slot(lwmutex);
+     struct LwcSlot* sl = lwc_slot(lwcond);
+@@ -504,6 +535,7 @@ static void sys_lwcond_wait(ppu_context* ctx)
+         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+     }
+ #endif
++    lwc_trace(result ? "timeout" : "woke", lwcond, ctx, LWC_WAITERS(lwcond), result);
+     ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+ }
+ 

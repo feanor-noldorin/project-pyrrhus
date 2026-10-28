@@ -1,0 +1,240 @@
+KZ2 patch 2121: a D3D12 WARP fallback, so kz2.exe starts on a machine with no GPU (the Windows VM
+installer test). from Killzone 3 PC port patch 2099 (2099-mouse-sensitivity-look-accumulator-d3d12-warp.patch, its
+D3D12 part only: rsx_d3d12_device.h and the two device sites; same author, MIT). The mouse part of KZ3's 2099 is not
+taken.
+libs/video/rsx_d3d12_device.h (new): rsx_d3d12_create_device: the default adapter as before, WARP
+(IDXGIFactory4::EnumWarpAdapter) only when that gives no device, RSX_D3D12_WARP=1 forces WARP, =0 never; one
+"[d3d12] device" line per device (adapter, vendor, device, flags, software, max feature level, binding tier, highest
+shader model).
+KZ2 change for KZ3's VM finding (the WARP adapter "Microsoft Basic Render Driver" reported software=0, its
+DXGI_ADAPTER_FLAG_SOFTWARE missing): rsx_adapter_is_software() also knows it by vendor 0x1414 / device 0x008C. The
+backend's high-performance adapter loop skips it (so it is never taken as the hardware adapter), and the log line
+says software=1 for it.
+rsx_d3d12_backend.c and rsx_live_draw.c create their device through it. The hardware path is unchanged: a GPU
+adapter is picked by the same loop and the same D3D12CreateDevice(NULL) as before. Host test
+tools/runtime/test_d3d12_warp.sh. KZ2 test value RSX_D3D12_WARP=fail: no device at all, for the no-device exit of
+port/kz2/main.cpp under Proton (whose DXGI always answers with the hardware adapter).
+
+diff -ruN a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c	2026-10-27 17:27:15.202297218 -0500
++++ b/libs/video/rsx_d3d12_backend.c	2026-10-27 18:16:52.596799665 -0500
+@@ -704,6 +704,8 @@
+  * D3D12 initialization
+  * -----------------------------------------------------------------------*/
+ 
++#include "rsx_d3d12_device.h"   /* KZ2 patch 2121 (from KZ3 2099): WARP fallback */
++
+ /* D3D12_VSYNC=0: present without waiting for the vblank, for measuring a title
+  * past the display's rate. Read once. */
+ static int d3d12_vsync_off(void)
+@@ -755,7 +757,8 @@
+      * (for A/B testing a suspected iGPU-driver stall). */
+     {
+         IDXGIFactory6* factory6 = NULL;
+-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
++        if (rsx_warp_try_hw(rsx_warp_mode_parse(getenv("RSX_D3D12_WARP"), NULL)) &&   /* patch 2121 */
++            SUCCEEDED(factory->lpVtbl->QueryInterface(
+                 factory, &IID_IDXGIFactory6, (void**)&factory6))) {
+             DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
+                 ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
+@@ -766,12 +769,14 @@
+                      != DXGI_ERROR_NOT_FOUND; ai++) {
+                 DXGI_ADAPTER_DESC1 ad;
+                 adapter->lpVtbl->GetDesc1(adapter, &ad);
+-                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
++                /* patch 2121: the Basic Render Driver (WARP) is software even when its flag is missing */
++                if (!rsx_adapter_is_software((ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0, ad.VendorId, ad.DeviceId) &&
+                     SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
+                         D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
+                         (void**)&s_d3d.device))) {
+                     printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
+                            (unsigned long long)(ad.DedicatedVideoMemory >> 20));
++                    rsx_d3d12_log_device(s_d3d.device, factory, "d3d12 backend", "high-performance adapter");
+                     adapter->lpVtbl->Release(adapter);
+                     break;
+                 }
+@@ -782,14 +787,12 @@
+         }
+     }
+     if (!s_d3d.device) {
+-        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
+-                               &IID_ID3D12Device, (void**)&s_d3d.device);
+-        if (FAILED(hr)) {
+-            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
++        /* patch 2121: the default adapter, then WARP (RSX_D3D12_WARP; rsx_d3d12_device.h) */
++        if (rsx_d3d12_create_device(factory, &s_d3d.device, "d3d12 backend") < 0) {
++            printf("[D3D12] ERROR: no D3D12 device\n");
+             factory->lpVtbl->Release(factory);
+             return -1;
+         }
+-        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+     }
+ 
+     /* Create command queue */
+diff -ruN a/libs/video/rsx_d3d12_device.h b/libs/video/rsx_d3d12_device.h
+--- a/libs/video/rsx_d3d12_device.h	1969-12-31 18:00:00.000000000 -0600
++++ b/libs/video/rsx_d3d12_device.h	2026-10-27 18:16:52.594620412 -0500
+@@ -0,0 +1,142 @@
++/* KZ2 patch 2121: D3D12 device creation with a WARP fallback, so the exe starts on a machine with no GPU (a Windows
++ * VM). From Killzone 3 PC port patch 2099 (rsx_d3d12_device.h; same author, MIT): the default adapter as before, the
++ * WARP adapter (IDXGIFactory4::EnumWarpAdapter, Microsoft's software rasteriser) only when that gives no device;
++ * RSX_D3D12_WARP=1 forces WARP (tests), RSX_D3D12_WARP=0 never uses it (the old failure).
++ *
++ * KZ2 change (KZ3's VM finding): the WARP adapter, "Microsoft Basic Render Driver" (vendor 0x1414, device 0x008C),
++ * reported DXGI_ADAPTER_DESC1.Flags without DXGI_ADAPTER_FLAG_SOFTWARE (software=0) in KZ3's Windows VM, so a test of
++ * the flag alone takes it for hardware. rsx_adapter_is_software() also knows it by its ids: the backend's
++ * high-performance adapter loop skips it (a hardware adapter is picked as before; with none, the default adapter, then
++ * WARP), and the "[d3d12] device" line says software=1 for it whichever way it was reached.
++ *
++ * The hardware path is unchanged: on a machine with a GPU the backend's loop and the live renderer's
++ * D3D12CreateDevice(NULL) pick the same adapter as before (only the log line is new).
++ *
++ * What the renderer needs from a device (KZ3 an earlier change, same lineage): feature level 11_0, FXC SM 5.0 bytecode,
++ * root signature 1.0, typed UAV stores only; optional features are queried by ld_caps_init / the pipeline library.
++ * WARP covers FL 12_1 and binding tier 3, so nothing degrades beyond speed.
++ *
++ * Pure part first (host test tools/runtime/test_d3d12_warp.sh); the Windows part needs d3d12.h and dxgi1_4.h. */
++#ifndef RSX_D3D12_DEVICE_H
++#define RSX_D3D12_DEVICE_H
++
++#include <stdio.h>
++#include <string.h>
++
++enum { RSX_WARP_AUTO = 0, RSX_WARP_FORCE = 1, RSX_WARP_NEVER = 2, RSX_WARP_FAIL = 3 };
++
++/* RSX_D3D12_WARP: unset/empty = auto (hardware, WARP only when no hardware device), "1" = WARP only, "0" = never,
++ * "fail" = no device at all (KZ2 test of the no-device exit under Proton, whose DXGI always has an adapter).
++ * Anything else = auto, *bad = 1. */
++static inline int rsx_warp_mode_parse(const char* e, int* bad)
++{
++    if (bad) *bad = 0;
++    if (!e || !*e) return RSX_WARP_AUTO;
++    if (e[0] == '1' && !e[1]) return RSX_WARP_FORCE;
++    if (e[0] == '0' && !e[1]) return RSX_WARP_NEVER;
++    if (!strcmp(e, "fail")) return RSX_WARP_FAIL;
++    if (bad) *bad = 1;
++    return RSX_WARP_AUTO;
++}
++static inline int rsx_warp_try_hw(int mode) { return mode == RSX_WARP_AUTO || mode == RSX_WARP_NEVER; }
++static inline int rsx_warp_try_warp(int mode, int hw_ok) { return mode == RSX_WARP_FORCE || (mode == RSX_WARP_AUTO && !hw_ok); }
++
++/* Microsoft Basic Render Driver: the WARP adapter's ids (the same on every Windows 8+ machine). */
++#define RSX_WARP_VENDOR 0x1414u
++#define RSX_WARP_DEVICE 0x008Cu
++/* 1 when an adapter is a software rasteriser: DXGI's flag, or the Basic Render Driver's ids (flag missing, KZ3 VM). */
++static inline int rsx_adapter_is_software(int flag_software, unsigned vendor, unsigned device)
++{
++    return flag_software || (vendor == RSX_WARP_VENDOR && device == RSX_WARP_DEVICE);
++}
++
++#ifdef _WIN32
++#include <stdlib.h>
++
++/* One "[d3d12] device" line: who, how it was made, the adapter and the capabilities that matter. -> 1 software,
++ * 0 hardware, -1 unknown (adapter not found by its LUID). */
++static int rsx_d3d12_log_device(ID3D12Device* dev, IDXGIFactory4* f, const char* who, const char* how)
++{
++    char name[256] = "?";
++    unsigned vendor = 0, device = 0, flags = 0;
++    int software = -1;
++    unsigned long long vram = 0;
++    LUID luid = {0, 0};
++    dev->lpVtbl->GetAdapterLuid(dev, &luid);   /* MinGW's C binding: the struct return is an out pointer */
++    IDXGIAdapter1* ad = NULL;
++    if (f && SUCCEEDED(f->lpVtbl->EnumAdapterByLuid(f, luid, &IID_IDXGIAdapter1, (void**)&ad)) && ad) {
++        DXGI_ADAPTER_DESC1 d;
++        if (SUCCEEDED(ad->lpVtbl->GetDesc1(ad, &d))) {
++            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, (int)sizeof name, NULL, NULL);
++            vendor = d.VendorId; device = d.DeviceId; flags = d.Flags;
++            software = rsx_adapter_is_software((d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0, vendor, device);
++            vram = (unsigned long long)d.DedicatedVideoMemory;
++        }
++        ad->lpVtbl->Release(ad);
++    }
++    static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_12_0,
++                                               D3D_FEATURE_LEVEL_12_1};
++    D3D12_FEATURE_DATA_FEATURE_LEVELS fl;
++    memset(&fl, 0, sizeof fl);
++    fl.NumFeatureLevels = (UINT)(sizeof levels / sizeof levels[0]);
++    fl.pFeatureLevelsRequested = levels;
++    const int have_fl = SUCCEEDED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof fl));
++    D3D12_FEATURE_DATA_D3D12_OPTIONS o;
++    memset(&o, 0, sizeof o);
++    const int have_o = SUCCEEDED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof o));
++    D3D12_FEATURE_DATA_SHADER_MODEL sm;
++    sm.HighestShaderModel = (D3D_SHADER_MODEL)0x60;   /* 6_0; the answer is the highest one up to the request */
++    if (FAILED(dev->lpVtbl->CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_MODEL, &sm, sizeof sm)))
++        sm.HighestShaderModel = (D3D_SHADER_MODEL)0x51;   /* runtimes that predate SM 6 know 5_1 */
++    fprintf(stderr, "[d3d12] device (%s, %s): adapter \"%s\" vendor=0x%04X device=0x%04X flags=0x%X software=%d "
++                    "vram=%llu MB max-fl=0x%X binding-tier=%d typed-uav-load-x=%d highest-sm=0x%X (needs: fl 11_0, sm 5.0)\n",
++            who, how, name, vendor, device, flags, software, vram >> 20,
++            have_fl ? (unsigned)fl.MaxSupportedFeatureLevel : 0u, have_o ? (int)o.ResourceBindingTier : -1,
++            have_o ? (int)o.TypedUAVLoadAdditionalFormats : -1, (unsigned)sm.HighestShaderModel);
++    return software;
++}
++
++/* The device by the RSX_D3D12_WARP rule (above). -> 0 = the default adapter, 1 = WARP, -1 = no device. */
++static int rsx_d3d12_create_device(IDXGIFactory4* f, ID3D12Device** out, const char* who)
++{
++    *out = NULL;
++    int bad = 0;
++    const int mode = rsx_warp_mode_parse(getenv("RSX_D3D12_WARP"), &bad);
++    if (bad) fprintf(stderr, "[d3d12] RSX_D3D12_WARP=%s not understood (1 = WARP only, 0 = never, fail = none): auto\n", getenv("RSX_D3D12_WARP"));
++    if (mode == RSX_WARP_FAIL) { fprintf(stderr, "[d3d12] RSX_D3D12_WARP=fail: no D3D12 device (test)\n"); return -1; }
++    if (rsx_warp_try_hw(mode)) {
++        HRESULT hw = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
++        if (SUCCEEDED(hw) && *out) {
++            if (rsx_d3d12_log_device(*out, f, who, "default adapter") == 1)
++                fprintf(stderr, "[d3d12] the default adapter is a software rasteriser (no GPU driver): expect a few fps\n");
++            return 0;
++        }
++        *out = NULL;
++        fprintf(stderr, "[d3d12] D3D12CreateDevice on the default adapter failed (hr=0x%08lX)%s\n", (unsigned long)hw,
++                mode == RSX_WARP_NEVER ? "; RSX_D3D12_WARP=0: no WARP fallback" : "; trying WARP");
++    }
++    if (!rsx_warp_try_warp(mode, 0)) return -1;
++    IDXGIAdapter* warp = NULL;
++    HRESULT hr = f ? f->lpVtbl->EnumWarpAdapter(f, &IID_IDXGIAdapter, (void**)&warp) : E_POINTER;
++    if (FAILED(hr) || !warp) {
++        fprintf(stderr, "[d3d12] ERROR: EnumWarpAdapter failed (hr=0x%08lX): no D3D12 device\n", (unsigned long)hr);
++        return -1;
++    }
++    hr = D3D12CreateDevice((IUnknown*)warp, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)out);
++    warp->lpVtbl->Release(warp);
++    if (FAILED(hr) || !*out) {
++        *out = NULL;
++        fprintf(stderr, "[d3d12] ERROR: D3D12CreateDevice on WARP failed (hr=0x%08lX): no D3D12 device\n", (unsigned long)hr);
++        return -1;
++    }
++    const int sw = rsx_d3d12_log_device(*out, f, who, mode == RSX_WARP_FORCE ? "WARP, forced" : "WARP, fallback");
++    if (sw == 0)   /* vkd3d-proton's DXGI answers EnumWarpAdapter with a hardware adapter */
++        fprintf(stderr, "[d3d12] WARP requested (%s) but EnumWarpAdapter gave a hardware adapter (Proton has no "
++                        "WARP): this run is not a WARP test\n", mode == RSX_WARP_FORCE ? "RSX_D3D12_WARP=1" : "fallback");
++    else
++        fprintf(stderr, "[d3d12] WARP (software rasteriser) in use: %s; expect a few fps\n",
++                mode == RSX_WARP_FORCE ? "RSX_D3D12_WARP=1" : "no hardware D3D12 device");
++    return 1;
++}
++#endif /* _WIN32 */
++#endif
+diff -ruN a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c	2026-10-27 17:27:15.208297351 -0500
++++ b/libs/video/rsx_live_draw.c	2026-10-27 17:28:01.067318921 -0500
+@@ -216,6 +216,7 @@
+ #include "rsx_gpupass.h"        /* patch 2086 */
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2091 (KZ3 2039): keycap prompts */
++#include "rsx_d3d12_device.h"   /* patch 2121 (KZ3 2099): WARP fallback */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -15365,7 +15366,8 @@
+     ld_enable_dred();
+     IDXGIFactory4* factory = NULL;
+     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) return -1;
+-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
++    /* patch 2121: the default adapter as before; WARP only when it gives no device or RSX_D3D12_WARP=1 */
++    if (rsx_d3d12_create_device(factory, &g.dev, "live renderer") < 0) {
+         factory->lpVtbl->Release(factory); return -1;
+     }
+ #if defined(YZ_PERF_PROFILE)

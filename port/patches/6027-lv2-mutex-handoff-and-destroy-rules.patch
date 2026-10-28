@@ -1,0 +1,965 @@
+KZ2 patch 6027: lv2 mutex semantics (guest-thread ownership, hand-off at unlock and cond signal, lv2 destroy rules).
+
+After R&C patch 7007 (rc-an earlier change; Ratchet & Clank PC port, same owner, MIT), ported onto KZ2's tree with
+patch 6025's diagnostics kept. Behaviour as RPCS3's lv2_mutex / lv2_cond (read, not copied).
+The mutex was a host CRITICAL_SECTION (pthread mutex) per slot, owned by a HOST thread, beside bookkeeping
+(owner_tid, lock_count) keyed by the GUEST thread id; sys_cond_wait re-locked it itself after the wake and destroy
+deleted it whatever its state. Now the mutex is the bookkeeping: owner / count / FIFO of waiters under a short host
+lock. unlock hands it to the first queued locker; a cond signal hands it to the woken waiter (or queues the waiter on
+the mutex when it is owned); a timed-out cond_wait queues like a locker and returns ETIMEDOUT once it owns the mutex
+again; destroy is ESRCH, then EBUSY while owned, then EPERM while a cond is bound (cond create/destroy count the
+binding); create checks its attribute (EFAULT, EINVAL); trylock by the owner of a non-recursive mutex is EDEADLK;
+sys_cond_signal_to wakes only the named thread (EPERM if it does not wait); slots are allocated next-fit and their
+host locks are never destroyed.
+Killzone 2 (the RE notes earlier change): not the cause of the intro-skip pause (that was the shared guest-call stack,
+patch 6028; with this patch alone the pause still came in 3 of 6 runs); kept as lv2 semantics, host-tested.
+Patch 6025's diagnostics stay and grow: the ring keeps 16 operations with the host thread and owner.count after each
+(ops L T t E X U u W R C D d), and a timed-out lock or a thread exiting with a mutex prints the outer locker of the
+current ownership with its guest call chain ("owned since").
+ASSUMPTION: FIFO hand-off for every protocol (lv2 orders SYS_SYNC_PRIORITY waiters by thread priority).
+Host test: tools/runtime/test_lv2_mutex.sh. Upstream candidate (with R&C).
+
+Rebased on ps3recomp v0.18.0 (hand-merged): sys_cond.c and sys_mutex.h taken as the patch side whole (upstream #474 is POSIX-only; #490's destroy rule is covered by 6027); the opt-in PS3_PRIO_START note_block in sys_mutex is not carried
+
+diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
+--- a/runtime/syscalls/sys_cond.c
++++ b/runtime/syscalls/sys_cond.c
+@@ -6,7 +6,6 @@
+  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
+  */
+ #include "sys_cond.h"
+-#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
+ #include "../memory/vm.h"
+ #include <string.h>
+ #include <stdlib.h>
+@@ -15,6 +14,7 @@
+ struct sys_cond_waiter {
+     struct sys_cond_waiter* next;
+     int signalled;
++    lv2_mtx_waiter mw;   /* KZ2 patch 6027: the mutex hand-off record a signal gives or queues */
+ };
+ 
+ sys_cond_info g_sys_conds[SYS_COND_MAX];
+@@ -27,8 +27,6 @@ static void table_unlock(void) { ReleaseSRWLockExclusive(&s_table_lock); }
+ static void cond_lock(sys_cond_info* c) { EnterCriticalSection(&c->signal_lock); }
+ static void cond_unlock(sys_cond_info* c) { LeaveCriticalSection(&c->signal_lock); }
+ static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
+-static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
+-static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
+ #else
+ static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
+ static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
+@@ -36,12 +34,14 @@ static void table_unlock(void) { pthread_mutex_unlock(&s_table_lock); }
+ static void cond_lock(sys_cond_info* c) { pthread_mutex_lock(&c->signal_lock); }
+ static void cond_unlock(sys_cond_info* c) { pthread_mutex_unlock(&c->signal_lock); }
+ static void cond_wake(sys_cond_info* c) { pthread_cond_broadcast(&c->cv); }
+-static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
+-static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
+ #endif
+ 
+-/* Lock ordering is table -> condition. No caller holds the condition lock
+- * while acquiring a guest mutex. Native locks survive slot recycling. */
++/* Lock ordering is table -> condition -> mutex field lock (m->lk). Native locks survive slot recycling.
++ * KZ2 patch 6027 (after R&C patch 7007; Ratchet & Clank PC port, same owner, MIT): a signal hands the bound mutex to
++ * the woken waiter at once (owner = waiter when the mutex is free, else the waiter is queued on the mutex and gets it
++ * at the next unlock), as lv2 does (RPCS3 lv2_cond::signal -> lv2_mutex::try_own; read, not copied); the waiter then
++ * only waits until it is the owner. A wait that times out queues on the mutex like a locker and returns ETIMEDOUT
++ * once it owns it again. The old code woke the waiter and let it re-lock a host CRITICAL_SECTION itself. */
+ static sys_cond_info* acquire_cond(uint32_t id)
+ {
+     if (!id || id > SYS_COND_MAX) return NULL;
+@@ -60,6 +60,7 @@ int64_t sys_cond_create(ppu_context* ctx)
+     uint32_t attr = LV2_ARG_PTR(ctx, 2);
+     if (!mid || mid > SYS_MUTEX_MAX || !g_sys_mutexes[mid - 1].active)
+         return (int32_t)CELL_ESRCH;
++    sys_mutex_info* bm = &g_sys_mutexes[mid - 1];
+     table_lock();
+     for (unsigned i = 0; i < SYS_COND_MAX; ++i) {
+         sys_cond_info* c = &g_sys_conds[i];
+@@ -79,6 +80,10 @@ int64_t sys_cond_create(ppu_context* ctx)
+ #endif
+             c->initialized = 1;
+         }
++        lv2_mtx_hold(bm);
++        if (!bm->active) { lv2_mtx_release(bm); table_unlock(); return (int32_t)CELL_ESRCH; }
++        bm->cond_count++;   /* patch 6027: lv2 refuses to destroy a mutex with bound conds (EPERM) */
++        lv2_mtx_release(bm);
+         c->mutex_id = mid;
+         c->waiters = NULL;
+         memset(c->name, 0, sizeof(c->name));
+@@ -113,7 +118,11 @@ int64_t sys_cond_destroy(ppu_context* ctx)
+     cond_lock(c);
+     int32_t result = CELL_OK;
+     if (c->waiters) result = (int32_t)CELL_EBUSY;
+-    else { c->active = 0; g_cond_id_addr[id] = 0; }
++    else {
++        c->active = 0; g_cond_id_addr[id] = 0;
++        sys_mutex_info* bm = &g_sys_mutexes[c->mutex_id - 1];   /* patch 6027 */
++        lv2_mtx_hold(bm); if (bm->cond_count > 0) bm->cond_count--; lv2_mtx_release(bm);
++    }
+     cond_unlock(c);
+     table_unlock();
+     return result;
+@@ -121,7 +130,6 @@ int64_t sys_cond_destroy(ppu_context* ctx)
+ 
+ int64_t sys_cond_wait(ppu_context* ctx)
+ {
+-    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
+     uint64_t timeout = LV2_ARG_U64(ctx, 1);
+     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
+     const char* peek = getenv("PS3_COND_PEEK");
+@@ -144,25 +152,25 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
+     if (!c) return (int32_t)CELL_ESRCH;
+     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+-    if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
+-    if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
+-        cond_unlock(c); return (int32_t)CELL_EPERM;
++    const uint64_t tid = ctx->thread_id;
++    lv2_mtx_hold(m);
++    if (!m->active) { lv2_mtx_release(m); cond_unlock(c); return (int32_t)CELL_ESRCH; }
++    if (m->owner_tid != tid || m->lock_count <= 0) {
++        lv2_mtx_release(m); cond_unlock(c); return (int32_t)CELL_EPERM;
+     }
+-    struct sys_cond_waiter waiter = {NULL, 0};
++    const int depth = m->lock_count;   /* lv2: the whole recursion count comes back with the mutex */
++    struct sys_cond_waiter waiter = {NULL, 0, {NULL, tid, depth}};
+     struct sys_cond_waiter** tail = &c->waiters;
+     while (*tail) tail = &(*tail)->next;
+     *tail = &waiter;
+-    int depth = m->lock_count;
+-    { extern void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr);
+-      sys_mutex_note(c->mutex_id, 'W', ctx->thread_id, (uint32_t)ctx->lr); }
+-    { extern int sys_mutex_traced(uint32_t id);   /* KZ2 patch 6025: PS3_MUTEX_TRACE */
+-      if (sys_mutex_traced(c->mutex_id))
+-          fprintf(stderr, "[mutex-trace] cond_wait(cond %u, %llu us) releases %u by %llu lr 0x%08X depth %d\n",
+-                  LV2_ARG_U32(ctx, 0), (unsigned long long)timeout, c->mutex_id, (unsigned long long)ctx->thread_id,
+-                  (uint32_t)ctx->lr, depth); }
+-    m->owner_tid = 0;
+     m->lock_count = 0;
+-    for (int i = 0; i < depth; ++i) guest_unlock(m);
++    lv2_mtx_handoff_locked(m);   /* release: the next queued locker owns it now, or it is free */
++    sys_mutex_note(c->mutex_id, 'W', tid, (uint32_t)ctx->lr);
++    lv2_mtx_release(m);
++    if (sys_mutex_traced(c->mutex_id))   /* KZ2 patch 6025: PS3_MUTEX_TRACE */
++        fprintf(stderr, "[mutex-trace] cond_wait(cond %u, %llu us) releases %u by %llu lr 0x%08X depth %d\n",
++                LV2_ARG_U32(ctx, 0), (unsigned long long)timeout, c->mutex_id, (unsigned long long)tid,
++                (uint32_t)ctx->lr, depth);
+ 
+     int32_t result = CELL_OK;
+ #ifdef _WIN32
+@@ -203,45 +211,58 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     struct sys_cond_waiter** link = &c->waiters;
+     while (*link != &waiter) link = &(*link)->next;
+     *link = waiter.next;
++    if (!waiter.signalled) {
++        /* Timed out (or the host wait failed) with no signal: take the mutex back like a locker (lv2 re-acquires
++         * it before returning ETIMEDOUT). A signal already gave the mutex to this thread or queued it. */
++        lv2_mtx_hold(m);
++        lv2_mtx_give_or_queue_locked(m, &waiter.mw);
++        lv2_mtx_release(m);
++    }
+     cond_unlock(c);
+-    /* Re-acquiring counts as waiting on the mutex (sys_mutex_destroy). */
+-    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+-    for (int i = 0; i < depth; ++i) guest_lock(m);
+-    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+-    m->owner_tid = ctx->thread_id;
+-    m->lock_count = depth;
+-    { extern void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr);
+-      sys_mutex_note(c->mutex_id, 'R', ctx->thread_id, (uint32_t)ctx->lr); }
+-    { extern int sys_mutex_traced(uint32_t id);   /* KZ2 patch 6025 */
+-      if (sys_mutex_traced(c->mutex_id))
++    lv2_mtx_hold(m);
++    lv2_mtx_wait_owner_locked(m, tid);
++    sys_mutex_note(c->mutex_id, 'R', tid, (uint32_t)ctx->lr);
++    lv2_mtx_release(m);
++    { if (sys_mutex_traced(c->mutex_id))
+           fprintf(stderr, "[mutex-trace] cond_wait re-took %u by %llu result 0x%08X\n", c->mutex_id,
+                   (unsigned long long)ctx->thread_id, (uint32_t)result); }
+     return result;
+ }
+ 
+-static int64_t signal_cond(uint32_t id, int all)
++/* to_tid != 0: signal that thread only (sys_cond_signal_to); EPERM when it is not waiting here (lv2). */
++static int64_t signal_cond(uint32_t id, int all, uint64_t to_tid)
+ {
+     sys_cond_info* c = acquire_cond(id);
+     if (!c) return (int32_t)CELL_ESRCH;
++    sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+     int selected = 0;
++    lv2_mtx_hold(m);
+     for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
+         if (w->signalled) continue;
++        if (to_tid && w->mw.tid != to_tid) continue;
+         w->signalled = 1;
++        lv2_mtx_give_or_queue_locked(m, &w->mw);   /* patch 6027: the hand-off lv2 does at the signal */
+         selected = 1;
+         if (!all) break;
+     }
++    lv2_mtx_release(m);
+     /* Broadcast the host CV: only selected records return to the guest.
+      * Waking an arbitrary host waiter could leave the selected one asleep. */
+     if (selected) cond_wake(c);
+     cond_unlock(c);
++    if (to_tid && !selected) return (int32_t)CELL_EPERM;
+     return CELL_OK;
+ }
+ 
+-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
+-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
++int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0, 0); }
++int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1, 0); }
+ 
+-/* Preserve upstream's current broadcast fallback for signal_to. */
+-int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
++/* r4 = the guest thread to wake (patch 6027: was a broadcast). */
++int64_t sys_cond_signal_to(ppu_context* ctx)
++{
++    const uint64_t to = LV2_ARG_U64(ctx, 1);
++    return signal_cond(LV2_ARG_U32(ctx, 0), 0, to ? to : ~0ull);
++}
+ 
+ void sys_cond_init(lv2_syscall_table* tbl)
+ {
+diff --git a/runtime/syscalls/sys_mutex.c b/runtime/syscalls/sys_mutex.c
+--- a/runtime/syscalls/sys_mutex.c
++++ b/runtime/syscalls/sys_mutex.c
+@@ -1,5 +1,17 @@
+ /*
+  * ps3recomp - Kernel mutex syscalls (implementation)
++ *
++ * KZ2 patch 6027 (after R&C patch 7007, rc-an earlier change; Ratchet & Clank PC port, same owner, MIT): lv2 mutex
++ * semantics on host primitives. The mutex was a host CRITICAL_SECTION (pthread mutex) per slot, owned by a HOST
++ * thread, next to bookkeeping (owner_tid, lock_count) keyed by the GUEST thread id, and sys_cond_wait re-acquired it
++ * itself after the wake. Now the mutex is the bookkeeping: owner_tid / lock_count / a FIFO of waiters under a short
++ * host lock, and the thread that releases it hands it to the next waiter (unlock; a cond signal while it is free), as
++ * lv2 does (RPCS3 lv2_mutex, lv2_cond::signal -> lv2_mutex::try_own; read, not copied).
++ * lv2's destroy rules: ESRCH, then EBUSY while owned, then EPERM while a cond is bound (cond create/destroy count the
++ * binding); create checks its attribute (EFAULT, EINVAL); trylock by the owner of a non-recursive mutex is EDEADLK.
++ * Slots are allocated next-fit and their host locks are never destroyed.
++ * ASSUMPTION: FIFO hand-off for every protocol (lv2 orders SYS_SYNC_PRIORITY waiters by thread priority).
++ * Host test: tools/runtime/test_lv2_mutex.sh.
+  */
+ 
+ #include "sys_mutex.h"
+@@ -16,189 +28,168 @@
+ sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
+ 
+ #ifdef _WIN32
+-static CRITICAL_SECTION s_mtx_table_lock;
+-static int              s_mtx_table_lock_init = 0;
++static SRWLOCK s_mtx_table_lock = SRWLOCK_INIT;
++static void mtx_table_lock(void)   { AcquireSRWLockExclusive(&s_mtx_table_lock); }
++static void mtx_table_unlock(void) { ReleaseSRWLockExclusive(&s_mtx_table_lock); }
++void lv2_mtx_hold(sys_mutex_info* m)    { AcquireSRWLockExclusive(&m->lk); }
++void lv2_mtx_release(sys_mutex_info* m) { ReleaseSRWLockExclusive(&m->lk); }
++static void mtx_wake(sys_mutex_info* m) { WakeAllConditionVariable(&m->cv); }
++static void mtx_host_init(sys_mutex_info* m) { InitializeSRWLock(&m->lk); InitializeConditionVariable(&m->cv); }
++static uint32_t mtx_host_tid(void) { return (uint32_t)GetCurrentThreadId(); }
+ #else
+-static pthread_mutex_t  s_mtx_table_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_mutex_t s_mtx_table_lock = PTHREAD_MUTEX_INITIALIZER;
++static void mtx_table_lock(void)   { pthread_mutex_lock(&s_mtx_table_lock); }
++static void mtx_table_unlock(void) { pthread_mutex_unlock(&s_mtx_table_lock); }
++void lv2_mtx_hold(sys_mutex_info* m)    { pthread_mutex_lock(&m->lk); }
++void lv2_mtx_release(sys_mutex_info* m) { pthread_mutex_unlock(&m->lk); }
++static void mtx_wake(sys_mutex_info* m) { pthread_cond_broadcast(&m->cv); }
++static void mtx_host_init(sys_mutex_info* m) { pthread_mutex_init(&m->lk, NULL); pthread_cond_init(&m->cv, NULL); }
++static uint32_t mtx_host_tid(void) { return 0; }
+ #endif
+ 
+-static void mtx_table_lock(void)
+-{
+ #ifdef _WIN32
+-    if (!s_mtx_table_lock_init) {
+-        InitializeCriticalSection(&s_mtx_table_lock);
+-        s_mtx_table_lock_init = 1;
+-    }
+-    EnterCriticalSection(&s_mtx_table_lock);
++static int64_t mtx_deadline(uint64_t us) { return lv2_usec_deadline(us); }   /* QPC units */
++static int     mtx_passed(int64_t d)     { return lv2_deadline_passed(d); }
+ #else
+-    pthread_mutex_lock(&s_mtx_table_lock);
++static int64_t mtx_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec * 1000000000ll + t.tv_nsec; }
++static int64_t mtx_deadline(uint64_t us) { return mtx_now_ns() + (int64_t)us * 1000ll; }
++static int     mtx_passed(int64_t d)     { return mtx_now_ns() >= d; }
+ #endif
+-}
+ 
+-static void mtx_table_unlock(void)
++/* Sleep on m->cv (m->lk held) until woken or the deadline (mtx_deadline units; timeout_us 0 = none). Returns 0 once
++ * the deadline has passed, 1 otherwise; the caller re-checks its predicate either way. */
++static int mtx_sleep(sys_mutex_info* m, uint64_t timeout_us, int64_t deadline)
+ {
++    if (!timeout_us) {
++#ifdef _WIN32
++        SleepConditionVariableSRW(&m->cv, &m->lk, INFINITE, 0);
++#else
++        pthread_cond_wait(&m->cv, &m->lk);
++#endif
++        return 1;
++    }
++    if (mtx_passed(deadline)) return 0;
+ #ifdef _WIN32
+-    LeaveCriticalSection(&s_mtx_table_lock);
++    SleepConditionVariableSRW(&m->cv, &m->lk, 1, 0);   /* 1 ms slices: the QPC deadline is re-checked */
+ #else
+-    pthread_mutex_unlock(&s_mtx_table_lock);
++    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_nsec += 1000000L; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++    pthread_cond_timedwait(&m->cv, &m->lk, &ts);
+ #endif
++    return 1;
+ }
+ 
+-static int mtx_find_free(void)
++void lv2_mtx_handoff_locked(sys_mutex_info* m)
+ {
+-    for (int i = 0; i < SYS_MUTEX_MAX; i++) {
+-        if (!g_sys_mutexes[i].active)
+-            return i;
++    lv2_mtx_waiter* w = m->queue;
++    if (w) {
++        m->queue = w->next;
++        m->owner_tid = w->tid;
++        m->lock_count = w->count;
++        mtx_wake(m);
++    } else {
++        m->owner_tid = 0;
++        m->lock_count = 0;
+     }
+-    return -1;
+ }
+ 
+-/* Byteswap helper for writing u32 to guest memory */
+-static void write_be32(uint32_t addr, uint32_t val)
++void lv2_mtx_give_or_queue_locked(sys_mutex_info* m, lv2_mtx_waiter* w)
+ {
+-    uint32_t* p = (uint32_t*)vm_to_host(addr);
+-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+-    val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
+-          ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
+-#endif
+-    *p = val;
++    w->next = NULL;
++    if (!m->owner_tid) {
++        m->owner_tid = w->tid;
++        m->lock_count = w->count;
++        mtx_wake(m);
++        return;
++    }
++    lv2_mtx_waiter** tail = &m->queue;
++    while (*tail) tail = &(*tail)->next;
++    *tail = w;
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * sys_mutex_create
+- *
+- * r3 = pointer to receive mutex ID (u32*)
+- * r4 = pointer to attribute struct
+- * -----------------------------------------------------------------------*/
+-int64_t sys_mutex_create(ppu_context* ctx)
++void lv2_mtx_wait_owner_locked(sys_mutex_info* m, uint64_t tid)
+ {
+-    uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
+-    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 1);
+-
+-    mtx_table_lock();
+-
+-    int slot = mtx_find_free();
+-    if (slot < 0) {
+-        mtx_table_unlock();
+-        return (int64_t)(int32_t)CELL_EAGAIN;
+-    }
+-
+-    sys_mutex_info* m = &g_sys_mutexes[slot];
+-    memset(m, 0, sizeof(*m));
+-    m->active = 1;
+-
+-    /* Read attributes from guest memory */
+-    if (attr_addr != 0) {
+-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
+-        /* protocol is at offset 0 (u32 BE) */
+-        uint32_t proto_be;
+-        memcpy(&proto_be, attr_raw + 0, 4);
+-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
+-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
+-#endif
+-        m->protocol = proto_be;
+-
+-        /* recursive flag at offset 4 (u32 BE) */
+-        uint32_t rec_be;
+-        memcpy(&rec_be, attr_raw + 4, 4);
+-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+-        rec_be = ((rec_be >> 24) & 0xFF) | ((rec_be >> 8) & 0xFF00) |
+-                 ((rec_be << 8) & 0xFF0000) | ((rec_be << 24) & 0xFF000000u);
+-#endif
+-        m->recursive = (rec_be == SYS_SYNC_RECURSIVE) ? 1 : 0;
+-
+-        /* name at offset 24 */
+-        memcpy(m->name, attr_raw + 24, 8);
+-    }
+-
+-    /* Initialize host mutex */
+-#ifdef _WIN32
+-    InitializeCriticalSection(&m->cs);
+-    m->wait_handle = CreateEventA(NULL, FALSE, TRUE, NULL);
+-#else
+-    {
+-        pthread_mutexattr_t mattr;
+-        pthread_mutexattr_init(&mattr);
+-        if (m->recursive) {
+-            pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+-        } else {
+-            pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
+-        }
+-        pthread_mutex_init(&m->mtx, &mattr);
+-        pthread_mutexattr_destroy(&mattr);
+-    }
+-#endif
+-
+-    /* Write mutex ID (slot + 1) to guest */
+-    uint32_t mutex_id = (uint32_t)(slot + 1);
+-    if (id_out_addr != 0) {
+-        write_be32(id_out_addr, mutex_id);
+-    }
+-
+-    mtx_table_unlock();
+-    return CELL_OK;
++    while (m->owner_tid != tid) mtx_sleep(m, 0, 0);
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * sys_mutex_destroy
+- *
+- * r3 = mutex_id
+- * -----------------------------------------------------------------------*/
+-int64_t sys_mutex_destroy(ppu_context* ctx)
++/* Next-fit allocation: a destroyed slot is not handed out again at once, so a stale id held by a slow thread does
++ * not name a brand-new mutex straight away (lv2 ids are not reused at once either). */
++static int mtx_find_free(void)
+ {
+-    uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
+-
+-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+-        return (int64_t)(int32_t)CELL_ESRCH;
+-
+-    mtx_table_lock();
+-
+-    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+-    if (!m->active) {
+-        mtx_table_unlock();
+-        return (int64_t)(int32_t)CELL_ESRCH;
++    static int next = 0;
++    for (int k = 0; k < SYS_MUTEX_MAX; k++) {
++        const int i = (next + k) % SYS_MUTEX_MAX;
++        if (!g_sys_mutexes[i].active) { next = (i + 1) % SYS_MUTEX_MAX; return i; }
+     }
++    return -1;
++}
+ 
+-#ifdef _WIN32
+-    DeleteCriticalSection(&m->cs);
+-    if (m->wait_handle) CloseHandle(m->wait_handle);
+-#else
+-    pthread_mutex_destroy(&m->mtx);
+-#endif
++static uint32_t rd_be32(uint32_t addr)
++{
++    const uint8_t* p = (const uint8_t*)vm_to_host(addr);
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
+ 
+-    m->active = 0;
+-    mtx_table_unlock();
+-    return CELL_OK;
++static void write_be32(uint32_t addr, uint32_t val)
++{
++    uint8_t* p = (uint8_t*)vm_to_host(addr);
++    p[0] = (uint8_t)(val >> 24); p[1] = (uint8_t)(val >> 16); p[2] = (uint8_t)(val >> 8); p[3] = (uint8_t)val;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * sys_mutex_lock
+- *
+- * r3 = mutex_id
+- * r4 = timeout_usec (0 = infinite)
++ * KZ2 patch 6025 (diagnostic): name the owner when a timed lock gives up, and the mutexes a thread still owns when
++ * it exits (lv2 does not release them; a later timed lock then times out every time), with that mutex's last 16
++ * operations: op:guest thread/host thread@guest lr>owner.count after it. Ops: L lock, T trylock, t trylock busy,
++ * E EDEADLK, X timed out, U unlock, u non-owner unlock (EPERM), W/R sys_cond_wait release/re-take, C create,
++ * D destroy, d destroy refused. First 24 lines of each kind. PS3_MUTEX_TRACE=<id>: every operation on that mutex.
+  * -----------------------------------------------------------------------*/
+-/* KZ2 patch 6025 (diagnostic): name the owner when a timed lock gives up, and the mutexes a thread still owns when
+- * it exits (lv2 does not release them; a later timed lock then times out every time), with that mutex's last eight
+- * operations (thread, op, guest lr: the caller of the game's lock helper). First 24 of each. */
+ static void mutex_name(const sys_mutex_info* m, char out[9]) { memcpy(out, m->name, 8); out[8] = 0; }
+-typedef struct { uint32_t tid, lr; char op; } MutexOp;
+-static MutexOp  s_mx_ring[SYS_MUTEX_MAX][8];
+-static uint8_t  s_mx_ring_n[SYS_MUTEX_MAX];
+-void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr)   /* L lock, T trylock, U unlock, W/R cond_wait */
++typedef struct { uint32_t tid, lr, host, owner; int16_t count; char op; } MutexOp;
++#define MX_RING 16
++static MutexOp  s_mx_ring[SYS_MUTEX_MAX][MX_RING];
++static uint32_t s_mx_ring_n[SYS_MUTEX_MAX];
++void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr)
+ {
+     if (!id || id > SYS_MUTEX_MAX) return;
+-    MutexOp* o = &s_mx_ring[id - 1][s_mx_ring_n[id - 1]++ & 7];
+-    o->tid = (uint32_t)tid; o->lr = lr; o->op = op;
++    const sys_mutex_info* m = &g_sys_mutexes[id - 1];
++    MutexOp* o = &s_mx_ring[id - 1][__atomic_add_fetch(&s_mx_ring_n[id - 1], 1u, __ATOMIC_RELAXED) % MX_RING];
++    o->tid = (uint32_t)tid; o->lr = lr; o->op = op; o->host = mtx_host_tid();
++    o->owner = (uint32_t)m->owner_tid; o->count = (int16_t)m->lock_count;
++}
++/* Who took the current ownership by a lock or trylock from free (not a cond_wait re-take, which restores the
++ * level the waiter had): op, thread, guest lr and the guest call chain (back chain at 0(r1), saved LR at 16(frame)),
++ * so a mutex held across many inner lock/unlock pairs and waits still names its outer locker. */
++typedef struct { uint32_t tid, lr, chain[6]; char op; } MutexOuter;
++static MutexOuter s_mx_outer[SYS_MUTEX_MAX];
++static uint32_t be32_at(uint32_t ea) { return ea ? rd_be32(ea) : 0; }
++static void mutex_outer_note(uint32_t id, char op, const ppu_context* ctx)
++{
++    MutexOuter* o = &s_mx_outer[id - 1];
++    o->tid = (uint32_t)ctx->thread_id; o->lr = (uint32_t)ctx->lr; o->op = op;
++    uint32_t sp = (uint32_t)ctx->gpr[1];
++    for (int k = 0; k < 6; k++) {
++        const uint32_t up = (sp && sp >= 0x10000u && !(sp & 7u)) ? be32_at(sp + 4) : 0;   /* low word of the back chain */
++        o->chain[k] = (up && up > sp) ? be32_at(up + 20) : 0;                           /* low word of LR at 16(up) */
++        sp = up > sp ? up : 0;
++    }
++}
++static void mutex_outer_print(uint32_t id)
++{
++    const MutexOuter* o = &s_mx_outer[id - 1];
++    if (o->op) fprintf(stderr, "[mutex] %u owned since %c by thread %u lr %08X, chain %08X %08X %08X %08X %08X %08X\n", id,
++                       o->op, o->tid, o->lr, o->chain[0], o->chain[1], o->chain[2], o->chain[3], o->chain[4], o->chain[5]);
+ }
+ static void mutex_ring_print(uint32_t id)
+ {
+-    char b[400]; int n = 0;
+-    for (int k = 0; k < 8; k++) {
+-        const MutexOp* o = &s_mx_ring[id - 1][(s_mx_ring_n[id - 1] + k) & 7];
+-        if (o->op) n += snprintf(b + n, sizeof b - (size_t)n, " %c:%u@%08X", o->op, o->tid, o->lr);
++    char b[2400]; int n = 0;
++    for (int k = 1; k <= MX_RING; k++) {
++        const MutexOp* o = &s_mx_ring[id - 1][(s_mx_ring_n[id - 1] + k) % MX_RING];
++        if (o->op && n < (int)sizeof b - 64)
++            n += snprintf(b + n, sizeof b - (size_t)n, " %c:%u/h%u@%08X>%u.%d", o->op, o->tid, o->host, o->lr,
++                          o->owner, o->count);
+     }
+     fprintf(stderr, "[mutex] %u last ops (oldest first):%s\n", id, b);
++    mutex_outer_print(id);
+ }
+ void sys_mutex_report_owned(uint64_t tid)
+ {
+@@ -224,81 +215,143 @@ static void mutex_timeout_log(const sys_mutex_info* m, uint32_t id, const ppu_co
+         if (said <= 2) mutex_ring_print(id);
+     }
+ }
+-
+-/* PS3_MUTEX_TRACE=<id>: every lock, trylock, unlock (and sys_cond_wait's release and re-take) of that mutex. */
+ int sys_mutex_traced(uint32_t id)
+ {
+     static long t = -1;
+     if (t < 0) { const char* e = getenv("PS3_MUTEX_TRACE"); t = e ? strtol(e, NULL, 0) : 0; }
+     return t && (uint32_t)t == id;
+ }
++static void mutex_op(uint32_t id, char op, const ppu_context* ctx, int32_t rc)
++{
++    sys_mutex_note(id, op, ctx->thread_id, (uint32_t)ctx->lr);
++    if (sys_mutex_traced(id)) {
++        const sys_mutex_info* m = &g_sys_mutexes[id - 1];
++        fprintf(stderr, "[mutex-trace] %c %u by %llu lr 0x%08X -> 0x%08X (owner %llu count %d)\n", op, id,
++                (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr, (uint32_t)rc,
++                (unsigned long long)m->owner_tid, m->lock_count);
++    }
++}
++
++/* ---------------------------------------------------------------------------
++ * sys_mutex_create
++ *
++ * r3 = pointer to receive mutex ID (u32*)
++ * r4 = pointer to attribute struct
++ * lv2 (RPCS3 sys_mutex_create, read): EFAULT for a null pointer; protocol FIFO / PRIORITY / PRIORITY_INHERIT and
++ * recursive RECURSIVE / NOT_RECURSIVE, anything else EINVAL.
++ * -----------------------------------------------------------------------*/
++int64_t sys_mutex_create(ppu_context* ctx)
++{
++    uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
++    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 1);
++    if (!id_out_addr || !attr_addr) return (int64_t)(int32_t)CELL_EFAULT;
++    const uint32_t protocol = rd_be32(attr_addr + 0), rec = rd_be32(attr_addr + 4);
++    if ((protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY && protocol != SYS_SYNC_PRIORITY_INHERIT) ||
++        (rec != SYS_SYNC_RECURSIVE && rec != SYS_SYNC_NOT_RECURSIVE)) {
++        static int said = 0;
++        if (said++ < 8)
++            fprintf(stderr, "[mutex] create: attribute protocol 0x%X recursive 0x%X -> EINVAL (lr 0x%08X)\n",
++                    protocol, rec, (uint32_t)ctx->lr);
++        return (int64_t)(int32_t)CELL_EINVAL;
++    }
++
++    mtx_table_lock();
++    int slot = mtx_find_free();
++    if (slot < 0) {
++        mtx_table_unlock();
++        return (int64_t)(int32_t)CELL_EAGAIN;
++    }
++    sys_mutex_info* m = &g_sys_mutexes[slot];
++    if (!m->initialized) { mtx_host_init(m); m->initialized = 1; }
++    lv2_mtx_hold(m);
++    m->protocol = protocol;
++    m->recursive = rec == SYS_SYNC_RECURSIVE;
++    memcpy(m->name, (const uint8_t*)vm_to_host(attr_addr) + 24, 8);
++    m->owner_tid = 0; m->lock_count = 0; m->cond_count = 0; m->queue = NULL;
++    m->active = 1;
++    lv2_mtx_release(m);
++    write_be32(id_out_addr, (uint32_t)(slot + 1));
++    mtx_table_unlock();
++    mutex_op((uint32_t)(slot + 1), 'C', ctx, CELL_OK);
++    return CELL_OK;
++}
++
++/* ---------------------------------------------------------------------------
++ * sys_mutex_destroy
++ *
++ * r3 = mutex_id. lv2: ESRCH, then EBUSY while owned, then EPERM while a cond is bound.
++ * -----------------------------------------------------------------------*/
++int64_t sys_mutex_destroy(ppu_context* ctx)
++{
++    uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
++    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
++        return (int64_t)(int32_t)CELL_ESRCH;
++    mtx_table_lock();
++    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
++    if (!m->active) { mtx_table_unlock(); return (int64_t)(int32_t)CELL_ESRCH; }
++    lv2_mtx_hold(m);
++    int32_t rc = CELL_OK;
++    if (m->owner_tid) rc = (int32_t)CELL_EBUSY;
++    else if (m->cond_count > 0) rc = (int32_t)CELL_EPERM;
++    if (rc == CELL_OK) m->active = 0;
++    lv2_mtx_release(m);
++    mtx_table_unlock();
++    mutex_op(mutex_id, rc == CELL_OK ? 'D' : 'd', ctx, rc);
++    return rc;
++}
+ 
++/* ---------------------------------------------------------------------------
++ * sys_mutex_lock
++ *
++ * r3 = mutex_id
++ * r4 = timeout_usec (0 = infinite)
++ * -----------------------------------------------------------------------*/
+ int64_t sys_mutex_lock(ppu_context* ctx)
+ {
+     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
+     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+         return (int64_t)(int32_t)CELL_ESRCH;
+-
+     sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+-    if (!m->active)
+-        return (int64_t)(int32_t)CELL_ESRCH;
+-
+-    uint64_t caller_tid = ctx->thread_id;
+-
+-    /* Check for deadlock on non-recursive mutex */
+-    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+-        return (int64_t)(int32_t)CELL_EDEADLK;
++    if (!m->initialized) return (int64_t)(int32_t)CELL_ESRCH;
++    const uint64_t tid = ctx->thread_id;
++    lv2_mtx_hold(m);
++    if (!m->active) { lv2_mtx_release(m); return (int64_t)(int32_t)CELL_ESRCH; }
++    if (m->owner_tid == tid) {
++        int32_t rc = CELL_OK;
++        if (!m->recursive) rc = (int32_t)CELL_EDEADLK;
++        else if (m->lock_count == 0x7FFFFFFF) rc = (int32_t)CELL_EKRESOURCE;
++        else m->lock_count++;
++        mutex_op(mutex_id, rc == CELL_OK ? 'L' : 'E', ctx, rc);
++        lv2_mtx_release(m);
++        return rc;
+     }
+-
+-#ifdef _WIN32
+-    if (timeout_us == 0) {
+-        /* Infinite wait */
+-        EnterCriticalSection(&m->cs);
+-    } else {
+-        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
+-         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
+-         * and slept a full tick per retry, overshooting sub-ms timeouts by
+-         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
+-         * holder can run; Sleep(1) only for waits long enough to absorb it.
+-         * Safe to poll: TryEnterCriticalSection's success IS the atomic
+-         * acquire, so there's no separate signal to miss between polls. */
+-        int64_t deadline = lv2_usec_deadline(timeout_us);
+-        while (!TryEnterCriticalSection(&m->cs)) {
+-            if (lv2_deadline_passed(deadline)) {
+-                mutex_timeout_log(m, mutex_id, ctx, timeout_us);   /* KZ2 patch 6025 */
+-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+-            }
+-            if (timeout_us < 1000) SwitchToThread();
+-            else                   Sleep(1);
+-        }
++    if (!m->owner_tid) {
++        m->owner_tid = tid; m->lock_count = 1;
++        mutex_outer_note(mutex_id, 'L', ctx);
++        mutex_op(mutex_id, 'L', ctx, CELL_OK);
++        lv2_mtx_release(m);
++        return CELL_OK;
+     }
+-#else
+-    if (timeout_us == 0) {
+-        pthread_mutex_lock(&m->mtx);
+-    } else {
+-        struct timespec ts;
+-        clock_gettime(CLOCK_REALTIME, &ts);
+-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
+-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+-        if (ts.tv_nsec >= 1000000000L) {
+-            ts.tv_sec++;
+-            ts.tv_nsec -= 1000000000L;
+-        }
+-        int rc = pthread_mutex_timedlock(&m->mtx, &ts);
+-        if (rc == ETIMEDOUT) {
+-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
++    lv2_mtx_waiter w = { NULL, tid, 1 };
++    lv2_mtx_waiter** tail = &m->queue;
++    while (*tail) tail = &(*tail)->next;
++    *tail = &w;
++    const int64_t deadline = timeout_us ? mtx_deadline(timeout_us) : 0;
++    int32_t rc = CELL_OK;
++    while (m->owner_tid != tid) {
++        if (!mtx_sleep(m, timeout_us, deadline) && m->owner_tid != tid) {
++            for (lv2_mtx_waiter** l = &m->queue; *l; l = &(*l)->next)
++                if (*l == &w) { *l = w.next; break; }
++            rc = (int32_t)CELL_ETIMEDOUT;
++            break;
+         }
+     }
+-#endif
+-
+-    m->owner_tid = caller_tid;
+-    m->lock_count++;
+-    sys_mutex_note(mutex_id, 'L', caller_tid, (uint32_t)ctx->lr);
+-    if (sys_mutex_traced(mutex_id))
+-        fprintf(stderr, "[mutex-trace] lock %u by %llu lr 0x%08X count %d\n", mutex_id, (unsigned long long)caller_tid,
+-                (uint32_t)ctx->lr, m->lock_count);
+-    return CELL_OK;
++    if (rc == CELL_OK) mutex_outer_note(mutex_id, 'l', ctx);   /* handed over after a wait */
++    mutex_op(mutex_id, rc == CELL_OK ? 'L' : 'X', ctx, rc);
++    if (rc != CELL_OK) mutex_timeout_log(m, mutex_id, ctx, timeout_us);   /* KZ2 patch 6025 */
++    lv2_mtx_release(m);
++    return rc;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -309,106 +362,46 @@ int64_t sys_mutex_lock(ppu_context* ctx)
+ int64_t sys_mutex_trylock(ppu_context* ctx)
+ {
+     uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
+-
+     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+         return (int64_t)(int32_t)CELL_ESRCH;
+-
+     sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+-    if (!m->active)
+-        return (int64_t)(int32_t)CELL_ESRCH;
+-
+-    uint64_t caller_tid = ctx->thread_id;
+-
+-    /* Recursive re-entry. MUST still acquire the host primitive: unlock
+-     * calls LeaveCriticalSection unconditionally per guest unlock, so every
+-     * guest lock (including a recursive re-entry) must Enter exactly once
+-     * or the Enter/Leave pairing breaks: the paired unlock releases the CS
+-     * while the guest logically still holds the mutex, and the final
+-     * unlock calls Leave on a non-held CS (undefined behavior, corrupts
+-     * the CS and causes random forever-blocks on later Enters).
+-     * EnterCriticalSection by the current owner is itself recursive and
+-     * never blocks, so this is safe and cheap. */
+-    if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+-#ifdef _WIN32
+-        EnterCriticalSection(&m->cs);
+-#else
+-        /* Same reasoning, and it applies here: create() gives a recursive
+-         * guest mutex a PTHREAD_MUTEX_RECURSIVE host mutex, so the owner
+-         * re-locking it bumps the host recursion count and never blocks.
+-         * The comment this replaces claimed the host mutex was the default
+-         * non-recursive kind and skipped the lock, which left one host
+-         * acquisition behind two guest ones: the first guest unlock then
+-         * dropped the host mutex entirely and another thread could enter
+-         * while the guest still believed it held the mutex. */
+-        pthread_mutex_lock(&m->mtx);
+-#endif
+-        m->lock_count++;
+-        return CELL_OK;
+-    }
+-
+-#ifdef _WIN32
+-    if (!TryEnterCriticalSection(&m->cs)) {
+-        return (int64_t)(int32_t)CELL_EBUSY;
+-    }
+-#else
+-    int rc = pthread_mutex_trylock(&m->mtx);
+-    if (rc != 0) {
+-        return (int64_t)(int32_t)CELL_EBUSY;
+-    }
+-#endif
+-
+-    m->owner_tid = caller_tid;
+-    m->lock_count++;
+-    sys_mutex_note(mutex_id, 'T', caller_tid, (uint32_t)ctx->lr);
+-    if (sys_mutex_traced(mutex_id))
+-        fprintf(stderr, "[mutex-trace] trylock %u by %llu lr 0x%08X count %d\n", mutex_id, (unsigned long long)caller_tid,
+-                (uint32_t)ctx->lr, m->lock_count);
+-    return CELL_OK;
++    if (!m->initialized) return (int64_t)(int32_t)CELL_ESRCH;
++    const uint64_t tid = ctx->thread_id;
++    int32_t rc = CELL_OK;
++    char op = 'T';
++    lv2_mtx_hold(m);
++    if (!m->active) { rc = (int32_t)CELL_ESRCH; op = 0; }
++    else if (m->owner_tid == tid) {
++        if (!m->recursive) { rc = (int32_t)CELL_EDEADLK; op = 'E'; }
++        else if (m->lock_count == 0x7FFFFFFF) { rc = (int32_t)CELL_EKRESOURCE; op = 'E'; }
++        else m->lock_count++;
++    } else if (m->owner_tid) { rc = (int32_t)CELL_EBUSY; op = 't'; }   /* owned, or handed to a waiter not yet running */
++    else { m->owner_tid = tid; m->lock_count = 1; mutex_outer_note(mutex_id, 'T', ctx); }
++    if (op) mutex_op(mutex_id, op, ctx, rc);
++    lv2_mtx_release(m);
++    return rc;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+  * sys_mutex_unlock
+  *
+- * r3 = mutex_id
++ * r3 = mutex_id. EPERM for a non-owner (RPCS3 lv2_mutex::try_unlock, read, not copied).
+  * -----------------------------------------------------------------------*/
+ int64_t sys_mutex_unlock(ppu_context* ctx)
+ {
+     uint32_t mutex_id = LV2_ARG_U32(ctx, 0);
+-
+     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+         return (int64_t)(int32_t)CELL_ESRCH;
+-
+     sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+-    if (!m->active)
+-        return (int64_t)(int32_t)CELL_ESRCH;
+-
+-    uint64_t caller_tid = ctx->thread_id;
+-
+-    if (sys_mutex_traced(mutex_id))
+-        fprintf(stderr, "[mutex-trace] unlock %u by %llu lr 0x%08X (owner %llu count %d)\n", mutex_id,
+-                (unsigned long long)caller_tid, (uint32_t)ctx->lr, (unsigned long long)m->owner_tid, m->lock_count);
+-    sys_mutex_note(mutex_id, m->owner_tid == caller_tid ? 'U' : 'u', caller_tid, (uint32_t)ctx->lr);
+-    if (m->owner_tid != caller_tid) {
+-        /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
+-         * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
+-         * "if (it.owner != cpu.id) return CELL_EPERM;"), not a made up
+-         * CELL_EMUTEX_NOT_OWNED code that guest branches on this
+-         * contract would never match. */
+-        return (int64_t)(int32_t)CELL_EPERM;
+-    }
+-
+-    m->lock_count--;
+-    if (m->lock_count == 0) {
+-        m->owner_tid = 0;
+-    }
+-
+-#ifdef _WIN32
+-    LeaveCriticalSection(&m->cs);
+-#else
+-    pthread_mutex_unlock(&m->mtx);
+-#endif
+-
+-    return CELL_OK;
++    if (!m->initialized) return (int64_t)(int32_t)CELL_ESRCH;
++    int32_t rc = CELL_OK;
++    lv2_mtx_hold(m);
++    if (!m->active) rc = (int32_t)CELL_ESRCH;
++    else if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) rc = (int32_t)CELL_EPERM;
++    else if (--m->lock_count == 0) lv2_mtx_handoff_locked(m);
++    if (rc != (int32_t)CELL_ESRCH) mutex_op(mutex_id, rc == CELL_OK ? 'U' : 'u', ctx, rc);
++    lv2_mtx_release(m);
++    return rc;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -416,15 +409,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
+  * -----------------------------------------------------------------------*/
+ void sys_mutex_init(lv2_syscall_table* tbl)
+ {
+-    memset(g_sys_mutexes, 0, sizeof(g_sys_mutexes));
+-
+-#ifdef _WIN32
+-    if (!s_mtx_table_lock_init) {
+-        InitializeCriticalSection(&s_mtx_table_lock);
+-        s_mtx_table_lock_init = 1;
+-    }
+-#endif
+-
++    /* Static storage starts empty; the host locks of a slot are made on its first create and kept. */
+     lv2_syscall_register(tbl, SYS_MUTEX_CREATE,  sys_mutex_create);
+     lv2_syscall_register(tbl, SYS_MUTEX_DESTROY, sys_mutex_destroy);
+     lv2_syscall_register(tbl, SYS_MUTEX_LOCK,    sys_mutex_lock);
+diff --git a/runtime/syscalls/sys_mutex.h b/runtime/syscalls/sys_mutex.h
+--- a/runtime/syscalls/sys_mutex.h
++++ b/runtime/syscalls/sys_mutex.h
+@@ -55,24 +55,46 @@ typedef struct sys_mutex_attribute_t {
+ } sys_mutex_attribute_t;
+ 
+ /* Internal mutex descriptor */
++/* KZ2 patch 6027 (after R&C patch 7007, rc-an earlier change: Ratchet & Clank PC port, same owner, MIT): the mutex is
++ * an lv2-style object owned by a guest thread id, not a host CRITICAL_SECTION / pthread mutex owned by a host thread.
++ * lk is a short host lock that only guards these fields; a guest thread that has to wait sleeps on cv until owner_tid
++ * names it. The releasing thread hands the mutex to the first waiter (unlock, or a cond signal while the mutex is
++ * free), as lv2 does (RPCS3 lv2_mutex / lv2_cond::signal -> lv2_mutex::try_own; read, not copied), so no third thread
++ * takes it in between. Host objects are made once per slot and never destroyed, so a stale id touches a valid lock. */
++typedef struct lv2_mtx_waiter {
++    struct lv2_mtx_waiter* next;
++    uint64_t tid;         /* guest thread that waits */
++    int      count;       /* lock_count it gets with the mutex (1, or a cond waiter's saved depth) */
++} lv2_mtx_waiter;
++
+ typedef struct sys_mutex_info {
+     int      active;
+     char     name[8];
+     uint32_t protocol;
+     int      recursive;
+-    uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
++    uint64_t owner_tid;   /* guest thread_id of the owner, 0 = free */
+     int      lock_count;  /* recursive lock count */
+-    volatile int waiters; /* threads blocked acquiring it (sys_mutex_lock, cond re-lock) */
+-
++    int      initialized; /* lk / cv made (once per slot) */
++    int      cond_count;  /* conds created against this mutex (lv2: destroy -> EPERM while > 0) */
++    lv2_mtx_waiter* queue;/* FIFO of threads waiting to be handed the mutex */
+ #ifdef _WIN32
+-    CRITICAL_SECTION cs;
+-    HANDLE           wait_handle;  /* for timed waits */
++    SRWLOCK            lk;
++    CONDITION_VARIABLE cv;
+ #else
+-    pthread_mutex_t  mtx;
++    pthread_mutex_t    lk;
++    pthread_cond_t     cv;
+ #endif
+-
+ } sys_mutex_info;
+ 
++/* Patch 6027, for sys_cond.c. All but the first two need m->lk held. */
++void lv2_mtx_hold(sys_mutex_info* m);
++void lv2_mtx_release(sys_mutex_info* m);
++void lv2_mtx_handoff_locked(sys_mutex_info* m);                         /* owner = next waiter, or free */
++void lv2_mtx_give_or_queue_locked(sys_mutex_info* m, lv2_mtx_waiter* w); /* free: w owns it now; else w queues */
++void lv2_mtx_wait_owner_locked(sys_mutex_info* m, uint64_t tid);        /* sleep until owner_tid == tid */
++void sys_mutex_note(uint32_t id, char op, uint64_t tid, uint32_t lr);   /* patch 6025 ring */
++int  sys_mutex_traced(uint32_t id);                                     /* patch 6025 PS3_MUTEX_TRACE */
++
+ extern sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
+ 
+ /* Syscall handlers */

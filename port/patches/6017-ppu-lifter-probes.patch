@@ -1,0 +1,91 @@
+ppu_lifter: --probes FILE, a diagnostic call to the host at chosen instruction addresses.
+
+Overrides (--overrides) only replace whole functions; a loop inside one function cannot be watched from its entry.
+With --probes, every listed instruction address gets `ppu_probe(ctx, addr)` emitted right before its lifted line
+(after its label, if any), with the guest registers as they are before that instruction. The declaration is at
+block scope (C++ linkage) so the shared header and the other chunks are unchanged; the host defines ppu_probe.
+The parallel lift (-j) hands the list to its workers like the other lift context.
+Without --probes (the default) the output is byte-identical.
+
+Use: watching the loop of Killzone 2's AI waypoint search (0x613DF0) from inside.
+
+Rebased on ps3recomp v0.18.0 (hand-merged): lifter probes beside upstream's insn_patches (_worker_init(..., toc_base=0, insn_patches=None, probes=None))
+
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1043,6 +1043,11 @@ class PPULifter:
+         # PPU_OVERRIDE_<addr> so the host can compile its replacement only
+         # against a lift that made room for it.
+         self.overrides: set[int] = set()
++        # --probes: instruction addresses where the lifted C first calls the
++        # host's `ppu_probe(ctx, addr)` (declared at block scope, C++ linkage),
++        # with the guest registers as they are before that instruction. A
++        # diagnostic hook inside a function body; empty by default.
++        self.probes: set[int] = set()
+         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
+         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
+         self.toc_base: int = 0
+@@ -1155,6 +1160,10 @@ class PPULifter:
+                 func.body_lines.append(f"loc_{insn.addr:08X}:")
+                 emitted_labels.add(insn.addr)
+ 
++            if insn.addr in self.probes:
++                func.body_lines.append(
++                    f"    {{ void ppu_probe(ppu_context*, uint32_t); ppu_probe(ctx, 0x{insn.addr:08X}u); }}")
++
+             patch = self.insn_patches.get(insn.addr)
+             if patch is not None:
+                 c_line = self._patched_translate(insn, func, patch)
+@@ -4967,8 +4976,9 @@ _WORKER_STATE: dict = {}
+ 
+ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
+                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
+-                 toc_base=0, insn_patches=None):
++                 toc_base=0, insn_patches=None, probes=None):
+     _WORKER_STATE["segs"] = segs
++    _WORKER_STATE["probes"] = probes or set()
+     _WORKER_STATE["be"] = big_endian
+     _WORKER_STATE["names"] = name_map
+     _WORKER_STATE["prefix"] = prefix
+@@ -4999,6 +5009,7 @@ def _worker_lift(task):
+     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
+     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
++    lifter.probes = _WORKER_STATE.get("probes", set())
+     results = []
+     for start, end in bounds:
+         blob = b""
+@@ -5034,7 +5045,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
+                              lifter.hle_stub_nids, lifter.function_entries,
+                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
+                              getattr(lifter, "toc_base", 0),
+-                             lifter.insn_patches))
++                             lifter.insn_patches, lifter.probes))
+     try:
+         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
+             results_by_idx[idx0] = results
+@@ -5117,6 +5128,9 @@ def main() -> None:
+     parser.add_argument("--overrides", metavar="FILE", default=None,
+                         help="Text file of function entry addresses (hex, one per line, '#' comments) "
+                              "the host replaces: their lifted bodies are emitted as <name>__lifted")
++    parser.add_argument("--probes", metavar="FILE", default=None,
++                        help="Text file of instruction addresses (hex, one per line, '#' comments): the "
++                             "lifted C calls the host's ppu_probe(ctx, addr) before each one (diagnostics)")
+     parser.add_argument("--hle-stubs", metavar="FILE", default=None,
+                         help="EBOOT.imports.json ([{library,nid,stub}]). Each "
+                              "import stub address is lifted as ps3_hle_call(nid) "
+@@ -5590,6 +5604,13 @@ def main() -> None:
+                 if _ln:
+                     lifter.overrides.add(int(_ln, 16))
+         print(f"  overrides: {len(lifter.overrides)} function(s) left to the host")
++    if args.probes:
++        with open(args.probes) as _pf:
++            for _ln in _pf:
++                _ln = _ln.split("#", 1)[0].strip()
++                if _ln:
++                    lifter.probes.add(int(_ln, 16))
++        print(f"  probes: {len(lifter.probes)} instruction(s) call ppu_probe")
+     lifter.function_entries = _func_entries
+     lifter.jump_tables = jt_dispatchers
+     if args.insn_patches:

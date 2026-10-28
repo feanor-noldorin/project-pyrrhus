@@ -1,0 +1,486 @@
+KZ2 patch 6031: async SPU tasks run on reusable host threads (spu_async_pool) instead of a new thread per task.
+
+spu_workload_dispatch_async started every SPURS task on a new detached host thread with a 256 MB stack reservation.
+Killzone 2 starts about 150 tasks a second in a level (Physics.KdTree, Gfx.Scene.Portals, Gfx.PB.*): an earlier change measured
+cellSpursCreateTaskWithAttribute at 0.23 ms per call on the main thread (mostly CreateThread under Wine, which also runs
+every DLL's thread attach and detach) and about 2 cores spent in threads that lived under 0.25 s.
+runtime/spu/spu_async_pool.h (header-only, static functions, so whatever compiles spu_workload.c needs no new source): submit hands the job to a parked thread if there is one, else starts a new thread
+(never queues: a task may wait on another task, so every task must start at once, as before); a finished thread parks
+for SPU_ASYNC_POOL_IDLE_MS (default 10000) and then ends. The job wrapper keeps the per-thread work of the old thread
+function (lock-line forget of the stack after each job; the stack guarantee is set once per pool thread). Per-thread
+state the next task on the same thread can see: g_kz3_cur_taskset/taskid (set at job start), diagnostics counters,
+and spu_channels.c's s_exit_seen, which only image 22 uses (YDKJ's cri task; KZ2 has no async image 22).
+SPU_ASYNC_POOL=0 starts a thread per task as before. Host test tools/runtime/test_spu_async_pool.sh (POSIX build of
+the pool: reuse, 16 mutually waiting jobs all run at once, idle retirement, SPU_ASYNC_POOL=0; ThreadSanitizer).
+
+--- /dev/null
++++ b/runtime/spu/spu_async_pool.h
+@@ -0,0 +1,206 @@
++/* spu_async_pool.h -- KZ2 patch 6031: reusable host threads for async SPU work (SPURS tasks).
++ *
++ * spu_workload_dispatch_async ran every SPURS task on a new detached host thread (256 MB stack reservation). Killzone 2
++ * starts about 150 tasks a second in a level, so the process created and destroyed about 150 threads a second; under
++ * Wine each one also runs every DLL's thread attach/detach. The pool keeps finished threads parked for reuse:
++ *   - submit hands the job to an idle thread if there is one, else starts a new thread (never queues: a task may
++ *     wait on another task, so every submitted job must start at once, as with a thread per task);
++ *   - a thread that stays idle for SPU_ASYNC_POOL_IDLE_MS (default 10000) ends;
++ *   - SPU_ASYNC_POOL=0 starts a new thread per job, as before.
++ * The job function runs on the pool thread; anything it leaves in thread-local storage is seen by the next job on
++ * that thread, so callers reset their per-job thread state at job start.
++ * Header-only (static functions): spu_workload.c includes it, so every build and host test that compiles
++ * spu_workload.c needs no extra source file. Host test: tools/runtime/test_spu_async_pool.sh (POSIX build). */
++#ifndef SPU_ASYNC_POOL_H
++#define SPU_ASYNC_POOL_H
++
++#include <stddef.h>
++
++typedef void (*spu_async_pool_fn)(void* arg);
++
++typedef struct {
++    unsigned long long submitted;   /* jobs handed out */
++    unsigned long long reused;      /* ... of which went to a parked thread */
++    unsigned long long created;     /* threads started */
++    unsigned long long retired;     /* threads that ended after the idle timeout */
++    unsigned idle;                  /* threads parked now */
++    unsigned live;                  /* threads alive now (busy + parked) */
++} spu_async_pool_stats_t;
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++#include <windows.h>
++typedef SRWLOCK            pool_lock_t;
++typedef CONDITION_VARIABLE pool_cv_t;
++#define POOL_LOCK_INIT     SRWLOCK_INIT
++static void pool_lock(pool_lock_t* l)   { AcquireSRWLockExclusive(l); }
++static void pool_unlock(pool_lock_t* l) { ReleaseSRWLockExclusive(l); }
++static void pool_cv_init(pool_cv_t* c)  { InitializeConditionVariable(c); }
++static void pool_cv_destroy(pool_cv_t* c) { (void)c; }
++static void pool_cv_signal(pool_cv_t* c) { WakeConditionVariable(c); }
++/* -> 0 = woken (or spurious), 1 = timed out */
++static int  pool_cv_wait(pool_cv_t* c, pool_lock_t* l, unsigned ms)
++{ return SleepConditionVariableSRW(c, l, ms, 0) ? 0 : (GetLastError() == ERROR_TIMEOUT); }
++#else
++#include <errno.h>
++#include <pthread.h>
++#include <time.h>
++typedef pthread_mutex_t    pool_lock_t;
++typedef pthread_cond_t     pool_cv_t;
++#define POOL_LOCK_INIT     PTHREAD_MUTEX_INITIALIZER
++static void pool_lock(pool_lock_t* l)   { pthread_mutex_lock(l); }
++static void pool_unlock(pool_lock_t* l) { pthread_mutex_unlock(l); }
++static void pool_cv_init(pool_cv_t* c)
++{
++    pthread_condattr_t a;
++    pthread_condattr_init(&a);
++    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
++    pthread_cond_init(c, &a);
++    pthread_condattr_destroy(&a);
++}
++static void pool_cv_destroy(pool_cv_t* c) { pthread_cond_destroy(c); }
++static void pool_cv_signal(pool_cv_t* c) { pthread_cond_signal(c); }
++static int  pool_cv_wait(pool_cv_t* c, pool_lock_t* l, unsigned ms)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    ts.tv_sec += ms / 1000;
++    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
++    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++    return pthread_cond_timedwait(c, l, &ts) == ETIMEDOUT;
++}
++#endif
++
++typedef struct pool_worker {
++    struct pool_worker* next_idle;   /* on the idle stack */
++    pool_cv_t           cv;
++    spu_async_pool_fn   fn;          /* next job; NULL while parked without one */
++    void*               arg;
++    size_t              stack;       /* reservation this thread was made with */
++} pool_worker;
++
++static pool_lock_t  s_pool_lock = POOL_LOCK_INIT;
++static pool_worker* s_pool_idle;           /* parked threads, most recent first (its stack is warm) */
++static spu_async_pool_stats_t s_pool_st;
++
++static int pool_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("SPU_ASYNC_POOL"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++static unsigned pool_idle_ms(void)
++{
++    static unsigned v = 0;
++    if (!v) { const char* e = getenv("SPU_ASYNC_POOL_IDLE_MS"); long x = e ? atol(e) : 0; v = x > 0 ? (unsigned)x : 10000u; }
++    return v;
++}
++
++/* Runs jobs until parked longer than the idle time; then unlinks itself and ends. */
++static void pool_worker_loop(pool_worker* w)
++{
++    for (;;) {
++        spu_async_pool_fn fn = w->fn;
++        void* arg = w->arg;
++        fn(arg);
++        pool_lock(&s_pool_lock);
++        w->fn = NULL;
++        if (!pool_enabled()) { s_pool_st.live--; pool_unlock(&s_pool_lock); break; }
++        w->next_idle = s_pool_idle; s_pool_idle = w; s_pool_st.idle++;
++        int timed_out = 0;
++        while (!w->fn && !timed_out) timed_out = pool_cv_wait(&w->cv, &s_pool_lock, pool_idle_ms());
++        if (!w->fn) {                    /* timed out with no job: still on the idle stack, take it off */
++            pool_worker** pp = &s_pool_idle;
++            while (*pp && *pp != w) pp = &(*pp)->next_idle;
++            if (*pp) { *pp = w->next_idle; s_pool_st.idle--; }
++            s_pool_st.live--; s_pool_st.retired++;
++            pool_unlock(&s_pool_lock);
++            break;
++        }
++        pool_unlock(&s_pool_lock);            /* submit popped us and set fn */
++    }
++    pool_cv_destroy(&w->cv);
++    free(w);
++}
++
++#ifdef _WIN32
++static DWORD WINAPI pool_thread(LPVOID p)
++{
++    /* Handler headroom so a stack overflow in lifted SPU code reaches the crash reporter (as the per-task threads). */
++    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
++    pool_worker_loop((pool_worker*)p);
++    return 0;
++}
++#else
++static void* pool_thread(void* p) { pool_worker_loop((pool_worker*)p); return NULL; }
++#endif
++
++static int pool_start_thread(pool_worker* w, size_t stack)
++{
++#ifdef _WIN32
++    HANDLE th = CreateThread(NULL, stack, pool_thread, w, stack ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
++    if (!th) return 0;
++    CloseHandle(th);
++    return 1;
++#else
++    pthread_t th;
++    pthread_attr_t a;
++    int rc = -1;
++    pthread_attr_init(&a);
++    if (!stack || pthread_attr_setstacksize(&a, stack) == 0) rc = pthread_create(&th, &a, pool_thread, w);
++    pthread_attr_destroy(&a);
++    if (rc != 0) rc = pthread_create(&th, NULL, pool_thread, w);   /* default stack: better than no thread */
++    if (rc != 0) return 0;
++    pthread_detach(th);
++    return 1;
++#endif
++}
++
++/* Runs fn(arg) on a pool thread with at least stack_reserve bytes of stack. 1 = started, 0 = no thread. */
++static int spu_async_pool_submit(spu_async_pool_fn fn, void* arg, size_t stack_reserve)
++{
++    if (!fn) return 0;
++    pool_lock(&s_pool_lock);
++    s_pool_st.submitted++;
++    if (pool_enabled()) {
++        /* A parked thread made with a large enough stack (every caller asks for the same size today). */
++        pool_worker** pp = &s_pool_idle;
++        while (*pp && (*pp)->stack < stack_reserve) pp = &(*pp)->next_idle;
++        if (*pp) {
++            pool_worker* w = *pp;
++            *pp = w->next_idle; s_pool_st.idle--; s_pool_st.reused++;
++            w->fn = fn; w->arg = arg;
++            pool_cv_signal(&w->cv);
++            pool_unlock(&s_pool_lock);
++            return 1;
++        }
++    }
++    s_pool_st.created++; s_pool_st.live++;
++    pool_unlock(&s_pool_lock);
++    pool_worker* w = (pool_worker*)calloc(1, sizeof *w);
++    if (!w) goto fail;
++    pool_cv_init(&w->cv);
++    w->fn = fn; w->arg = arg; w->stack = stack_reserve;
++    if (pool_start_thread(w, stack_reserve)) return 1;
++    pool_cv_destroy(&w->cv);
++    free(w);
++fail:
++    pool_lock(&s_pool_lock);
++    s_pool_st.submitted--; s_pool_st.created--; s_pool_st.live--;
++    pool_unlock(&s_pool_lock);
++    return 0;
++}
++
++#if defined(__GNUC__)
++__attribute__((unused))
++#endif
++static void spu_async_pool_stats(spu_async_pool_stats_t* out)
++{
++    pool_lock(&s_pool_lock);
++    *out = s_pool_st;
++    pool_unlock(&s_pool_lock);
++}
++
++#endif
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/runtime/spu/spu_async_pool.h b/runtime/spu/spu_async_pool.h
+new file mode 100644
+--- /dev/null
++++ b/runtime/spu/spu_async_pool.h
+@@ -0,0 +1,206 @@
++/* spu_async_pool.h -- KZ2 patch 6031: reusable host threads for async SPU work (SPURS tasks).
++ *
++ * spu_workload_dispatch_async ran every SPURS task on a new detached host thread (256 MB stack reservation). Killzone 2
++ * starts about 150 tasks a second in a level, so the process created and destroyed about 150 threads a second; under
++ * Wine each one also runs every DLL's thread attach/detach. The pool keeps finished threads parked for reuse:
++ *   - submit hands the job to an idle thread if there is one, else starts a new thread (never queues: a task may
++ *     wait on another task, so every submitted job must start at once, as with a thread per task);
++ *   - a thread that stays idle for SPU_ASYNC_POOL_IDLE_MS (default 10000) ends;
++ *   - SPU_ASYNC_POOL=0 starts a new thread per job, as before.
++ * The job function runs on the pool thread; anything it leaves in thread-local storage is seen by the next job on
++ * that thread, so callers reset their per-job thread state at job start.
++ * Header-only (static functions): spu_workload.c includes it, so every build and host test that compiles
++ * spu_workload.c needs no extra source file. Host test: tools/runtime/test_spu_async_pool.sh (POSIX build). */
++#ifndef SPU_ASYNC_POOL_H
++#define SPU_ASYNC_POOL_H
++
++#include <stddef.h>
++
++typedef void (*spu_async_pool_fn)(void* arg);
++
++typedef struct {
++    unsigned long long submitted;   /* jobs handed out */
++    unsigned long long reused;      /* ... of which went to a parked thread */
++    unsigned long long created;     /* threads started */
++    unsigned long long retired;     /* threads that ended after the idle timeout */
++    unsigned idle;                  /* threads parked now */
++    unsigned live;                  /* threads alive now (busy + parked) */
++} spu_async_pool_stats_t;
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifdef _WIN32
++#include <windows.h>
++typedef SRWLOCK            pool_lock_t;
++typedef CONDITION_VARIABLE pool_cv_t;
++#define POOL_LOCK_INIT     SRWLOCK_INIT
++static void pool_lock(pool_lock_t* l)   { AcquireSRWLockExclusive(l); }
++static void pool_unlock(pool_lock_t* l) { ReleaseSRWLockExclusive(l); }
++static void pool_cv_init(pool_cv_t* c)  { InitializeConditionVariable(c); }
++static void pool_cv_destroy(pool_cv_t* c) { (void)c; }
++static void pool_cv_signal(pool_cv_t* c) { WakeConditionVariable(c); }
++/* -> 0 = woken (or spurious), 1 = timed out */
++static int  pool_cv_wait(pool_cv_t* c, pool_lock_t* l, unsigned ms)
++{ return SleepConditionVariableSRW(c, l, ms, 0) ? 0 : (GetLastError() == ERROR_TIMEOUT); }
++#else
++#include <errno.h>
++#include <pthread.h>
++#include <time.h>
++typedef pthread_mutex_t    pool_lock_t;
++typedef pthread_cond_t     pool_cv_t;
++#define POOL_LOCK_INIT     PTHREAD_MUTEX_INITIALIZER
++static void pool_lock(pool_lock_t* l)   { pthread_mutex_lock(l); }
++static void pool_unlock(pool_lock_t* l) { pthread_mutex_unlock(l); }
++static void pool_cv_init(pool_cv_t* c)
++{
++    pthread_condattr_t a;
++    pthread_condattr_init(&a);
++    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
++    pthread_cond_init(c, &a);
++    pthread_condattr_destroy(&a);
++}
++static void pool_cv_destroy(pool_cv_t* c) { pthread_cond_destroy(c); }
++static void pool_cv_signal(pool_cv_t* c) { pthread_cond_signal(c); }
++static int  pool_cv_wait(pool_cv_t* c, pool_lock_t* l, unsigned ms)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    ts.tv_sec += ms / 1000;
++    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
++    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
++    return pthread_cond_timedwait(c, l, &ts) == ETIMEDOUT;
++}
++#endif
++
++typedef struct pool_worker {
++    struct pool_worker* next_idle;   /* on the idle stack */
++    pool_cv_t           cv;
++    spu_async_pool_fn   fn;          /* next job; NULL while parked without one */
++    void*               arg;
++    size_t              stack;       /* reservation this thread was made with */
++} pool_worker;
++
++static pool_lock_t  s_pool_lock = POOL_LOCK_INIT;
++static pool_worker* s_pool_idle;           /* parked threads, most recent first (its stack is warm) */
++static spu_async_pool_stats_t s_pool_st;
++
++static int pool_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("SPU_ASYNC_POOL"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++static unsigned pool_idle_ms(void)
++{
++    static unsigned v = 0;
++    if (!v) { const char* e = getenv("SPU_ASYNC_POOL_IDLE_MS"); long x = e ? atol(e) : 0; v = x > 0 ? (unsigned)x : 10000u; }
++    return v;
++}
++
++/* Runs jobs until parked longer than the idle time; then unlinks itself and ends. */
++static void pool_worker_loop(pool_worker* w)
++{
++    for (;;) {
++        spu_async_pool_fn fn = w->fn;
++        void* arg = w->arg;
++        fn(arg);
++        pool_lock(&s_pool_lock);
++        w->fn = NULL;
++        if (!pool_enabled()) { s_pool_st.live--; pool_unlock(&s_pool_lock); break; }
++        w->next_idle = s_pool_idle; s_pool_idle = w; s_pool_st.idle++;
++        int timed_out = 0;
++        while (!w->fn && !timed_out) timed_out = pool_cv_wait(&w->cv, &s_pool_lock, pool_idle_ms());
++        if (!w->fn) {                    /* timed out with no job: still on the idle stack, take it off */
++            pool_worker** pp = &s_pool_idle;
++            while (*pp && *pp != w) pp = &(*pp)->next_idle;
++            if (*pp) { *pp = w->next_idle; s_pool_st.idle--; }
++            s_pool_st.live--; s_pool_st.retired++;
++            pool_unlock(&s_pool_lock);
++            break;
++        }
++        pool_unlock(&s_pool_lock);            /* submit popped us and set fn */
++    }
++    pool_cv_destroy(&w->cv);
++    free(w);
++}
++
++#ifdef _WIN32
++static DWORD WINAPI pool_thread(LPVOID p)
++{
++    /* Handler headroom so a stack overflow in lifted SPU code reaches the crash reporter (as the per-task threads). */
++    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
++    pool_worker_loop((pool_worker*)p);
++    return 0;
++}
++#else
++static void* pool_thread(void* p) { pool_worker_loop((pool_worker*)p); return NULL; }
++#endif
++
++static int pool_start_thread(pool_worker* w, size_t stack)
++{
++#ifdef _WIN32
++    HANDLE th = CreateThread(NULL, stack, pool_thread, w, stack ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
++    if (!th) return 0;
++    CloseHandle(th);
++    return 1;
++#else
++    pthread_t th;
++    pthread_attr_t a;
++    int rc = -1;
++    pthread_attr_init(&a);
++    if (!stack || pthread_attr_setstacksize(&a, stack) == 0) rc = pthread_create(&th, &a, pool_thread, w);
++    pthread_attr_destroy(&a);
++    if (rc != 0) rc = pthread_create(&th, NULL, pool_thread, w);   /* default stack: better than no thread */
++    if (rc != 0) return 0;
++    pthread_detach(th);
++    return 1;
++#endif
++}
++
++/* Runs fn(arg) on a pool thread with at least stack_reserve bytes of stack. 1 = started, 0 = no thread. */
++static int spu_async_pool_submit(spu_async_pool_fn fn, void* arg, size_t stack_reserve)
++{
++    if (!fn) return 0;
++    pool_lock(&s_pool_lock);
++    s_pool_st.submitted++;
++    if (pool_enabled()) {
++        /* A parked thread made with a large enough stack (every caller asks for the same size today). */
++        pool_worker** pp = &s_pool_idle;
++        while (*pp && (*pp)->stack < stack_reserve) pp = &(*pp)->next_idle;
++        if (*pp) {
++            pool_worker* w = *pp;
++            *pp = w->next_idle; s_pool_st.idle--; s_pool_st.reused++;
++            w->fn = fn; w->arg = arg;
++            pool_cv_signal(&w->cv);
++            pool_unlock(&s_pool_lock);
++            return 1;
++        }
++    }
++    s_pool_st.created++; s_pool_st.live++;
++    pool_unlock(&s_pool_lock);
++    pool_worker* w = (pool_worker*)calloc(1, sizeof *w);
++    if (!w) goto fail;
++    pool_cv_init(&w->cv);
++    w->fn = fn; w->arg = arg; w->stack = stack_reserve;
++    if (pool_start_thread(w, stack_reserve)) return 1;
++    pool_cv_destroy(&w->cv);
++    free(w);
++fail:
++    pool_lock(&s_pool_lock);
++    s_pool_st.submitted--; s_pool_st.created--; s_pool_st.live--;
++    pool_unlock(&s_pool_lock);
++    return 0;
++}
++
++#if defined(__GNUC__)
++__attribute__((unused))
++#endif
++static void spu_async_pool_stats(spu_async_pool_stats_t* out)
++{
++    pool_lock(&s_pool_lock);
++    *out = s_pool_st;
++    pool_unlock(&s_pool_lock);
++}
++
++#endif
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include "ps3emu/log_first.h"
++#include "spu_async_pool.h"   /* KZ2 patch 6031 */
+ #ifdef _WIN32
+ #include <windows.h>
+ #else
+@@ -1143,6 +1144,20 @@ static void spu_async_run(spu_async_job* j)
+     free(j);
+ }
+ 
++/* KZ2 patch 6031: one async job on a pool thread (spu_async_pool.c parks finished threads for reuse). The pool
++ * thread set its stack guarantee once; per job: the per-task thread state, then the run, then the lock-line forget of
++ * this stack (nothing on it may stay in the reserver set between jobs either). */
++static void spu_async_pool_job(void* p)
++{
++    spu_async_run((spu_async_job*)p);
++#ifdef _WIN32
++    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
++      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
++      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
++      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
++#endif
++}
++
+ #ifdef _WIN32
+ static DWORD WINAPI spu_async_thread(LPVOID p) {
+     ps3_thread_name("spu job");
+@@ -1724,6 +1739,15 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                 fprintf(stderr, "\n");
+             } } }
+ 
++    /* KZ2 patch 6031: a parked pool thread when there is one, else a new one (never queued); same 256 MB stack
++     * reservation. KZ2 starts ~150 tasks a second in a level; a new thread each cost the main thread ~0.2 ms per
++     * CreateTask under Wine and ~2 cores of thread start/exit. SPU_ASYNC_POOL=0: the thread per task below. */
++    { static int _pool = -1;
++      if (_pool < 0) { const char* e = getenv("SPU_ASYNC_POOL"); _pool = (e && e[0] == '0') ? 0 : 1; }
++      if (_pool) {
++          if (spu_async_pool_submit(spu_async_pool_job, j, 256u << 20)) return 1;
++          free(j); return 0;
++      } }
+ #ifdef _WIN32
+     /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
+      * chains are deep host call chains with fat lifted frames -- a 1MB stack

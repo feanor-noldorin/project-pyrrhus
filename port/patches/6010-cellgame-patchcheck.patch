@@ -1,0 +1,58 @@
+cellGame: cellGamePatchCheck.
+
+Symptom: Killzone 2 1.29 booted with its update (BootCheck attribute PATCH, patch 6007) calls cellGamePatchCheck
+(NID 0xCE4374F6), which was unresolved ("[hle] unresolved NID 0xCE4374F6"). Fix: return CELL_GAME_RET_OK and the
+BootCheck sizes when PS3_GAME_ATTR_PATCH=1, CELL_GAME_ERROR_NOTPATCH otherwise; ContentPermit is unchanged.
+
+Verification: Killzone 2 under Proton ("[cellGame] PatchCheck() -> OK", 0 unresolved imports).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/system/cellGame.c b/libs/system/cellGame.c
+index 760087b..ac733df 100644
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -388,6 +388,31 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+     return CELL_OK;
+ }
+ 
++/* KZ2 patch 6010: cellGamePatchCheck (NID 0xCE4374F6). A title that BootCheck
++ * told it was booted with its update (attribute PATCH, patch 6007) calls this
++ * next; it was the one unresolved import of Killzone 2 1.29 (the HLE default
++ * returned 0 without writing `size`). Returns CELL_GAME_RET_OK and the same
++ * sizes BootCheck gives when PS3_GAME_ATTR_PATCH=1, CELL_GAME_ERROR_NOTPATCH
++ * otherwise. The content session stays the disc's: ContentPermit keeps
++ * returning /dev_bdvd paths, and the update files are served by the port's
++ * VFS miss hook . ASSUMPTION: that is enough for
++ * the title (it read the update through those paths in a test run). */
++s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved)
++{
++    (void)reserved;
++    const char* pe = getenv("PS3_GAME_ATTR_PATCH");
++    const int patch = pe && pe[0] == '1';
++    printf("[cellGame] PatchCheck() -> %s\n", patch ? "OK" : "NOTPATCH");
++    if (!patch) return CELL_GAME_ERROR_NOTPATCH;
++    uint32_t size_ea = (uint32_t)(uintptr_t)size;
++    if (size_ea) {
++        vm_write32(size_ea + 0, (u32)content_free_kb());
++        vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
++        vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
++    }
++    return CELL_GAME_RET_OK;
++}
++
+ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
+ {
+     printf("[cellGame] ContentPermit() -> %s\n",
+diff --git a/libs/system/cellGame.h b/libs/system/cellGame.h
+index 734a2b7..0257327 100644
+--- a/libs/system/cellGame.h
++++ b/libs/system/cellGame.h
+@@ -145,6 +145,7 @@ void cellGame_set_content_path(const char* path);
+  * Functions
+  * -----------------------------------------------------------------------*/
+ 
++s32 cellGamePatchCheck(CellGameContentSize* size, u64 reserved);   /* KZ2 patch 6010 */
+ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+                        char* dirName);
+ 

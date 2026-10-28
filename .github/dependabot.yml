@@ -1,0 +1,15 @@
+# Dependabot (adapted from Project Helghast, the Killzone 3 PC port: same author, MIT): GitHub Actions versions
+# weekly, plus security updates. The repository has no other package manifest: Python tools use the standard library
+# or the Nix shell, Nix inputs (flake.lock) are updated by hand, and the ps3recomp submodule is pinned on purpose (the
+# patches in port/patches are made against that commit) and is updated by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

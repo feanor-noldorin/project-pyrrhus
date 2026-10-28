@@ -1,0 +1,155 @@
+KZ2 patch 4020: the prompt-device switch ignores keys already held when the window comes back to the front.
+
+Hand session 2026-10-22 (session log kz2-20261022-090725.log): pressing F12 (Steam's screenshot key) flipped the
+button prompts to keycaps. All six "[pad] last input: keyboard" lines name buttons 0x0800 = R1, whose default keys are
+Mouse1 and O; F12 is bound to nothing and pad_kb_eval never sees it. KZ2 4016 takes a key as pressed when it is down
+now and was up at the previous poll, and a poll while the window is not in front reads every key as up, so a key that
+is held at the first poll back in front (the click that brought the window back, a button the overlay or the desktop
+kept down across a focus change) counted as a fresh press: once per focus change, which 4016's own header already
+named ("again after a focus change"). Now the edge lives in pad_keybinds.h (pad_kb_edge, host test
+tools/runtime/test_pad_kb_edge.sh): the first poll in front takes the held keys as the baseline, and it starts in that
+state, so a key held while the game starts does not count either. KZ3 4011's intent is kept: any bound key or mouse
+button pressed in the game window switches the prompts to keycaps. The log line names the keys ("(r1:Mouse1)"), and the
+window leaving and coming back to the front is logged (first 20) with the keys held at that moment.
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -104,6 +104,7 @@ static int           s_port_motion[PAD_MAX_HOST_PORTS];
+ static PadLastDevice s_last_dev = { PAD_DEV_NONE, -1 };
+ static int           s_keys_active = 0;   /* this poll had keyboard/mouse input (pad_poll_keyboard) */
+ static unsigned      s_keys_new_b, s_keys_new_d;   /* 4016: the keys that went down (the log line names them) */
++static char          s_keys_new_names[96];         /* 4020: their keys, "r1:Mouse1" */
+ 
+ #if PAD_BACKEND_SDL
+ typedef struct PadSdlGamepad PadSdlGamepad;   /* SDL_Gamepad */
+@@ -210,6 +211,8 @@ static int pad_host_window_focused(void)
+ 
+ static PadKeybinds s_kb;
+ static PadKbState  s_kb_state;          /* this poll's keys (zero when unfocused) */
++static PadKbEdge    s_kb_edge = { { 0, 0 }, 1 };   /* 4020: held keys and the baseline after a focus change */
++static int          s_kb_front = 0;                /* 4020: the last poll had the window in front */
+ static int         s_kb_ready = 0;
+ static wchar_t     s_kb_path[1024];
+ static FILETIME    s_kb_stamp;
+@@ -437,8 +440,6 @@ static int pad_kb_test_key(void)
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+-    /* KZ2 patch 4016: the keys held at the last poll, so only a new press makes the keyboard the prompt device */
+-    const PadKbState was = s_kb_state;
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     s_kb_state.buttons = 0; s_kb_state.dirs = 0;
+     if (off) return;
+@@ -469,21 +470,42 @@ static void pad_poll_keyboard(void)
+         if (pad_kb_ui_busy(&s_kb_ui) || !focused) {
+             /* Nothing while another program has the focus; releasing on focus loss keeps a key held while
+              * alt-tabbing from staying down forever. */
++            (void)pad_kb_edge(&s_kb_edge, 0, s_kb_state);   /* 4020: the next poll in front takes a new baseline */
++            if (s_kb_front) {
++                static int said = 0;
++                s_kb_front = 0;
++                if (said < 20) { said++; printf("[pad] window not in front: keys ignored\n"); fflush(stdout); }
++            }
+             ReleaseSRWLockExclusive(&s_kb_lock);
+             return;
+         }
+     }
+     s_kb_state = pad_kb_eval(&s_kb, pad_kb_down_win, NULL);
+-    ReleaseSRWLockExclusive(&s_kb_lock);
+     /* KZ2 patch 4016: a key going down, not a key being down (KZ3 4011 took the held state). Under Proton on a Wayland
+      * desktop a key can read as held with nobody touching the keyboard (a release the window never saw), and every
+      * idle moment then switched the prompts back to keycaps: "last input: keyboard (port -1)" after each pad input,
+-     * over and over (in a hand session). A stuck key now switches at most once. Kept until
+-     * pad_prompt_track reads it. */
++     * over and over (in a hand session). Kept until pad_prompt_track reads it.
++     * KZ2 patch 4020: the edge is pad_kb_edge's, which also takes the keys held when the window comes back to the
++     * front as the baseline, so a key held across a focus change (the F12 screenshot case) is not a press. */
+     {
+-        const unsigned nb = (unsigned)(s_kb_state.buttons & ~was.buttons), nd = (unsigned)(s_kb_state.dirs & ~was.dirs);
+-        if (nb || nd) { s_keys_active = 1; s_keys_new_b = nb; s_keys_new_d = nd; }
++        const PadKbState fresh = pad_kb_edge(&s_kb_edge, 1, s_kb_state);
++        if (!s_kb_front) {
++            static int said = 0;
++            s_kb_front = 1;
++            if (said < 20 && (s_kb_state.buttons || s_kb_state.dirs)) {
++                char names[96];
++                said++;
++                pad_kb_names(&s_kb, s_kb_state, pad_kb_down_win, NULL, names, sizeof names);
++                printf("[pad] window in front again with keys held (%s): not counted as presses\n", names);
++                fflush(stdout);
++            }
++        }
++        if (fresh.buttons || fresh.dirs) {
++            s_keys_active = 1; s_keys_new_b = fresh.buttons; s_keys_new_d = fresh.dirs;
++            pad_kb_names(&s_kb, fresh, pad_kb_down_win, NULL, s_keys_new_names, sizeof s_keys_new_names);
++        }
+     }
++    ReleaseSRWLockExclusive(&s_kb_lock);
+ }
+ 
+ /* Port 0 = the XInput pad (if any) plus the keys. Without a pad, port 0 is the keys alone and is reported
+@@ -985,7 +1007,7 @@ static void pad_prompt_track(void)
+         printf("[pad] last input: %s%s (port %d)", pad_dev_name(s_last_dev.dev),
+                s_last_dev.port >= 0 && s_port_motion[s_last_dev.port] ? ", motion sensors" : "", s_last_dev.port);
+         if (s_last_dev.dev == PAD_DEV_KEYBOARD)   /* 4016: which bound buttons/directions went down */
+-            printf(" keys buttons 0x%04X dirs 0x%02X", s_keys_new_b, s_keys_new_d);
++            printf(" keys buttons 0x%04X dirs 0x%02X (%s)", s_keys_new_b, s_keys_new_d, s_keys_new_names);
+         printf("\n");
+         fflush(stdout);
+     }
+diff --git a/libs/input/pad_keybinds.h b/libs/input/pad_keybinds.h
+--- a/libs/input/pad_keybinds.h
++++ b/libs/input/pad_keybinds.h
+@@ -347,6 +347,49 @@ static PadKbState pad_kb_eval(const PadKeybinds* kb, PadKbDown down, void* ctx)
+     return st;
+ }
+ 
++/* KZ2 patch 4020: which bound keys went down this poll, for the prompt-device switch (KZ2 4016 took the edge from
++ * the held state of the previous poll). While the window is not in front (or the bindings page captures keys) the
++ * keys read as up; the first poll back in front takes the keys held at that moment as the baseline instead of as
++ * presses. A key already down when the window comes back (the click that brought it to the front, a key the overlay
++ * or the desktop kept held across a focus change, as around Steam's F12 screenshot) is not a press made in the game,
++ * and it switched the prompts to keycaps once per focus change (hand session 2026-10-22: six switches, all on R1's
++ * binding, Mouse1 / O; F12 itself is unbound and never counted). Starts in the baseline state, so a key held while
++ * the game starts does not count either. */
++typedef struct { PadKbState held; int baseline; } PadKbEdge;
++
++static inline void pad_kb_edge_init(PadKbEdge* e) { e->held.buttons = 0; e->held.dirs = 0; e->baseline = 1; }
++
++static inline PadKbState pad_kb_edge(PadKbEdge* e, int in_front, PadKbState now)
++{
++    PadKbState fresh = { 0, 0 };
++    if (!in_front) { e->held = fresh; e->baseline = 1; return fresh; }
++    if (e->baseline) { e->baseline = 0; e->held = now; return fresh; }
++    fresh.buttons = (unsigned short)(now.buttons & ~e->held.buttons);
++    fresh.dirs = (unsigned char)(now.dirs & ~e->held.dirs);
++    e->held = now;
++    return fresh;
++}
++
++/* KZ2 patch 4020: the names of the held keys behind the inputs in `st` ("r1:Mouse1 cross:Space"), for the log. */
++static inline void pad_kb_names(const PadKeybinds* kb, PadKbState st, PadKbDown down, void* ctx, char* buf, size_t n)
++{
++    size_t o = 0;
++    int i, s;
++    if (n) buf[0] = 0;
++    for (i = 0; i < PKB_N_INPUTS; i++) {
++        int hit = pad_kb_inputs[i].dir >= 0 ? (st.dirs >> pad_kb_inputs[i].dir) & 1 : (st.buttons & pad_kb_inputs[i].btn) != 0;
++        if (!hit) continue;
++        for (s = 0; s < PKB_SLOTS; s++)
++            if (kb->key[i][s] && down(ctx, kb->key[i][s])) {
++                int w = snprintf(buf + o, o < n ? n - o : 0, "%s%s:%s", o ? " " : "", pad_kb_inputs[i].name,
++                                 pad_kb_key_name(kb->key[i][s]));
++                if (w > 0) o += (size_t)w;
++                if (o >= n) return;
++                break;
++            }
++    }
++}
++
+ /* Stick axis from two opposite directions: both or neither = centre (128), else 0 or 255 (full deflection, also
+  * on a diagonal; ASSUMPTION: the game's own dead zone and response curve want the raw range like a DS3 corner). */
+ static unsigned char pad_kb_axis(unsigned char dirs, int neg, int pos)

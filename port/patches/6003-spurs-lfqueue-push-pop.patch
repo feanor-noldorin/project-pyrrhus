@@ -1,0 +1,226 @@
+libs/spurs: _cellSpursLFQueuePushBody / _cellSpursLFQueuePopBody on the big-endian CellSyncLFQueue line, with the
+wake-up of an SPU task waiting in push2/hs1 (FIOS dearchiver -> Edge zlib task). Upstream
+candidate. A new file plus one hunk in cellSpurs.c, to rebase easily. PS3_LFQ_TRACE=1 logs each push/pop. Also drops
+the depth store at +0x0C in _cellSpursLFQueueInitialize (that is push1.h7/h8 in the LF layout; it made the queue look full).
+
+Rebased on ps3recomp v0.18.0: context and offsets only.
+
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 043b474..80852fc 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -4237,7 +4237,11 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+      * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
+      * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
+      * the queue look permanently empty no matter what a producer wrote. */
+-    vm_write32(q + 0x0C, depth);
++    /* KZ2 patch 6003: NOT depth at +0x0C here. That store (and the comment above it) came over from the
++     * CellSpursQueue initializer, whose consumer reads a u32 ring modulus there; in the LF queue +0x0C/+0x0E are
++     * push1.h7/h8 (h8 = the next push index), so depth there made the queue look full to a PPU producer from the
++     * start (Killzone 2's FIOS: _cellSpursLFQueuePushBody spun forever). Killzone 2's SPU-side pop (Edge zlib task
++     * LS 0x9B60) takes the ring from +0x14 (depth * 2) and never reads +0x0C. The line stays zero there. */
+     vm_write32(q + 0x10, size);
+     vm_write32(q + 0x14, depth);
+     vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);   /* bcptr<void,u64> */
+diff --git a/libs/spurs/cellSpursLFQueue.c b/libs/spurs/cellSpursLFQueue.c
+new file mode 100644
+index 0000000..b8ca1a6
+--- /dev/null
++++ b/libs/spurs/cellSpursLFQueue.c
+@@ -0,0 +1,196 @@
++/* cellSpursLFQueue.c -- PPU side of the SPURS lock-free queue (CellSpursLFQueue = CellSyncLFQueue in guest memory).
++ *
++ * KZ2 patch 6003 (Killzone 2 port). Upstream candidate: ps3recomp v0.13.0 has
++ * _cellSpursLFQueueInitialize (cellSpurs.c) but no push or pop, so a title whose PPU feeds an SPU task through an LF
++ * queue (Killzone 2's FIOS dearchiver -> Edge zlib inflate task) stalls: the import is answered CELL_OK without
++ * writing anything, the task sleeps in WAIT_SIGNAL and the PPU waits forever on the completion event flag.
++ *
++ * Layout and protocol: read off the consumer, the SPU-side libspurs code statically linked into the Edge zlib task
++ * (Killzone 2 v1.01 SPU image at file offset 0xCB3500; LS addresses below). Big-endian, one 128-byte line:
++ *   +0x00 pop1   u16 h1 (pops completed, in order) | u16 h2 (out-of-order pop mask) | u16 h3 | u16 h4 (pops reserved)
++ *   +0x08 push1  u16 h5 (pushes completed, in order) | u16 h6 (out-of-order push mask) | u16 h7 | u16 h8 (reserved)
++ *   +0x10 u32 size   +0x14 u32 depth   +0x18 u64 buffer   +0x24 u32 direction (SPU accepts 0 or 2, 3 = any2any)
++ *   +0x30 u16 push2 pack: three 5-bit counters mod 30, a = bits 10-14 (waiters signalled), b = bits 5-9 (signals
++ *         taken), c = bits 0-4 (waiters registered); +0x32 u16 hs1[15] waiter ids, slot = counter mod 15
++ *   +0x50 u16 pop2 pack, +0x52 u16 hs2[15] (the same for the other direction)   +0x70 u64 eaSignal (taskset)
++ * Indices run mod 2*depth; the element slot is index mod depth. The SPU pop (_cellSpursLFQueuePop @LS 0x9600, pop
++ * pointer @0x9B60) reads h4 vs h5 under GETLLAR; when the queue is empty and the call blocks, it writes its id
++ * ((LS[0x1DC] wklCurrentId << 8) | task id, @0x9848) into hs1[c % 15], advances c and PUTLLCs the line, then
++ * WAIT_SIGNALs (@0x9450); on wake it advances b and retries. So the producer, after committing a push, has to hand
++ * one signal to hs1[a % 15] and advance a while a != c. That is what CompletePush below does, under the lock-line
++ * stripe lock the SPU's PUTLLC compares under, so either side's read-modify-write of the line is one transaction.
++ *
++ * Written for this port from the SPU code above; RPCS3's cellSync.cpp was read as a cross-check of the field names,
++ * not copied. The out-of-order completion masks (h6, h2) follow the same rule the SPU applies to pops: bit 15 is the
++ * next index to commit, and the commit index advances over the leading run of set bits.
++ *
++ * Diagnostics: PS3_LFQ_TRACE=1 logs every push/pop with the line counters and each signal sent. */
++#include "cellSpurs.h"
++#include "../../runtime/ppu/ppu_memory.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <windows.h>
++
++void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* runtime/spu/spu_workload.c */
++
++#define LFQ_ERROR_AGAIN 0x80410101u   /* CELL_SYNC_ERROR_AGAIN */
++#define LFQ_ERROR_NULL  0x80410111u   /* CELL_SYNC_ERROR_NULL_POINTER */
++#define LFQ_ERROR_ALIGN 0x80410110u   /* CELL_SYNC_ERROR_ALIGN */
++#define LFQ_ERROR_PERM  0x80410109u   /* CELL_SYNC_ERROR_PERM */
++
++static int lfq_trace(void)
++{
++    static int t = -1;
++    if (t < 0) { const char* e = getenv("PS3_LFQ_TRACE"); t = (e && *e && *e != '0') ? 1 : 0; }
++    return t;
++}
++
++static inline uint16_t ld16(const uint8_t* l, unsigned o) { return (uint16_t)((l[o] << 8) | l[o + 1]); }
++static inline uint32_t ld32(const uint8_t* l, unsigned o)
++{ return ((uint32_t)l[o] << 24) | ((uint32_t)l[o + 1] << 16) | ((uint32_t)l[o + 2] << 8) | l[o + 3]; }
++static inline void st16(uint8_t* l, unsigned o, uint16_t v) { l[o] = (uint8_t)(v >> 8); l[o + 1] = (uint8_t)v; }
++
++/* Commit index `pos` into an (index, mask) pair: mask bit 15 stands for `idx` itself, bit 15-k for idx+k. */
++static void lfq_commit(uint16_t* idx, uint16_t* mask, uint32_t pos, uint32_t ring)
++{
++    uint32_t off = (pos + ring - *idx) % ring;
++    uint32_t m = *mask;
++    if (off < 16) m |= 0x8000u >> off;
++    uint32_t run = 0;
++    while (run < 16 && (m & (0x8000u >> run))) run++;
++    *mask = (uint16_t)(run >= 16 ? 0 : (m << run));
++    *idx = (uint16_t)((*idx + run) % ring);
++}
++
++/* Hand at most one pending wake-up from a pack (+0x30 or +0x50) and its id array. Returns the id, or -1. */
++static int32_t lfq_take_waiter(uint8_t* l, unsigned pack_off, uint32_t in_flight)
++{
++    uint16_t pack = ld16(l, pack_off);
++    uint32_t a = (pack >> 10) & 31, b = (pack >> 5) & 31, c = pack & 31;
++    if (a == c) return -1;                              /* nobody registered and not yet signalled */
++    uint32_t unacked = (a + 30 - b) % 30;
++    if (in_flight + unacked > 15) return -1;            /* the id ring holds 15: never lap a slot still in use */
++    int32_t id = ld16(l, pack_off + 2 + 2 * (a % 15));
++    a = (a == 29) ? 0 : a + 1;
++    st16(l, pack_off, (uint16_t)((pack & 0x83FFu) | (a << 10)));
++    return id;
++}
++
++/* Read-modify-write of the queue line, atomic against SPU GETLLAR/PUTLLC (same stripe lock, then the reservation of
++ * any SPU holding the line is broken so its PUTLLC fails and it re-reads). */
++typedef int (*lfq_op)(uint8_t* line, void* arg);
++static int lfq_atomic(uint32_t q, lfq_op op, void* arg)
++{
++    uint8_t line[128];
++    PPU_LL_DECL(llm, q, 128);
++    PPU_LL_LOCK(llm);
++    uint8_t* mem = vm_ptr8(q);
++    memcpy(line, mem, 128);
++    int r = op(line, arg);
++    if (memcmp(line, mem, 128) != 0) {
++        memcpy(mem, line, 128);
++        spu_coh_notify_write(q);
++    }
++    PPU_LL_UNLOCK(llm);
++    if (g_resv_store_active > 0) ppu_resv_break_store(q);
++    return r;
++}
++
++typedef struct { int pop; uint32_t pos; int32_t id; uint16_t c1, c2; } lfq_args;
++
++/* Reserve the next index. pop=0: push (h8 vs completed pops h1); pop=1: pop (h4 vs completed pushes h5). */
++static int lfq_reserve(uint8_t* l, void* p)
++{
++    lfq_args* a = (lfq_args*)p;
++    uint32_t depth = ld32(l, 0x14), ring = depth * 2;
++    if (!a->pop) {
++        uint32_t h8 = ld16(l, 0x0E), h1 = ld16(l, 0x00);
++        if ((h8 + ring - h1) % ring >= depth) return 0;  /* full */
++        a->pos = h8;
++        st16(l, 0x0E, (uint16_t)((h8 + 1) % ring));
++    } else {
++        uint32_t h4 = ld16(l, 0x06), h5 = ld16(l, 0x08);
++        if (h4 == h5) return 0;                          /* empty */
++        a->pos = h4;
++        st16(l, 0x06, (uint16_t)((h4 + 1) % ring));
++    }
++    return 1;
++}
++
++static int lfq_complete(uint8_t* l, void* p)
++{
++    lfq_args* a = (lfq_args*)p;
++    uint32_t ring = ld32(l, 0x14) * 2;
++    if (!a->pop) {
++        uint16_t h5 = ld16(l, 0x08), h6 = ld16(l, 0x0A);
++        lfq_commit(&h5, &h6, a->pos, ring);
++        st16(l, 0x08, h5); st16(l, 0x0A, h6);
++        uint32_t pops_in_flight = (ld16(l, 0x06) + ring - ld16(l, 0x00)) % ring;
++        a->id = lfq_take_waiter(l, 0x30, pops_in_flight);   /* an SPU consumer waiting for data */
++    } else {
++        uint16_t h1 = ld16(l, 0x00), h2 = ld16(l, 0x02);
++        lfq_commit(&h1, &h2, a->pos, ring);
++        st16(l, 0x00, h1); st16(l, 0x02, h2);
++        uint32_t pushes_in_flight = (ld16(l, 0x0E) + ring - ld16(l, 0x08)) % ring;
++        a->id = lfq_take_waiter(l, 0x50, pushes_in_flight); /* ASSUMPTION: an SPU producer waiting for room */
++    }
++    a->c1 = ld16(l, a->pop ? 0x00 : 0x08);
++    a->c2 = ld16(l, a->pop ? 0x50 : 0x30);
++    return 1;
++}
++
++static s32 lfq_body(uint32_t q, uint32_t data, uint32_t isBlocking, int pop)
++{
++    if (!q || !data) return (s32)LFQ_ERROR_NULL;
++    if (q & 127) return (s32)LFQ_ERROR_ALIGN;
++    uint32_t size = vm_read32(q + 0x10), depth = vm_read32(q + 0x14);
++    uint32_t buf = (uint32_t)vm_read64(q + 0x18) & ~1u;   /* bit 0 marks an any2any queue */
++    if (!size || !depth || !buf) return (s32)LFQ_ERROR_PERM;
++
++    lfq_args a = { pop, 0, -1, 0, 0 };
++    for (unsigned spins = 0; !lfq_atomic(q, lfq_reserve, &a); spins++) {
++        if (!isBlocking) return (s32)LFQ_ERROR_AGAIN;
++        /* Full push / empty pop: the other side is an SPU task that will move on its own. Our producer never
++         * registers in hs2 (an lv2 event queue wait in libsre, cellSpursLFQueueAttachLv2EventQueue), it polls. */
++        if (lfq_trace() && (spins == 1000 || spins % 30000 == 29999)) {
++            fprintf(stderr, "[lfq] %s q=0x%08X %s for %u tries; line:", pop ? "pop" : "push", q, pop ? "empty" : "full",
++                    spins);
++            for (int i = 0; i < 0x40; i += 4) fprintf(stderr, " %08X", vm_read32(q + i));
++            fprintf(stderr, "\n"); fflush(stderr);
++        }
++        Sleep(spins < 64 ? 0 : 1);
++    }
++    uint32_t slot = buf + size * (a.pos % depth);
++    if (!pop) VM_WRITE_COH(slot, vm_ptr8(data), size);
++    else      VM_WRITE_COH(data, vm_ptr8(slot), size);
++    lfq_atomic(q, lfq_complete, &a);
++
++    uint32_t sig = (uint32_t)vm_read64(q + 0x70);
++    if (lfq_trace()) {
++        uint32_t w[4];
++        for (int i = 0; i < 4; i++) w[i] = vm_read32((pop ? data : slot) + 4 * i);
++        fprintf(stderr, "[lfq] %s q=0x%08X pos=%u slot=0x%08X committed=%u pack=0x%04X signal=%d (eaSignal 0x%08X)"
++                        " elem=%08X %08X %08X %08X\n", pop ? "pop" : "push", q, a.pos, slot, a.c1, a.c2, (int)a.id,
++                sig, w[0], w[1], w[2], w[3]);
++        fflush(stderr);
++    }
++    if (a.id >= 0 && sig)
++        spu_taskset_signal_task(sig, (uint32_t)a.id & 0xFFu);  /* id = (workload id << 8) | task id */
++    return CELL_OK;
++}
++
++/* _cellSpursLFQueuePushBody(CellSpursLFQueue* queue, const void* buffer, u32 isBlocking)  NID 0x8A85674D */
++s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 isBlocking)
++{
++    return lfq_body((uint32_t)queue_ea, (uint32_t)buffer_ea, isBlocking, 0);
++}
++
++/* _cellSpursLFQueuePopBody(CellSpursLFQueue* queue, void* buffer, u32 isBlocking). Not called by Killzone 2 (no
++ * import); the mirror image of the push, ASSUMPTION: an SPU producer registers in pop2/hs2 the way the consumer
++ * registers in push2/hs1. */
++s32 _cellSpursLFQueuePopBody(u64 queue_ea, u64 buffer_ea, u32 isBlocking)
++{
++    return lfq_body((uint32_t)queue_ea, (uint32_t)buffer_ea, isBlocking, 1);
++}

@@ -1,0 +1,29 @@
+spu_coh_bitmap.h: g_spu_coh_bits as __declspec(selectany) on MinGW too, not __attribute__((weak)).
+
+Symptom: ps3recomp v0.18.0 (4e8f3ca) does not link kz2.exe: "undefined reference to
+`g_spu_coh_bits'" from main.cpp.obj (.refptr.g_spu_coh_bits) and ppu_loader.cpp.obj (spu_coh_line_reserved). Cause:
+upstream #534 defines the PPU-store bitmap pointer in the header, selectany under MSVC and weak elsewhere. On a PE
+target GCC's weak definition is a weak external with a per-object default, and MinGW ld (binutils 2.46) leaves it
+undefined when C++ objects reach it through the .refptr indirection; reproduced with three objects (one C TU that
+stores the pointer, two C++ TUs that read it): weak -> the same undefined references, selectany -> links. Fix: the
+MSVC branch (selectany, a COMDAT "any": one definition kept, every object sees the same variable) also for
+__MINGW32__; other toolchains unchanged. Upstream candidate (general: any MinGW build of v0.18.0).
+Verification: the three-object repro under Proton prints "0 1 1" (not reserved before the store, reserved after,
+one shared pointer); kz2.exe links.
+
+diff --git a/runtime/spu/spu_coh_bitmap.h b/runtime/spu/spu_coh_bitmap.h
+index 79bffe7..a8a61a8 100644
+--- a/runtime/spu/spu_coh_bitmap.h
++++ b/runtime/spu/spu_coh_bitmap.h
+@@ -17,7 +17,10 @@
+ 
+ #include <stdint.h>
+ 
+-#if defined(_MSC_VER)
++#if defined(_MSC_VER) || defined(__MINGW32__)
++/* KZ2 patch 6033: selectany on MinGW too. GCC's weak definition on a PE target is a weak external with a
++ * per-object default; with the C++ objects' .refptr indirection, MinGW ld left g_spu_coh_bits undefined in
++ * kz2.exe's link (ppu_loader.cpp, main.cpp). selectany (a COMDAT "any") is what the MSVC branch already uses. */
+ #  define SPU_COH_SHARED __declspec(selectany)
+ #else
+ #  define SPU_COH_SHARED __attribute__((weak))
