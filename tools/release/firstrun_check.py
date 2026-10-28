@@ -44,6 +44,14 @@ Split archives (from Project Helghast v0.1.3): a dump copied to a FAT32 drive st
 up, magic from the first part) and names the first missing part when the numbering has a gap; A1 hashes the parts in
 order as one stream.
 
+Input reasons (adapted from Project Helghast PR #14): after a FAIL, one line per failing input, labelled "Disc dump",
+"1.29 update" or "EBOOT": "<label> failed: <path>: <what is there>. <what it must hold>." (plus "Found: <its FAIL
+messages>." unless the input is the wrong thing altogether), then the other FAIL messages (O1, O2), then "Passed: A,
+B and C." for the inputs that passed. Swapped roles are named: the update folder given as the disc ("looks like the
+1.29 update"), a disc dump given as the update, the disc's PS3_GAME given as the update (also a U1 FAIL: category
+DG); a drive root is searched two levels down for the disc and the update, another folder one level. In --json
+they are facts.reasons; in text they follow "first-run checks: FAIL", indented by two spaces. The codes are unchanged.
+
 One line per check: OK / WARN / FAIL <code>: <message>. Exit 0 = no FAIL, 1 = at least one FAIL, 2 = usage.
 --json prints {"ok": bool, "checks": [{"code", "level", "message"}], "facts": {...}} instead. Numbers come from
 the RE notes and a disc dump with the 1.29 update; no game content is embedded.
@@ -54,6 +62,11 @@ import json
 import os
 import struct
 import sys
+
+# the bundled embeddable Python (a python3XX._pth file) puts only its own folders on sys.path, never the script's:
+# firstrun.py starts this file by full path, so `import iso9660` (an ISO dump) failed there (from Project Helghast
+# PR #14)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 TITLE_ID = "BCUS98116"                 # US disc (the RE notes); the only id accepted (no other region tested)
 TITLE = "Killzone 2"
@@ -498,6 +511,9 @@ def check_psarc_hash(r, psarc, title_id, hashes_file=PSARC_HASHES_FILE, cache_di
 
 def check_update(r, upd, disc_id=None):
     sfo = check_sfo(r, os.path.join(upd, "PARAM.SFO"), "U1", "1.29 update", disc_id)
+    if sfo and sfo.get("CATEGORY") == "DG":       # from Project Helghast PR #14
+        r.fail("U1", "1.29 update: this PARAM.SFO is the disc's (category DG), not an update's: the disc's PS3_GAME "
+                     "folder was given as the update")
     if sfo:
         ver = sfo.get("APP_VER")
         r.facts["update"] = {k: sfo.get(k) for k in ("TITLE_ID", "APP_VER", "VERSION", "CATEGORY")}
@@ -595,6 +611,240 @@ def check_eboot_hash(r, elf, hashes_file):
                      "check that the decrypted EBOOT.elf is the update's")
 
 
+# ------------------------------------------------------------------------------ input reasons (Project Helghast PR #14)
+# Adapted from Project Helghast PR #14 (the Killzone 3 PC port, same author, MIT): each failing input gets one line
+# naming the input, the path, what is there and what it must hold; swapped disc and update folders and drive roots
+# are recognised; a last line says which inputs passed. The check codes (D, I, A, U, E, H, O) are unchanged.
+GETTING_FILES = "https://github.com/undecuple/project-pyrrhus/blob/main/docs/GETTING-FILES.md"
+INPUT_CODES = {"disc": ("D", "I", "A"), "update": ("U",), "eboot": ("E", "H")}   # check code letters per input
+INPUT_NAMES = {"disc": "the disc dump", "update": "the 1.29 update", "eboot": "the decrypted EBOOT"}
+INPUT_LABELS = {"disc": "Disc dump", "update": "1.29 update", "eboot": "EBOOT"}   # each failure line's label
+MAX_LIST = 400            # folder entries looked at when describing what a wrong folder holds (a drive root can be big)
+
+
+def _is(d, *rel):
+    return os.path.isfile(os.path.join(d, *rel))
+
+
+def _entries(d):
+    """-> (folders, files) names in d, sorted, at most MAX_LIST together; ([], []) when unreadable."""
+    try:
+        names = sorted(os.listdir(d))[:MAX_LIST]
+    except OSError:
+        return [], []
+    dirs = [n for n in names if os.path.isdir(os.path.join(d, n))]
+    return dirs, [n for n in names if n not in dirs]
+
+
+def _find(names, want):
+    """The entry of names equal to want ignoring case (Windows), else ""."""
+    return next((n for n in names if n.lower() == want.lower()), "")
+
+
+def _sfo_kind(path):
+    """-> (TITLE_ID, CATEGORY) of a PARAM.SFO, or None when it is missing or unreadable."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        sfo = read_sfo(path)
+    except (OSError, ValueError, struct.error, IndexError):
+        return None
+    return sfo.get("TITLE_ID"), sfo.get("CATEGORY")
+
+
+def is_drive_root(path):
+    r"""E:\ or / (the folder is its own parent): two levels are searched there, one elsewhere."""
+    p = os.path.abspath(path)
+    return os.path.dirname(p) == p
+
+
+def update_marks(d):
+    """The update-only files found in d: USRDIR/added_data_ps3.psarc and the USRDIR/patch_data_ps3 folder (the 1.01
+    disc has neither: the RE notes, 1.29 update layout)."""
+    out = []
+    if _is(d, "USRDIR", UPDATE_DATA):
+        out.append(os.path.join("USRDIR", UPDATE_DATA))
+    if os.path.isdir(os.path.join(d, "USRDIR", UPDATE_PATCH_DIR)):
+        out.append(os.path.join("USRDIR", UPDATE_PATCH_DIR))
+    return out
+
+
+def looks_like_disc(d):
+    """A folder holding PS3_GAME/PARAM.SFO (a disc dump)."""
+    return _is(d, "PS3_GAME", "PARAM.SFO")
+
+
+def looks_like_update(d):
+    """A folder that is an installed update: PARAM.SFO of a non-disc category plus USRDIR/EBOOT.BIN, or the update's
+    own data (USRDIR/added_data_ps3.psarc or USRDIR/patch_data_ps3) without the disc archive data_ps3.psarc."""
+    if update_marks(d) and not psarc_info(os.path.join(d, "USRDIR", PSARC_NAME))[0]:
+        return True
+    kind = _sfo_kind(os.path.join(d, "PARAM.SFO"))
+    return bool(kind and kind[1] != "DG" and _is(d, "USRDIR", "EBOOT.BIN"))
+
+
+def looks_like_ps3_game(d):
+    """The disc's PS3_GAME folder itself (perhaps renamed): a disc-category PARAM.SFO directly in it."""
+    kind = _sfo_kind(os.path.join(d, "PARAM.SFO"))
+    return bool(kind and kind[1] == "DG")
+
+
+def candidates(top, depth):
+    """-> (disc folders, update folders) among the subfolders of top, `depth` levels down (1 or 2; never deeper:
+    a drive root can be large). At most MAX_LIST entries per folder, three of each kind."""
+    discs, updates, level = [], [], [top]
+    for _ in range(depth):
+        nxt = []
+        for d in level:
+            for n in _entries(d)[0]:
+                sub = os.path.join(d, n)
+                if looks_like_disc(sub):
+                    discs.append(sub)
+                elif looks_like_update(sub):
+                    updates.append(sub)
+                else:
+                    nxt.append(sub)
+        level = nxt[:MAX_LIST]
+    return discs[:3], updates[:3]
+
+
+def _hint(path, want):
+    """Where the wanted input (disc or update) and the other one seem to be, below path (two levels on a drive root,
+    one elsewhere): '; on this drive, the disc dump looks like X: pick that folder; the 1.29 update looks like Y
+    (give it as the update)' or ''."""
+    root = is_drive_root(path)
+    discs, updates = candidates(path, 2 if root else 1)
+    if not discs and not updates:
+        return ""
+    where = "on this drive" if root else "one folder down"
+    first, second = (discs, updates) if want == "disc" else (updates, discs)
+    other = "update" if want == "disc" else "disc"
+    parts = []
+    if first:
+        parts.append(f"{INPUT_NAMES[want]} looks like {' or '.join(first)}: pick that folder")
+    if second:
+        parts.append(f"{INPUT_NAMES[other]} looks like {' or '.join(second)} (give it as the {other})")
+    return f"; {path} is a drive root" * root + f"; {where}, " + "; ".join(parts)
+
+
+def disc_found(path):
+    """-> (what the disc input path holds, structural): structural = the input is the wrong thing altogether, so
+    the D1-D3 messages add nothing."""
+    if not path or not os.path.exists(path):
+        return f"nothing is there (no such file or folder: {path})", True
+    if os.path.isfile(path):
+        return f"the file {os.path.basename(path)}, read as a disc ISO", False
+    dirs, files = _entries(path)
+    if _find(dirs, "PS3_GAME"):
+        need = [os.path.join("PS3_GAME", "PARAM.SFO"), os.path.join("PS3_GAME", "USRDIR", "EBOOT.BIN"),
+                os.path.join("PS3_GAME", "USRDIR", PSARC_NAME)]
+        miss = [n for n in need[:2] if not _is(path, n)]
+        parts, missing = psarc_info(os.path.join(path, need[2]))[:2]
+        if not parts or missing:
+            miss.append(need[2])
+        if miss:
+            return f"{path} holds PS3_GAME, but not " + " or ".join(miss), False
+        return f"{path} holds PS3_GAME with PARAM.SFO, EBOOT.BIN and {PSARC_NAME}", False
+    if looks_like_update(path):       # the update folder given as the disc
+        have = [n for n in ("PARAM.SFO", os.path.join("USRDIR", "EBOOT.BIN")) if _is(path, n)] + update_marks(path)
+        return (f"{path} looks like the 1.29 update ({', '.join(have)}), not the disc dump: give it as the 1.29 "
+                "update, and the folder that holds PS3_GAME as the disc dump"), True
+    what = f"{path} holds no PS3_GAME folder"
+    if looks_like_ps3_game(path):
+        return what + "; it holds a disc PARAM.SFO directly, so it looks like the PS3_GAME folder under another name", True
+    hint = _hint(path, "disc")
+    isos = [n for n in files if n.lower().endswith(".iso")]
+    if hint:
+        what += hint
+    elif isos:
+        what += f"; it holds the ISO file {isos[0]}: pick that file"
+    elif not dirs and not files:
+        what += " (the folder is empty)"
+    else:
+        what += f" ({len(dirs)} folders, {len(files)} files)"
+    return what, True
+
+
+def update_found(path):
+    """-> (what the update input path holds, structural), as disc_found."""
+    if not path or not os.path.exists(path):
+        return f"nothing is there (no such folder: {path})", True
+    if os.path.isfile(path):
+        return f"{path} is a file, not a folder" + (
+            " (an update package, not an installed update)" if path.lower().endswith(".pkg") else ""), True
+    dirs, files = _entries(path)
+    if looks_like_disc(path) or _find(dirs, "PS3_GAME"):     # the disc given as the update
+        return (f"{path} holds PS3_GAME, so it looks like the disc dump, not the update: give it as the disc dump, "
+                "and the installed update folder as the 1.29 update"), True
+    if looks_like_ps3_game(path):
+        return (f"{path} holds the disc's PARAM.SFO (category DG), so it looks like the disc's PS3_GAME folder, not "
+                "the update: give the folder above it as the disc dump, and the installed update folder as the 1.29 "
+                "update"), True
+    have = [n for n in ("PARAM.SFO", os.path.join("USRDIR", "EBOOT.BIN")) if _is(path, n)] + update_marks(path)
+    if not have:
+        what = f"{path} holds none of these files"
+        hint = _hint(path, "update")
+        pkgs = [n for n in files if n.lower().endswith(".pkg")]
+        if hint:
+            what += hint
+        elif pkgs:
+            what += f"; it holds the package {pkgs[0]}, which is not an installed update"
+        elif not dirs and not files:
+            what += " (the folder is empty)"
+        else:
+            what += f" ({len(dirs)} folders, {len(files)} files)"
+        return what, True
+    return f"{path} holds " + ", ".join(have), False
+
+
+def eboot_found(path):
+    """-> (what the EBOOT input path is, structural), as disc_found."""
+    if not path or not os.path.exists(path):
+        return f"no file at {path}: EBOOT.elf is missing", True
+    if os.path.isdir(path):
+        return f"{path} is a folder, not the EBOOT.elf file", True
+    return f"the file {path} ({os.path.getsize(path):,} bytes)", False
+
+
+DISC_NEED = ("It must be the folder that holds PS3_GAME (with PS3_GAME{s}PARAM.SFO, PS3_GAME{s}USRDIR{s}EBOOT.BIN and "
+             "PS3_GAME{s}USRDIR{s}" + PSARC_NAME + "), the PS3_GAME folder itself, or a decrypted .iso file picked "
+             "as a file")
+UPDATE_NEED = ("It must be the installed 1.29 update folder (dev_hdd0{s}game{s}" + TITLE_ID + "), holding PARAM.SFO "
+               "and USRDIR{s}EBOOT.BIN, with USRDIR{s}" + UPDATE_DATA + " and USRDIR{s}" + UPDATE_PATCH_DIR)
+EBOOT_NEED = "It must be EBOOT.elf, the decrypted 1.29 EBOOT of your own copy (see " + GETTING_FILES + ")"
+
+
+def input_reasons(r, dump, update, eboot):
+    """One line per failing input (its label, the path, what is there, what it must hold, and its FAIL messages
+    unless the input is the wrong thing altogether), the other checks' FAIL messages (O1, O2), and which inputs
+    passed. -> r.facts["reasons"]; firstrun.py shows them as REASON lines (the setup's box, the launcher's dialog,
+    the console). Adapted from Project Helghast PR #14."""
+    fails = [c for c in r.checks if c["level"] == "FAIL"]
+    if not fails:
+        return []
+    of = {k: [c for c in r.checks if c["code"][:1] in v] for k, v in INPUT_CODES.items()}
+    found = {"disc": lambda: disc_found(dump), "update": lambda: update_found(update),
+             "eboot": lambda: eboot_found(eboot)}
+    need = {"disc": DISC_NEED, "update": UPDATE_NEED, "eboot": EBOOT_NEED}
+    lines, passed = [], []
+    for k in ("disc", "update", "eboot"):
+        bad = [c["message"] for c in of[k] if c["level"] == "FAIL"]
+        if not bad:
+            if of[k] and (k != "update" or update):
+                passed.append(INPUT_NAMES[k])
+            continue
+        what, structural = found[k]()
+        line = f"{INPUT_LABELS[k]} failed: {what}. " + need[k].format(s=os.sep) + "."
+        if not structural:
+            line += " Found: " + "; ".join(bad) + "."
+        lines.append(line)
+    codes = tuple(x for v in INPUT_CODES.values() for x in v)
+    lines += [c["message"] for c in fails if not c["code"].startswith(codes)]
+    if passed:
+        lines.append("Passed: " + (", ".join(passed[:-1]) + " and " if len(passed) > 1 else "") + passed[-1] + ".")
+    return lines
+
+
 BUILD_DLL = "at3_standalone.dll"   # built beside kz2.exe (patch 6022, PS3RECOMP_AT3_SHARED); kz2.exe imports it
 
 
@@ -640,14 +890,19 @@ def main(argv=None):
     if not a.dump:
         ap.error("--dump is required")
     r = Report()
-    a.dump = resolve_dump(a.dump)
-    if a.update:
-        a.update = resolve_update(a.update)
+    dump = resolve_dump(a.dump)
+    if dump != a.dump:
+        r.ok("D0", f"INFO: {a.dump} is inside the dump; using the folder that holds PS3_GAME: {dump}")
+    upd = resolve_update(a.update) if a.update else a.update
+    if upd != a.update:
+        r.ok("U0", f"INFO: {a.update} is the update's USRDIR; using the update folder: {upd}")
+    a.dump, a.update = dump, upd
     check_onedrive_tree(r, a.root, a.build)
     iso = os.path.isfile(a.dump)       # a decrypted disc ISO instead of a folder
     # before anything is read: opening an online-only placeholder would start a download of the 6.5 GiB archive
     if check_online_only(r, a.dump if os.path.exists(a.dump) else "",
                          a.update if a.update and os.path.isdir(a.update) else "", a.eboot or ""):
+        r.facts["reasons"] = input_reasons(r, a.dump, a.update, a.eboot or "")
         return finish(r, a)
     if iso:
         check_dump_iso(r, a.dump, a.min_psarc_bytes)
@@ -679,6 +934,7 @@ def main(argv=None):
         elf = next((c for c in cand if os.path.isfile(c) and head(c, 4) == ELF_MAGIC), cand[0])
     check_eboot_elf(r, elf, a.target, a.update)
     check_eboot_hash(r, elf, a.hashes)
+    r.facts["reasons"] = input_reasons(r, a.dump, a.update, elf)
     return finish(r, a)
 
 
@@ -689,6 +945,8 @@ def finish(r, a):
         for c in r.checks:
             print(f"{c['level']:4} {c['code']}: {c['message']}")
         print("first-run checks:", "pass" if r.passed else "FAIL")
+        for ln in r.facts.get("reasons", []):    # firstrun.py's console reads these back (text_reasons)
+            print(f"  {ln}")
     return 0 if r.passed else 1
 
 

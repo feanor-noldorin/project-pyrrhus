@@ -30,7 +30,10 @@ you gave in the setup. When the check fails, the setup's message box, the dialog
 console show the reason (the same text as the log). On the next start the check runs first. When only the EBOOT is
 wrong (E1), it asks for the EBOOT again and offers the update's `USRDIR/EBOOT.elf` when there is one. Otherwise, when
 you choose to change the folders, it asks only for the inputs whose checks failed (the disc for D, I and A codes, the
-update for U codes).
+update for U codes). The reason names the input and the path, so a disc and an update given the wrong way round are
+easy to spot: an update folder (with `PARAM.SFO` and `USRDIR/EBOOT.BIN`, or the update's own
+`USRDIR/added_data_ps3.psarc` or `USRDIR/patch_data_ps3` and no disc archive) given as the disc is named as the update,
+and a folder holding `PS3_GAME` given as the update is named as the disc dump.
 
 ## Accepted layouts
 
@@ -69,7 +72,7 @@ A `WARN` lets it go on. The full log is next to the installer (or in the install
 | O1 | FAIL | The install folder or the build folder is inside OneDrive | Install into a folder outside OneDrive (the default is fine) |
 | O2 | FAIL | A game file exists only online in OneDrive (nothing was read, so nothing was downloaded) | Right-click the game folders, choose "Always keep on this device", wait for the download, then run the setup again |
 | O3 | OK | A note: the dump or update folder is inside OneDrive but its files are on this device | Nothing |
-| D0 | OK / FAIL | FAIL: the dump folder was not found. OK: a note that the dump is a decrypted ISO file | Pick the dump folder again |
+| D0 | OK / FAIL | FAIL: the dump folder was not found. OK: a note that the dump is a decrypted ISO file, or that `PS3_GAME` or `PS3_GAME/USRDIR` was picked and the folder above it is used | Pick the dump folder again |
 | I1 | FAIL | "this ISO is encrypted; use a decrypted dump": the ISO's file table or its files cannot be read as plain data | Use a decrypted dump (a folder or a decrypted ISO) |
 | I2 | FAIL | The ISO cannot be read: not an ISO image, damaged or cut short | Copy the ISO again |
 | D1 | OK / WARN / FAIL | FAIL: `PS3_GAME/PARAM.SFO` is missing or unreadable, or its title id is not BCUS98116 (the id and game found are named). WARN: the folder's category is not a disc game (maybe an installed copy), or the disc version is not 01.01 (02.00 is the Killzone Trilogy disc, untested) | Pick the folder that holds `PS3_GAME`. For a WARN you can go on |
@@ -77,11 +80,19 @@ A `WARN` lets it go on. The full log is next to the installer (or in the install
 | D3 | OK / FAIL | The game archive is missing, too small, does not start with `PSAR` (not an archive, or still encrypted), or its parts have a gap (the missing part is named) | Copy or dump the disc again; check that all parts `.66600`, `.66601`, ... are there |
 | A1 | OK / WARN | The archive is compared with the known disc archive, taken from our copy of the disc (it reads the whole archive once; the result is kept, so later starts do not read it again). OK: it matches. WARN: it differs (a damaged or changed copy, or a printing of the disc not seen yet), or it could not be compared | If the game does not start or stops while loading, copy or dump the disc again |
 | U0 | WARN / FAIL | No update folder was given (WARN), or it was not found (FAIL) | Pick the update folder |
-| U1 | OK / WARN / FAIL | FAIL: the update's `PARAM.SFO` is missing, unreadable, not BCUS98116 or not the disc's title id. WARN: its version is not 01.29 | Pick the 1.29 update folder |
+| U1 | OK / WARN / FAIL | FAIL: the update's `PARAM.SFO` is missing, unreadable, not BCUS98116 or not the disc's title id, or it is the disc's own (category DG: the disc's `PS3_GAME` folder was given as the update). WARN: its version is not 01.29 | Pick the 1.29 update folder |
 | U2 | OK / FAIL | `USRDIR/EBOOT.BIN` is missing in the update folder | Pick the folder that holds `PARAM.SFO` and `USRDIR` |
 | U3 | OK / WARN | `USRDIR/added_data_ps3.psarc` is missing or does not start with `PSAR`, or the `USRDIR/patch_data_ps3` folder is missing: the update's data would be missing | Use a complete update folder |
 | E1 | OK / WARN / FAIL | FAIL: no decrypted `EBOOT.elf` was found, it is not a 64-bit PowerPC ELF, or it is the disc's 1.01 EBOOT (or another known version). WARN: an unknown size | Pick the decrypted EBOOT of the 1.29 update, from the update's `USRDIR` folder |
 | H1 | OK / WARN | The EBOOT is compared with the known 1.29 one. A WARN means it differs or could not be compared | The build may still work if it is a 1.29 EBOOT; if the build fails, check the file |
+
+When a check fails, the setup's message box, the dialog of `Project Pyrrhus.exe` and the console show one line per
+input that failed, labelled `Disc dump`, `1.29 update` or `EBOOT`: the path it looked at, what is there, and what that
+folder or file must hold, followed by the failed checks' own messages when the input is the right kind of thing. They
+also say when the folder looks like the other input (the update given as the disc, or the disc dump or its
+`PS3_GAME` folder given as the update), and which folders look like the disc dump or the update one level below the
+folder you picked (two levels below a drive root such as `E:\`). A last line says which inputs passed, for example
+"Passed: the 1.29 update and the decrypted EBOOT." The log keeps the coded lines above.
 
 The build can also stop later with a plain message (no code):
 

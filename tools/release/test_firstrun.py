@@ -697,6 +697,25 @@ def main():
         lg17 = next((open(os.path.join(dl, n)).read() for n in sorted(os.listdir(dl))
                      if n.endswith(".log") and why in open(os.path.join(dl, n)).read()), "")
         check("REASON " not in lg17 and why in lg17, "17 the log has the reason text, without the REASON tag")
+        # Project Helghast PR #14: firstrun_check's facts.reasons (per failing input: path, what is there, what it must
+        # hold; which inputs passed) replace the FAIL messages; the run above (no reasons) is the control. INPUT_OF
+        # still picks the inputs to ask again from the codes.
+        rs17 = ["Disc dump failed: E:\\ holds no PS3_GAME folder (3 folders, 1 files). It must be ...",
+                "Passed: the 1.29 update and the decrypted EBOOT."]
+        rep17r = json.dumps({"ok": False, "facts": {"reasons": rs17}, "checks": [
+            {"level": "FAIL", "code": "D1", "message": "disc dump: no PARAM.SFO at E:\\PS3_GAME\\PARAM.SFO"}]})
+        chk17r = [fr.Step("check", "Checking the game files", 1,
+                          lambda c: [py(f"import sys; print({rep17r!r}); sys.exit(1)")], always=True)]
+        rc, out = run(tmp, chk17r, "--build", os.path.join(tmp, "b17r"), "--status-file", sf17)
+        st = open(sf17).read().splitlines()
+        check(rc == 1 and st[2:] == [f"REASON {x}" for x in rs17], f"17 facts.reasons become the REASON lines {st}")
+        ini17r = open(os.path.join(tmp, "root", "kz2-install.ini")).read()
+        check("wrong = dump" in ini17r, f"17 with reasons the failed input is still recorded from the codes: {ini17r!r}")
+        tr = "FAIL D1: x\nfirst-run checks: FAIL\n  Disc dump failed: a. b.\n  Passed: the decrypted EBOOT.\n"
+        check(fr.text_reasons(tr) == ["Disc dump failed: a. b.", "Passed: the decrypted EBOOT."] and
+              fr.text_reasons("FAIL D1: x\nfirst-run checks: FAIL\n") == [] and
+              fr.check_reasons(fr.text_checks("FAIL D1: x\n"), []) == ["x"],
+              "17 text_reasons reads the console's indented lines; none -> the FAIL messages")
         cmp17 = [fr.Step("compile", "Compiling", 1, lambda c: [py("import sys; print('a.c:1: error: boom'); "
                                                                      "print('ninja: build stopped'); sys.exit(1)")])]
         rc, out = run(tmp, cmp17, "--build", os.path.join(tmp, "b17c"), "--status-file", sf17)
@@ -754,8 +773,11 @@ def main():
                       "--log-dir", dl12, "--jobs", "1", "--log-name", "kz2-quit.log", "--status-file", sf18],
                      steps=steps, out=o18, ask=lambda q: "q")
         st = open(sf18).read().splitlines()
-        check(rc == 1 and st[1].startswith("RESULT ok=0 step=quit") and len(st) == 3 and st[2].startswith("REASON ")
-              and "disc's 1.01 one" in st[2], f"18 quit at a failed check: the reasons in the status file {st}")
+        # the input reasons (Project Helghast PR #14): the EBOOT's line with E1's message, then which inputs passed
+        check(rc == 1 and st[1].startswith("RESULT ok=0 step=quit") and len(st) == 4 and
+              st[2].startswith("REASON EBOOT failed: the file ") and "disc's 1.01 one" in st[2] and
+              st[3] == "REASON Passed: the disc dump and the 1.29 update.",
+              f"18 quit at a failed check: the input reasons in the status file {st}")
         check("Nothing was built" in o18.getvalue(), f"18 quit: the console's last line {o18.getvalue()[-200:]!r}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

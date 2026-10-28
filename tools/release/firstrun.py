@@ -46,12 +46,15 @@ builder, done-marker). Standard library only, Python 3.11+, Windows and Linux.
   the player quits, and a failed check step of the build, write the answers and the failed inputs to kz2-install.ini
   [paths] (dump, update, eboot, wrong): the next start checks them first (the launcher's --check-first, or
   --interactive with no folder arguments) and the questions after the check are asked only when the ini has no
-  answers yet. Input labels for the reasons go in fail_reason (a hook for Project Helghast's issue #10 work).
+  answers yet. The reasons of a failed check are firstrun_check's input reasons (facts.reasons in --json, the indented
+  lines after "first-run checks: FAIL" in text; check_reasons, text_reasons): one line per failing input labelled
+  "Disc dump", "1.29 update" or "EBOOT" with the path, what is there and what it must hold, then "Passed: ..."
+  (adapted from Project Helghast PR #14); without them, the FAIL messages.
 
 Machine-readable lines on stdout, for the Inno wizard's output page and the zip's console:
   LOG path=<file>
   PROGRESS step=N/M name=<step> done=X total=Y elapsed=S pct=P      (P = whole pipeline, weights applied)
-  REASON <text>                        (before RESULT ok=0, one per reason: the failing check's own message)
+  REASON <text>                        (before RESULT ok=0, one per reason: an input reason or a failing check's message)
   RESULT ok=1|0 step=<failed step, quit or -> elapsed=S   (quit: --interactive ended at q after a failed check)
 The compile step's done/total come from Ninja's "[x/y]" status lines. Every other line is the step's own output.
 
@@ -90,7 +93,8 @@ DEFAULT_LOG_NAME = "Project-Pyrrhus-setup.log"
 MARKER_DIR = ".firstrun"
 KEEP_LOG_COPIES = 5                      # the install's logs\ keeps the last five
 NINJA_RE = re.compile(r"^\[(\d+)/(\d+)\]")
-REASON_MAX = 400       # characters of one REASON line (a message box line, not a log dump)
+REASON_MAX = 900       # characters of one REASON line (a message box paragraph, not a log dump; an input's line names
+                       # its path, what is there and what it must hold: Project Helghast PR #14)
 # Which input a check code is about (firstrun_check's codes): the console asks again only for these after a FAIL.
 # O1/O2 (OneDrive) are about no single input: the console then asks for all three.
 INPUT_OF = {"D0": "dump", "D1": "dump", "D2": "dump", "D3": "dump", "I1": "dump", "I2": "dump", "A1": "dump",
@@ -99,14 +103,31 @@ INPUT_OF = {"D0": "dump", "D1": "dump", "D2": "dump", "D3": "dump", "I1": "dump"
 
 def fail_reason(check):
     """The on-screen reason for one failed check (a dict with code, level, message), the same text the log has.
-    Hook: input labels (which input, the path, what was found there; Project Helghast's issue #10 work, to be brought
-    over by the maintainer) go here, so the wizard's box, the launcher's dialog and the console all get them."""
+    Used when firstrun_check gave no input reasons (an older check, or text without them)."""
     return check.get("message", "")
 
 
-def check_reasons(checks):
-    """The FAIL checks' reasons, in the check's order."""
-    return [fail_reason(c) for c in checks if c.get("level") == "FAIL"]
+def check_reasons(checks, reasons=None):
+    """The on-screen reasons of a failed check: firstrun_check's input reasons (one line per failing input, labelled
+    "Disc dump", "1.29 update" or "EBOOT", with the path, what is there and what it must hold, then "Passed: ...";
+    adapted from Project Helghast PR #14) when it gave them, else the FAIL checks' messages in the check's order."""
+    return list(reasons) if reasons else [fail_reason(c) for c in checks if c.get("level") == "FAIL"]
+
+
+def text_reasons(text):
+    """The input reasons of firstrun_check's text output: the lines indented by two spaces after
+    "first-run checks: FAIL"."""
+    lines = text.splitlines()
+    try:
+        i = lines.index("first-run checks: FAIL")
+    except ValueError:
+        return []
+    out = []
+    for ln in lines[i + 1:]:
+        if not ln.startswith("  "):
+            break
+        out.append(ln[2:])
+    return out
 
 
 def text_checks(text):
@@ -1122,7 +1143,7 @@ class Runner:
         if step.name == "check":
             try:
                 j = json.loads("\n".join(ln for ln in out if not ln.startswith("ARCHIVE-HASH ")))
-                fails = check_reasons(j.get("checks", []))
+                fails = check_reasons(j.get("checks", []), (j.get("facts") or {}).get("reasons"))
                 if fails:
                     self.fail_inputs = {INPUT_OF.get(c.get("code")) for c in j.get("checks", [])
                                         if c.get("level") == "FAIL"}
@@ -1560,7 +1581,7 @@ def interactive(a, root, log_path, notes, ask=input, out=sys.stdout, check=_chec
             if rc == 0:
                 break
             checks = text_checks(text)
-            a.fail_reasons = check_reasons(checks)      # for the launcher's dialog when the player quits here
+            a.fail_reasons = check_reasons(checks, text_reasons(text))   # the launcher's dialog when the player quits here
             codes = {c["code"] for c in checks if c["level"] == "FAIL"}
             inputs = {INPUT_OF.get(c) for c in codes}
             if codes == {"E1"} and elf and os.path.isfile(elf):
@@ -1720,6 +1741,9 @@ def main(argv=None, steps=None, out=sys.stdout, ask=input):
     if a.interactive and not a.dry_run:
         if not interactive(a, root, pick_log(a.log_dir or None, a.log_name)[0], notes, ask=ask, out=out):
             quit_early = True
+    # a pick of PS3_GAME, PS3_GAME/USRDIR or the update's USRDIR: the folder above, for every step, not just the
+    # check (a silent install's /DUMP= is resolved by the setup; the command line here was not; Project Helghast PR #14)
+    a.dump, a.update = _fc().resolve_dump(a.dump), _fc().resolve_update(a.update)
     is_iso = bool(a.dump) and os.path.isfile(a.dump)      # a decrypted disc ISO instead of a dump folder
     if steps is None:
         steps = steps_for(is_iso)

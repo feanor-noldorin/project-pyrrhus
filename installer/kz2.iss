@@ -592,6 +592,58 @@ begin
   Result := (Path <> '') and (CompareText(ExtractFileExt(Path), '.iso') = 0) and FileExists(Path) and not DirExists(Path);
 end;
 
+{ What a wrong folder holds, for the page messages: 'it holds 3 folders and 1 files', 'it is empty' or 'there is no
+  such folder' (from Project Helghast PR #14) }
+function FolderSummary(Dir: String): String;
+var
+  FR: TFindRec;
+  NDirs, NFiles: Integer;
+begin
+  if not DirExists(Dir) then begin
+    Result := 'there is no such folder';
+    Exit;
+  end;
+  NDirs := 0;
+  NFiles := 0;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      repeat
+        if (FR.Name <> '.') and (FR.Name <> '..') then begin
+          if (FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then NDirs := NDirs + 1 else NFiles := NFiles + 1;
+        end;
+      until not FindNext(FR);
+    finally
+      FindClose(FR);
+    end;
+  end;
+  if NDirs + NFiles = 0 then Result := 'it is empty'
+  else Result := 'it holds ' + IntToStr(NDirs) + ' folders and ' + IntToStr(NFiles) + ' files';
+end;
+
+{ The first subfolder of Dir that holds Rel (PS3_GAME\PARAM.SFO, PARAM.SFO), else '': a pick one level too high
+  (from Project Helghast PR #14) }
+function SubWith(Dir, Rel: String): String;
+var
+  FR: TFindRec;
+  More: Boolean;
+begin
+  Result := '';
+  if not DirExists(Dir) then Exit;
+  if FindFirst(AddBackslash(Dir) + '*', FR) then begin
+    try
+      More := True;
+      while More and (Result = '') do begin
+        if (FR.Name <> '.') and (FR.Name <> '..') and ((FR.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and
+           FileExists(AddBackslash(Dir) + FR.Name + '\' + Rel) then
+          Result := AddBackslash(Dir) + FR.Name;
+        More := FindNext(FR);
+      end;
+    finally
+      FindClose(FR);
+    end;
+  end;
+end;
+
 { A pick of PS3_GAME or PS3_GAME\USRDIR becomes the folder that holds PS3_GAME (as firstrun_check.py resolve_dump) }
 function ResolveDump(Dir: String): String;
 var
@@ -682,14 +734,25 @@ end;
   found ('' when none) }
 function DumpProblem(Dir: String; var Id: String): String;
 var
-  Title: String;
+  Title, Sub: String;
 begin
   Id := '';
   Result := '';
   if IsIsoPick(Dir) then Exit
   else if (CompareText(ExtractFileExt(Dir), '.iso') = 0) and not DirExists(Dir) then
     Result := 'The ISO file ' + Dir + ' was not found.'
-  else if not FileExists(DiscSfo(Dir)) then
+  else if not DirExists(AddBackslash(Dir) + 'PS3_GAME') then begin
+    { Project Helghast PR #14: say what is there (a drive root given as the dump read as an EBOOT problem), where
+      PS3_GAME is when it is one folder down, and an update folder given as the dump (as firstrun_check.py disc_found) }
+    Result := Dir + ' holds no PS3_GAME folder (' + FolderSummary(Dir) + ')';
+    Sub := SubWith(Dir, 'PS3_GAME\PARAM.SFO');
+    if Sub <> '' then Result := Result + '; PS3_GAME is one folder down: pick ' + Sub;
+    if (FileExists(AddBackslash(Dir) + 'PARAM.SFO') and FileExists(AddBackslash(Dir) + 'USRDIR\EBOOT.BIN')) or
+       FileExists(AddBackslash(Dir) + 'USRDIR\added_data_ps3.psarc') then
+      Result := Result + '. It looks like the 1.29 update folder: give it as the update, and the disc dump here';
+    Result := Result + '. Select the folder that holds PS3_GAME (picking PS3_GAME itself also works), or a ' +
+      'decrypted .iso file (picked as a file).';
+  end else if not FileExists(DiscSfo(Dir)) then
     Result := 'This folder does not look like a Killzone 2 disc dump: PS3_GAME\PARAM.SFO is missing. Select the ' +
       'folder that holds PS3_GAME (picking PS3_GAME itself also works), or a decrypted .iso file.'
   else begin
@@ -719,6 +782,54 @@ begin
   else if (DiscId <> '') and (Id <> DiscId) then
     Result := 'This update is for ' + Id + ', but the disc dump is ' + DiscId + '. Pick the Killzone 2 update ' +
       '(dev_hdd0\game\' + DiscId + ').';
+end;
+
+{ The update page's quick check: PARAM.SFO, USRDIR\EBOOT.BIN and the update's own archive USRDIR\added_data_ps3.psarc }
+function UpdateOK(Dir: String): Boolean;
+var
+  D: String;
+begin
+  D := AddBackslash(Dir);
+  Result := FileExists(D + 'PARAM.SFO') and FileExists(D + 'USRDIR\EBOOT.BIN') and
+    FileExists(D + 'USRDIR\added_data_ps3.psarc');
+end;
+
+{ Why a folder is not the update: the path, what is missing or what is there instead (a disc dump, the disc's
+  PS3_GAME); '' when UpdateOK. From Project Helghast PR #14, as firstrun_check.py update_found. }
+function UpdateProblem(Dir: String): String;
+var
+  D, Miss, Sub: String;
+begin
+  Result := '';
+  if UpdateOK(Dir) then Exit;
+  D := AddBackslash(Dir);
+  if not DirExists(Dir) then
+    Result := Dir + ': there is no such folder.'
+  else if DirExists(D + 'PS3_GAME') then
+    Result := Dir + ' holds PS3_GAME: that is a disc dump, not the update. Give it as the disc dump.'
+  else if FileExists(D + 'PARAM.SFO') and (SfoField(D + 'PARAM.SFO', 'CATEGORY') = 'DG') then
+    Result := Dir + ' holds the disc''s PARAM.SFO: that is the disc''s PS3_GAME folder, not the update.'
+  else begin
+    Miss := '';
+    if not FileExists(D + 'PARAM.SFO') then Miss := 'PARAM.SFO';
+    if not FileExists(D + 'USRDIR\EBOOT.BIN') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\EBOOT.BIN';
+    end;
+    if not FileExists(D + 'USRDIR\added_data_ps3.psarc') then begin
+      if Miss <> '' then Miss := Miss + ', ';
+      Miss := Miss + 'USRDIR\added_data_ps3.psarc';
+    end;
+    Result := Dir + ' does not hold ' + Miss;
+    if FileExists(D + 'PARAM.SFO') or FileExists(D + 'USRDIR\EBOOT.BIN') then
+      Result := Result + '.'
+    else begin
+      Result := Result + ' (' + FolderSummary(Dir) + ')';
+      Sub := SubWith(Dir, 'PARAM.SFO');
+      if Sub <> '' then Result := Result + '; PARAM.SFO is one folder down: pick ' + Sub;
+      Result := Result + '.';
+    end;
+  end;
 end;
 
 { eboot_sha256.json (firstrun_check.py's table, extracted from the setup on first use): per known EBOOT version
@@ -1150,12 +1261,13 @@ begin
     if Problem <> '' then begin
       MsgBox(Problem, mbError, MB_OK);
       Result := False;
-    end else if not (FileExists(D + 'PARAM.SFO') and FileExists(D + 'USRDIR\EBOOT.BIN') and
-            FileExists(D + 'USRDIR\added_data_ps3.psarc')) then begin
-      { A missing 1.29 update stops here with the steps; Next again = check again.
+    end else if not UpdateOK(UpdatePage.Values[0]) then begin
+      { A missing 1.29 update stops here with the steps; Next again = check again. UpdateProblem names the path and
+        what is wrong there (Project Helghast PR #14).
         ASSUMPTION: the exact RPCS3/PS3 wording is to be checked against RPCS3's own docs before release. }
-      MsgBox('The 1.29 update was not found in this folder (PARAM.SFO, USRDIR\EBOOT.BIN and ' +
-        'USRDIR\added_data_ps3.psarc are needed). The port is built on 1.29.' + #13#10 + #13#10 +
+      MsgBox('The 1.29 update was not found in this folder: ' + UpdateProblem(UpdatePage.Values[0]) + #13#10 + #13#10 +
+        'The update folder is the installed update (dev_hdd0\game\BCUS98116) and holds PARAM.SFO, USRDIR\EBOOT.BIN ' +
+        'and USRDIR\added_data_ps3.psarc. The port is built on 1.29.' + #13#10 + #13#10 +
         'To add it:' + #13#10 +
         '  - on your PS3: install the 1.29 update for Killzone 2, then copy the game''s update ' +
         'folder from dev_hdd0\game\BCUS98116; or' + #13#10 +
@@ -1180,8 +1292,9 @@ begin
       MsgBox(EbootMsg, mbError, MB_OK);
       Result := False;
     end else if not FileExists(EbootPage.Values[0]) then begin
-      MsgBox('No decrypted EBOOT here. The port cannot decrypt it. It needs a decrypted EBOOT.elf, made from ' +
-        'your own copy, in that folder.', mbError, MB_OK);
+      MsgBox('No file at ' + EbootPage.Values[0] + ': EBOOT.elf is missing. The port cannot decrypt it. It needs a ' +
+        'decrypted EBOOT.elf, made from your own copy (what it must be: ' +
+        'https://github.com/undecuple/project-pyrrhus/blob/main/docs/GETTING-FILES.md).', mbError, MB_OK);
       Result := False;
     end else begin
       Problem := EbootProblem(EbootPage.Values[0], UpdatePage.Values[0]);
