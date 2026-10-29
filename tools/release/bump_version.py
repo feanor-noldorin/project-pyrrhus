@@ -202,7 +202,10 @@ def main(argv=None):
             print("would regenerate public/site/index.html (website.py)")
         return 0
     for p, text in changed.items():
-        p.write_text(text, encoding="utf-8")
+        # Keep each file's own line endings: read_text() gave "\n", and write_text() would write the platform's (CRLF
+        # on Windows; reported by @feanor-noldorin, issue #9).
+        eol = "\r\n" if b"\r\n" in p.read_bytes() else "\n"
+        p.write_text(text, encoding="utf-8", newline=eol)
     site = root / "tools/release/website.py"
     if changed and (root / "docs/features.tsv").is_file() and site.is_file():
         r = subprocess.run([sys.executable, str(site), "--root", str(root), "-q"])

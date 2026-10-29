@@ -812,13 +812,16 @@ def jobs_for(avail, clang=False, cores=None):
 
 def redactor(rpcs3_roots=()):
     """Replace the user's home folder in log text with %USERPROFILE% (both slash styles, any case on Windows), and the
-    RPCS3 folder the player chose (rpcs3_import) with <RPCS3>; the longer prefix wins."""
+    RPCS3 folder the player chose (rpcs3_import) with <RPCS3>; the longer prefix wins. The escaped form with doubled
+    backslashes (a path's repr(), a list of paths, json.dumps) is replaced too, so an exception or a child tool's JSON
+    cannot keep the user name (reported by @feanor-noldorin, issue #9)."""
     homes = {h for h in (os.environ.get("USERPROFILE"), os.path.expanduser("~")) if h and len(h) > 3}
     subs = [(h, "%USERPROFILE%") for h in homes] + [(r, "<RPCS3>") for r in rpcs3_roots if r and len(r) > 3]
     pats = {}
     for h, label in sorted(subs, key=lambda t: -len(t[0])):
         h = h.rstrip("\\/")
-        for v in {h, h.replace("\\", "/"), h.replace("/", "\\")}:
+        back = h.replace("/", "\\")
+        for v in {h, h.replace("\\", "/"), back, back.replace("\\", "\\\\")}:
             pats.setdefault(v.lower() if os.name == "nt" else v, (re.escape(v), label))
     if not pats:
         return lambda s: s

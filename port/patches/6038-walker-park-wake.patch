@@ -1,0 +1,113 @@
+KZ2 patch 6038: wake the frame thread when an SPU put patches the FIFO park the walker waits at (KZ2_PARK_WAKE, default
+on; 0 = off). Symptom (patch 6037's input-latency probe, Corinth River): between the game's flip
+request and the walker reaching that flip the port's frame thread slept a mean 9-10 ms per frame after drain passes
+that stopped on a park, in whole 4.06 ms quanta. Cause: a self-JUMP park stops the drain pass (the hardware RSX would
+re-read the word continuously) and the frame thread (port/kz2/main.cpp) slept a fixed Sleep(4) before the next pass,
+so a park the SPU had already patched still cost up to 4 ms; Killzone 2 parks every frame at its post stage until the
+SPU job Gfx.Post.Unlock overwrites the park with a DMA put, and at Edge command-buffer holes its SPU jobs fill. Fix: a
+pass that stops on a park publishes the park word's EA (s_park_wake_ea, then re-reads the word for a put that landed
+first); the SPU write hook gcm_spu_note_pages_ea (KZ3 patch 2033's SPU put hook) sets an auto-reset event when a put
+covers it; cellGcm_walker_wait(ms) is the frame thread's sleep: a wait on that event while a park is armed, a plain
+Sleep otherwise. A PPU store that patches a park is not seen, so that wait ends at its timeout as before. The probe
+showed polling the park every 1 ms instead does not move the park wait's median (the SPU job's own time dominates),
+so the wake is event-driven rather than a faster poll. General (upstream candidate with the frame-thread sleep of
+boot_main.cpp's vblank ticker).
+
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1092,6 +1092,57 @@
+ static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+ static u32 s_fifo_calloff = 0;
+ static u32 s_park_off = 0xFFFFFFFFu;  /* KZ3 patch 1007: park being waited on */
++/* KZ2 patch 6038: wake the frame thread when an SPU put lands on the park it waits at. On hardware the RSX re-reads a
++ * parked JUMP continuously; the drain stops its pass instead and the port's frame thread came back only after a fixed
++ * 4 ms sleep. Killzone 2 parks the walker at its post stage every frame until the SPU job Gfx.Post.Unlock overwrites
++ * the park (a DMA put) and at Edge command-buffer holes its SPU jobs fill, so each park cost up to 4 ms after the
++ * patch had landed, on the stage that bounds both the frame rate and the input-to-present time (an earlier change's
++ * probe: a mean 9-10 ms asleep per frame after park stops). s_park_wake_ea is the park word's EA while a pass has
++ * stopped on it (0 otherwise); the SPU write hook (gcm_spu_note_pages_ea) sets s_walker_wake when a put covers it,
++ * and cellGcm_walker_wait is the frame thread's sleep. A PPU store that patches a park is not seen: that wait still
++ * ends at its timeout, as before. KZ2_PARK_WAKE=0 = off (the frame thread sleeps as before). */
++static volatile u32 s_park_wake_ea = 0;
++#ifdef _WIN32
++static HANDLE s_walker_wake;   /* auto-reset; created by cellGcm_walker_wait's first call */
++#endif
++static int gcm_park_wake_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("KZ2_PARK_WAKE"); on = !(e && e[0] == '0'); }
++    return on;
++}
++static void gcm_walker_kick(void)
++{
++#ifdef _WIN32
++    if (s_walker_wake) SetEvent(s_walker_wake);
++#endif
++}
++/* The frame thread's sleep between drain passes: up to `ms`, ended early by an SPU put on the park the last pass
++ * stopped at. Returns 1 if it was woken. */
++int cellGcm_walker_wait(unsigned ms)
++{
++#ifdef _WIN32
++    if (!s_walker_wake) s_walker_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
++    if (!s_walker_wake || !gcm_park_wake_on() || !__atomic_load_n(&s_park_wake_ea, __ATOMIC_ACQUIRE)) {
++        Sleep(ms);
++        return 0;
++    }
++    return WaitForSingleObject(s_walker_wake, ms) == WAIT_OBJECT_0;
++#else
++    (void)ms;
++    return 0;
++#endif
++}
++/* KZ2 patch 6038: a drain pass stopped on the park at IO `io` holding word `w`. Publish its EA for the SPU write hook,
++ * then read the word again: a put that landed before the EA was visible would not wake the frame thread, so its
++ * change is caught here instead (seq_cst on both sides: the hook fences between its copy and its read of the EA). */
++static void gcm_park_wake_arm(u32 io, u32 w)
++{
++    if (!gcm_park_wake_on()) return;
++    const u32 ea = gcm_io2ea(io);
++    __atomic_store_n(&s_park_wake_ea, ea, __ATOMIC_SEQ_CST);
++    if (ea && vm_read32(ea) != w) gcm_walker_kick();
++}
+ /* KZ2 patch 6008 (diagnostic): command words the walker reports when it reaches them (cellGcm_watch_cmd_ea). The
+  * Killzone 2 post stage (Render 1.29 0x54B9D0 / v1.01 0x53E930) leaves a word P in the command stream that the PPU
+  * (Render) and the SPU job Gfx.Post.Unlock both overwrite with a JUMP; the port's override registers P here. */
+@@ -3150,11 +3201,14 @@
+                           if (kz3_ft_on()) fprintf(stderr, "[ft] %llu park io=0x%08X ea=0x%08X put=0x%08X\n", ps3_ms_now(),
+                                                    s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put); }
+                       else if (put != s_park_put) { s_park_put = put; s_park_putchg++; }
+-                      if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) { why = "park-wait"; s_park_pass = 1; break; }
++                      if (pw > 0 && now - s_park_t0 < (u64)pw * 1000000ull) { why = "park-wait"; s_park_pass = 1;
++                          gcm_park_wake_arm(s_fifo_getoff, w); break; }   /* patch 6038 */
+                       /* Upstream #513: read the park again before giving up on it (an SPU job filling an
+                        * Edge command-buffer hole can land between this pass's read and the resync). */
+-                      if (vm_read32(gcm_io2ea(s_fifo_getoff)) != w) { why = "park-wait"; s_park_pass = 1; break; }
++                      if (vm_read32(gcm_io2ea(s_fifo_getoff)) != w) { why = "park-wait"; s_park_pass = 1;
++                          gcm_park_wake_arm(s_fifo_getoff, w); break; }   /* patch 6038 */
+                       s_park_off = 0xFFFFFFFFu;
++                      __atomic_store_n(&s_park_wake_ea, 0u, __ATOMIC_RELEASE);   /* patch 6038: given up on */
+                       park_off = 0;
+                       if (kz3_ft_on()) fprintf(stderr, "[ft] %llu park-timeout io=0x%08X put=0x%08X\n", ps3_ms_now(), s_fifo_getoff, put);
+                       { static int pn = 0; if (pw > 0 && pn++ < 8)
+@@ -3236,6 +3290,7 @@
+                                            s_fifo_getoff, (unsigned long long)ms, tgt);
+               }
+               s_park_off = 0xFFFFFFFFu;
++              __atomic_store_n(&s_park_wake_ea, 0u, __ATOMIC_RELEASE);   /* patch 6038: past the park */
+               kz3_pt_jump(s_fifo_getoff, tgt, put);   /* KZ3 patch 1009 diagnostic */
+               s_fifo_getoff = tgt;
+               /* get is the RSX's fetch pointer: a title polling it sees the
+@@ -4664,6 +4719,11 @@
+ /* Patch 2081 diagnostic: the two hooks tag their notes (LD_TEX_WRITER names the path that last wrote a page). */
+ static void gcm_spu_note_pages_ea(uint32_t ea, uint32_t size)
+ {
++    {   /* KZ2 patch 6038: this put covers the park the walker waits at: wake the frame thread */
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++        const u32 pe = __atomic_load_n(&s_park_wake_ea, __ATOMIC_RELAXED);
++        if (pe && ((u32)(ea - pe) < 4u || (u32)(pe - ea) < size)) gcm_walker_kick();   /* [ea, ea+size) meets [pe, pe+4) */
++    }
+     /* KZ2: through cellGcm_note_guest_write_pages_ea, which KZ2 patch 6008 extends with the SPU-local bitmap */
+     rsx_live_draw_set_write_source(1u); cellGcm_note_guest_write_pages_ea(ea, size); rsx_live_draw_set_write_source(0u);
+ }

@@ -122,8 +122,15 @@ def layout_round(name, root):
     for d in ("30-01-02", "2030-1-2", "20300102"):
         check(run(root, new, "--date", d)[0] == 2 and snapshot(root) == base, f"{name}: bad --date {d!r} refused")
 
+    # A CRLF file keeps CRLF and the LF files stay LF (write_text() alone writes the platform's line end; issue #9)
+    cff_p = bump_version.at(root, "public/CITATION.cff")
+    cff_p.write_bytes(cff_p.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
     rc, out, err = run(root, new, "--date", "2030-01-02")
     check(rc == 0, f"{name}: bump to {new} succeeds", out[-400:] + err[-600:])
+    raw = cff_p.read_bytes()
+    check(raw.count(b"\n") == raw.count(b"\r\n") and f'version: "{new}"'.encode() in raw, f"{name}: a CRLF file keeps CRLF")
+    check(b"\r" not in bump_version.at(root, "installer/VERSION").read_bytes()
+          and b"\r" not in bump_version.at(root, "public/CHANGELOG.md").read_bytes(), f"{name}: LF files stay LF")
     check(t("installer/VERSION") == new + "\n", f"{name}: installer/VERSION")
     cff = t("public/CITATION.cff")
     check(f'\nversion: "{new}"\n' in cff and '\ndate-released: "2030-01-02"\n' in cff, f"{name}: CITATION.cff", cff[:300])

@@ -7,7 +7,12 @@ port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-
 ## [Unreleased]
 
 ### Changed
+- A frame waiting on a graphics job from the game's SPU code is resumed as soon as the job writes its result, instead of after a fixed 4 ms sleep. In our tests the time from a button press to the frame being handed to Windows went down by 4 to 5 ms (median), to about 59 ms; the screen's own delay comes on top and was not measured.
 - The release notes on GitHub list each change as its own bullet, with the fixes in a list of their own, instead of one long paragraph.
+
+### Fixed
+- The first-run log no longer keeps the Windows user name when a path is written in its escaped form, with doubled backslashes (an error message, or a list or JSON of paths). Reported by @feanor-noldorin (#9).
+- `bump_version.py` keeps each file's line endings instead of writing Windows line endings when run on Windows. Reported by @feanor-noldorin (#9).
 
 ## [0.1.2] - 2026-10-28 (pre-release)
 

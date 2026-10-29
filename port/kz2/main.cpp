@@ -55,6 +55,7 @@
 #include "kz2_log.h"   /* stdio stand-in for KZ3's file logger */
 #include "ps3emu/split_file.h"   /* patch 6034: ps3_sf_has_parts for the update miss hook */
 #include "kz2_fios_stamp.h"       /* FIOS disk cache stamp (patch 6035 pre-open hook) */
+#include "ps3emu/input_latency.h" /* patch 6037: input-to-present probe (KZ2_LATENCY=1) */
 
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
@@ -430,6 +431,7 @@ static void kz2_pump_note(int fired)
  * (rsx_live_draw_pso_await_totals, patch 2124), and every 10 s a summary names the longest call of each kind. An earlier change
  * saw single passes of 8.4-9.2 s at the Corinth River start; this says which call it was and what it waited on. */
 extern "C" void rsx_live_draw_pso_await_totals(unsigned long long* n, unsigned long long* us);
+extern "C" const char* cellGcm_last_drain_why(void);   /* patch 6037: why the last FIFO drain pass stopped */
 enum { KZ2_FC_PRESENT, KZ2_FC_DRAIN, KZ2_FC_PUMP, KZ2_FC_N };
 static const char* const kz2_fc_name[KZ2_FC_N] = {"present", "drain", "pump"};
 struct Kz2FcMark { LARGE_INTEGER t0; unsigned long long aw, awus; };
@@ -448,6 +450,7 @@ static void kz2_fc_end(int kind, const Kz2FcMark& m)
     if (!s_qf.QuadPart) { QueryPerformanceFrequency(&s_qf); s_win = t1; }
     const double ms = (double)(t1.QuadPart - m.t0.QuadPart) * 1e3 / (double)s_qf.QuadPart;
     if (ms > s_max[kind]) s_max[kind] = ms;
+    if (kind == KZ2_FC_DRAIN) ps3_lat_walker(PS3_LAT_WALK_DRAIN, (uint64_t)(ms * 1e3));   /* patch 6037 probe (KZ2_LATENCY=1) */
     if (ms > 250.0 && s_lines++ < 40) {
         unsigned long long aw, awus;
         rsx_live_draw_pso_await_totals(&aw, &awus);
@@ -462,6 +465,11 @@ static void kz2_fc_end(int kind, const Kz2FcMark& m)
         for (double& v : s_max) v = 0.0;
     }
 }
+
+/* The frame thread's sleep between passes (input latency): cellGcm_walker_wait (patch 6038) sleeps
+ * 4 ms as before, but while the last pass stopped on a self-JUMP park it returns as soon as an SPU put patches that
+ * park (KZ2_PARK_WAKE=0 = a plain 4 ms sleep). */
+extern "C" int cellGcm_walker_wait(unsigned ms);
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
@@ -481,7 +489,26 @@ static DWORD WINAPI frame_clock(LPVOID)
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
-        Sleep(4);
+        {   /* the sleep between passes (cellGcm_walker_wait), timed for the patch 6037 probe (KZ2_LATENCY=1) */
+            LARGE_INTEGER s0, s1, sf;
+            const char* why = cellGcm_last_drain_why();
+            QueryPerformanceCounter(&s0);
+            const int woke = cellGcm_walker_wait(4);
+            QueryPerformanceCounter(&s1); QueryPerformanceFrequency(&sf);
+            {   /* [park-wake] every 10 s: sleeps an SPU put on the park ended early (patch 6038), and all sleeps */
+                static unsigned s_woke, s_sleeps; static ULONGLONG s_t0;
+                s_woke += woke ? 1u : 0u; s_sleeps++;
+                const ULONGLONG t = GetTickCount64();
+                if (!s_t0) s_t0 = t;
+                else if (t - s_t0 >= 10000) {
+                    fprintf(stderr, "[park-wake] last %.1f s: %u of %u frame-thread sleeps ended by an SPU put on the park\n",
+                            (double)(t - s_t0) / 1000.0, s_woke, s_sleeps);
+                    s_t0 = t; s_woke = s_sleeps = 0;
+                }
+            }
+            ps3_lat_walker(ps3_lat_walk_kind(why),
+                           (uint64_t)((double)(s1.QuadPart - s0.QuadPart) * 1e6 / (double)sf.QuadPart));
+        }
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;

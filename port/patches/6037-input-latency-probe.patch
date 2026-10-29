@@ -1,0 +1,605 @@
+KZ2 patch 6037: input-to-present latency probe (KZ2_LATENCY=1, off by default).
+Players ask for less input lag and the port had never measured it. With KZ2_LATENCY=1 a host thread presses a pad
+button (KZ2_LATENCY_INJECT=<start s>:<period ms>:<hold ms>:<mask>, default 50:700:120:0x0002 = L3, a gap of period
++ 0..period/2 so the presses land at every phase of a frame) the way a real pad report lands between two game reads,
+and include/ps3emu/input_latency.h follows each press: the game's first cellPadGetData on port 0 that hands it out
+(len > 0), the game's next flip request (gcm_flip_request), the FIFO drain reaching that flip (the 0xFEAD flip
+marker), the frame thread starting its present (rsx_live_draw_present), the swap-chain Present call and its return,
+and the frame's GPU fence (SetEventOnCompletion on the probe's own event, stamped by the injector thread). One
+[latency] probe line per press, a [latency] summary every 20 (median / p95 per stage, in->ret and in->gpu totals,
+present-to-present frame time p50 / p99 over the same span). The port's frame thread (port/kz2/main.cpp) reports
+its time in FIFO drains and its sleeps by why the drain before them stopped (cellGcm_last_drain_why, added here:
+"caught-up", "flip", "park-wait", and "acquire" for a semaphore acquire, which used to keep "caught-up"), so the
+probe line splits req->fifo into the walker's work and its waits (patch 6038 then wakes the
+frame thread from a park). Header-only like ps3_ftrace.h (state in one weak
+object; off, each hook is a load and a branch). General (upstream candidate as a diagnostic).
+
+diff --git a/include/ps3emu/input_latency.h b/include/ps3emu/input_latency.h
+new file mode 100644
+--- /dev/null
++++ b/include/ps3emu/input_latency.h
+@@ -0,0 +1,459 @@
++/*
++ * input_latency -- input-to-present latency probe (KZ2 patch 6037). Off by default.
++ *
++ * KZ2_LATENCY=1 starts an injector thread that presses a pad button at known host times, the way a real pad or key
++ * lands between two of the game's reads, and follows each press through the port:
++ *
++ *   in    the injector sets the button (the host input event)
++ *   read  the game's first cellPadGetData on port 0 that hands it out (len > 0, the bit set)
++ *   req   the game's next flip request after that read (it finished building the frame; cellGcmSetFlip*)
++ *   fifo  the FIFO drain reaches that flip (the live renderer has recorded the whole frame)
++ *   pres  the frame thread starts presenting it (rsx_live_draw_present)
++ *   call  the swap-chain Present is called (after the submit and the frames-in-flight wait)
++ *   ret   Present returned
++ *   gpu   the frame's GPU work finished (its fence; the wait for it is on the probe's own thread)
++ *
++ * Knobs: KZ2_LATENCY_INJECT=<start s>:<period ms>:<hold ms>:<mask> (default 50:700:120:0x0002, L3; start counts from
++ * the first pad read; each gap is period + a pseudo-random 0..period/2 so presses land at every phase of a frame;
++ * mask is PAD_SCRIPT's (DIGITAL2 << 8) | DIGITAL1). One line per press ([latency] probe ...), a summary every 20
++ * presses ([latency] summary: median and p95 per stage, in->ret totals, and the present-to-present frame time p50 /
++ * p99 over the same span). The press is a real pad press for the game, so pick a harmless button.
++ *
++ * Header-only like ps3_ftrace.h: the hooked files are also compiled alone by tests. State is one weak/selectany
++ * object; off, every hook is one load and a branch.
++ */
++#ifndef PS3EMU_INPUT_LATENCY_H
++#define PS3EMU_INPUT_LATENCY_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#ifdef _WIN32
++#  include <windows.h>
++#else
++#  include <time.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* One object for the whole program. Not __attribute__((weak)) on Windows: MinGW GCC turns a weak data definition
++ * into a PE weak external per object, and the hooked files then each kept a copy of their own (an earlier change's first run:
++ * two "probe on" lines and a garbage mask). selectany is a COMDAT the linker folds; it needs initialised data. */
++#if defined(_WIN32)
++#  define PS3_LAT_SHARED __declspec(selectany)
++#else
++#  define PS3_LAT_SHARED __attribute__((weak))
++#endif
++
++enum { PS3_LAT_IN, PS3_LAT_READ, PS3_LAT_REQ, PS3_LAT_FIFO, PS3_LAT_PRES, PS3_LAT_CALL, PS3_LAT_RET, PS3_LAT_GPU,
++       PS3_LAT_NSTAMP };
++/* The frame thread's time (ps3_lat_walker): draining, or asleep after a drain that stopped caught up with put, on a
++ * self-JUMP park or semaphore acquire (waiting for an SPU job or the guest), or on a flip with work still queued. */
++enum { PS3_LAT_WALK_DRAIN, PS3_LAT_WALK_IDLE, PS3_LAT_WALK_PARK, PS3_LAT_WALK_FLIP, PS3_LAT_WALK_N };
++enum { PS3_LAT_MAX = 4096, PS3_LAT_OPEN = 16, PS3_LAT_FT = 16384, PS3_LAT_EVERY = 20 };
++
++typedef struct {
++    uint64_t t[PS3_LAT_NSTAMP];   /* us; 0 = not reached */
++    uint32_t flip;                /* the flip request number this press is waiting for (req count + 1 at read) */
++    uint32_t fence_hi, fence_lo;  /* its frame's fence value (gpu stamp) */
++    int stage;                    /* next stamp to fill */
++    uint64_t walk0[PS3_LAT_WALK_N];   /* the frame thread's totals at the req stamp */
++    double walk_ms[PS3_LAT_WALK_N];   /* ... and their growth from req to fifo */
++} ps3_lat_probe;
++
++typedef struct {
++    uint32_t magic;               /* PS3_LAT_MAGIC: the initialiser selectany needs (and a check the object is shared) */
++    int on;                       /* 0 unknown, 1 initialising, 2 on, 3 off */
++    uint64_t qpf;
++    double start_s, period_ms, hold_ms;
++    uint32_t mask;
++    volatile uint32_t inj_mask;   /* the injector's button bits, ORed into port 0 */
++    volatile int inj_wait_read;   /* a press is down and no read has handed it out yet */
++    uint64_t first_read_us;
++    volatile uint32_t n_req, n_fifo;   /* guest flip requests, flips the drain reached */
++    uint32_t n_probe, n_done, n_reported;
++    ps3_lat_probe* probe;         /* PS3_LAT_MAX, allocated when the probe turns on */
++    uint32_t open[PS3_LAT_OPEN], n_open;   /* indices of probes not yet complete */
++    uint64_t ft_prev; double* ft; uint32_t n_ft;   /* PS3_LAT_FT present-to-present ms since the first press */
++    volatile uint64_t walk_us[PS3_LAT_WALK_N];   /* the frame thread: in a FIFO drain / asleep after each kind of stop */
++#ifdef _WIN32
++    SRWLOCK lock;
++    HANDLE gpu_event, gpu_fence_wait;   /* gpu_event: set by the fence; the probe thread stamps it */
++    volatile LONG gpu_probe;            /* probe index + 1 the fence event belongs to, 0 = none */
++#endif
++} ps3_lat_state;
++
++#define PS3_LAT_MAGIC 0x4C41544Eu
++#if defined(__GNUC__)
++#  pragma GCC diagnostic push
++#  pragma GCC diagnostic ignored "-Wmissing-field-initializers"   /* C++: the rest is zero, as in C */
++#endif
++PS3_LAT_SHARED ps3_lat_state g_ps3_lat = { .magic = PS3_LAT_MAGIC };   /* initialised: selectany */
++#if defined(__GNUC__)
++#  pragma GCC diagnostic pop
++#endif
++
++static inline uint64_t ps3_lat_now(void)
++{
++#ifdef _WIN32
++    LARGE_INTEGER c;
++    QueryPerformanceCounter(&c);
++    return (uint64_t)((double)c.QuadPart * 1e6 / (double)(g_ps3_lat.qpf ? g_ps3_lat.qpf : 1));
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
++#endif
++}
++
++static inline void ps3_lat_lock(void)
++{
++#ifdef _WIN32
++    AcquireSRWLockExclusive(&g_ps3_lat.lock);
++#endif
++}
++static inline void ps3_lat_unlock(void)
++{
++#ifdef _WIN32
++    ReleaseSRWLockExclusive(&g_ps3_lat.lock);
++#endif
++}
++
++/* Parse "<start s>:<period ms>:<hold ms>:<mask>"; missing fields keep their defaults. Returns the fields read. */
++static inline int ps3_lat_parse(const char* e, double* start_s, double* period_ms, double* hold_ms, uint32_t* mask)
++{
++    if (!e || !*e) return 0;
++    double a = *start_s, b = *period_ms, c = *hold_ms; unsigned m = *mask;
++    char hex[32] = {0};
++    const int n = sscanf(e, "%lf:%lf:%lf:%31s", &a, &b, &c, hex);
++    if (n >= 1 && a >= 0) *start_s = a;
++    if (n >= 2 && b >= 50) *period_ms = b;
++    if (n >= 3 && c > 0 && c < *period_ms) *hold_ms = c;
++    if (n >= 4) { m = (unsigned)strtoul(hex, 0, 0); if (m && m <= 0xFFFF) *mask = m; }
++    return n;
++}
++
++/* Sorted-copy quantile (nearest rank). n small (<= PS3_LAT_MAX, PS3_LAT_FT). */
++static inline int ps3_lat_cmp(const void* a, const void* b)
++{
++    const double x = *(const double*)a, y = *(const double*)b;
++    return x < y ? -1 : x > y;
++}
++static inline double ps3_lat_q(double* v, uint32_t n, double q)
++{
++    if (!n) return 0;
++    qsort(v, n, sizeof v[0], ps3_lat_cmp);
++    uint32_t k = (uint32_t)(q * n + 0.999999); if (k < 1) k = 1; if (k > n) k = n;
++    return v[k - 1];
++}
++
++static const char* const ps3_lat_name[PS3_LAT_NSTAMP] = { "in", "read", "req", "fifo", "pres", "call", "ret", "gpu" };
++
++static inline void ps3_lat_summary(void)   /* caller holds the lock */
++{
++    ps3_lat_state* s = &g_ps3_lat;
++    static double v[PS3_LAT_MAX];
++    uint32_t n;
++    char line[1400]; int o = 0;
++    o += snprintf(line + o, sizeof line - o, "[latency] summary presses=%u", s->n_done);
++    for (int st = 1; st < PS3_LAT_NSTAMP; st++) {
++        n = 0;
++        for (uint32_t i = 0; i < s->n_probe; i++) {
++            const ps3_lat_probe* p = &s->probe[i];
++            if (p->stage < PS3_LAT_NSTAMP || !p->t[st] || !p->t[st - 1]) continue;
++            v[n++] = (double)(p->t[st] - p->t[st - 1]) / 1000.0;
++        }
++        const double md = ps3_lat_q(v, n, 0.5), p95 = ps3_lat_q(v, n, 0.95);
++        o += snprintf(line + o, sizeof line - o, " %s->%s=%.1f/%.1f", ps3_lat_name[st - 1], ps3_lat_name[st], md, p95);
++    }
++    for (int k = 0; k < 2; k++) {   /* totals: in->ret (the brief's input-to-Present) and in->gpu */
++        const int st = k ? PS3_LAT_GPU : PS3_LAT_RET;
++        n = 0;
++        for (uint32_t i = 0; i < s->n_probe; i++) {
++            const ps3_lat_probe* p = &s->probe[i];
++            if (p->stage < PS3_LAT_NSTAMP || !p->t[st]) continue;
++            v[n++] = (double)(p->t[st] - p->t[PS3_LAT_IN]) / 1000.0;
++        }
++        const double md = ps3_lat_q(v, n, 0.5), p95 = ps3_lat_q(v, n, 0.95);
++        o += snprintf(line + o, sizeof line - o, " total_in->%s=%.1f/%.1f", ps3_lat_name[st], md, p95);
++    }
++    for (int k = 0; k < PS3_LAT_WALK_N; k++) {   /* the frame thread inside req->fifo: draining, asleep after a stop */
++        static const char* const wn[PS3_LAT_WALK_N] = { "drain", "sleep_caughtup", "sleep_park", "sleep_flip" };
++        n = 0;
++        for (uint32_t i = 0; i < s->n_probe; i++) {
++            const ps3_lat_probe* p = &s->probe[i];
++            if (p->stage < PS3_LAT_NSTAMP) continue;
++            v[n++] = p->walk_ms[k];
++        }
++        const double md = ps3_lat_q(v, n, 0.5), p95 = ps3_lat_q(v, n, 0.95);
++        o += snprintf(line + o, sizeof line - o, " req->fifo_%s=%.1f/%.1f", wn[k], md, p95);
++    }
++    {
++        static double f[PS3_LAT_FT];
++        n = s->n_ft < (uint32_t)PS3_LAT_FT ? s->n_ft : (uint32_t)PS3_LAT_FT;
++        memcpy(f, s->ft, n * sizeof f[0]);
++        double sum = 0; for (uint32_t i = 0; i < n; i++) sum += f[i];
++        const double p50 = ps3_lat_q(f, n, 0.5), p99 = ps3_lat_q(f, n, 0.99);
++        o += snprintf(line + o, sizeof line - o, " frames=%u fps=%.2f ft_p50=%.1f ft_p99=%.1f (ms, median/p95)",
++                      n, n && sum > 0 ? 1000.0 * n / sum : 0.0, p50, p99);
++    }
++    fprintf(stderr, "%s\n", line);
++    fflush(stderr);
++}
++
++/* One press done (or abandoned): its line, and a summary every PS3_LAT_EVERY. Caller holds the lock. */
++static inline void ps3_lat_finish(uint32_t idx)
++{
++    ps3_lat_state* s = &g_ps3_lat;
++    const ps3_lat_probe* p = &s->probe[idx];
++    char line[768]; int o = 0;
++    o += snprintf(line + o, sizeof line - o, "[latency] probe %u flip=%u req->fifo: drain %.1f, asleep after caught-up "
++                  "%.1f park %.1f flip %.1f ms |", idx, p->flip, p->walk_ms[0], p->walk_ms[1], p->walk_ms[2], p->walk_ms[3]);
++    for (int st = 1; st < PS3_LAT_NSTAMP; st++)
++        o += snprintf(line + o, sizeof line - o, " %s=%.1f", ps3_lat_name[st],
++                      p->t[st] ? (double)(p->t[st] - p->t[PS3_LAT_IN]) / 1000.0 : -1.0);
++    fprintf(stderr, "%s\n", line);
++    for (uint32_t k = 0; k < s->n_open; k++)
++        if (s->open[k] == idx) { s->open[k] = s->open[--s->n_open]; break; }
++    s->n_done++;
++    if (s->n_done - s->n_reported >= PS3_LAT_EVERY) { s->n_reported = s->n_done; ps3_lat_summary(); }
++}
++
++#ifdef _WIN32
++static DWORD WINAPI ps3_lat_thread(LPVOID arg)
++{
++    (void)arg;
++    ps3_lat_state* s = &g_ps3_lat;
++    uint32_t rng = 0x2545F491u;
++    while (!s->first_read_us) Sleep(50);
++    const uint64_t t0 = s->first_read_us + (uint64_t)(s->start_s * 1e6);
++    while (ps3_lat_now() < t0) Sleep(20);
++    fprintf(stderr, "[latency] injecting mask 0x%04X every %.0f-%.0f ms, held %.0f ms\n", (unsigned)s->mask, s->period_ms,
++            s->period_ms * 1.5, s->hold_ms);
++    fflush(stderr);
++    for (;;) {
++        /* press */
++        ps3_lat_lock();
++        {   /* a press still open after 3 s (a load, or a fence stamp that never came) is closed as incomplete */
++            const uint64_t now = ps3_lat_now();
++            for (uint32_t k = 0; k < s->n_open; ) {
++                ps3_lat_probe* p = &s->probe[s->open[k]];
++                if (now - p->t[PS3_LAT_IN] > 3000000u) {
++                    if (s->gpu_probe == (LONG)s->open[k] + 1) InterlockedExchange(&s->gpu_probe, 0);
++                    p->stage = -1; ps3_lat_finish(s->open[k]);   /* moves the last open index here */
++                } else k++;
++            }
++        }
++        if (s->n_probe < PS3_LAT_MAX && s->n_open < PS3_LAT_OPEN) {
++            const uint32_t i = s->n_probe++;
++            memset(&s->probe[i], 0, sizeof s->probe[i]);
++            s->probe[i].t[PS3_LAT_IN] = ps3_lat_now();
++            s->probe[i].stage = PS3_LAT_READ;
++            s->open[s->n_open++] = i;
++            s->inj_wait_read = 1;
++            s->inj_mask = s->mask;
++            if (!s->ft_prev) s->ft_prev = 1;   /* frame times are kept from the first press on */
++        }
++        ps3_lat_unlock();
++        /* hold, stamping the GPU fence of a probe frame on the way */
++        const uint64_t up = ps3_lat_now() + (uint64_t)(s->hold_ms * 1000.0);
++        rng = rng * 1664525u + 1013904223u;
++        const uint64_t next = up + (uint64_t)((s->period_ms - s->hold_ms + (s->period_ms * 0.5) * ((rng >> 8) / 16777216.0))
++                                              * 1000.0);
++        int released = 0;
++        for (;;) {
++            const uint64_t now = ps3_lat_now();
++            if (!released && now >= up) {
++                ps3_lat_lock();
++                s->inj_mask = 0;
++                if (s->inj_wait_read) {   /* never read while held: the game was not polling (load); drop it */
++                    s->inj_wait_read = 0;
++                    if (s->n_open) { const uint32_t i = s->open[s->n_open - 1];
++                                     if (s->probe[i].stage == PS3_LAT_READ) { s->probe[i].stage = -1; ps3_lat_finish(i); } }
++                }
++                ps3_lat_unlock();
++                released = 1;
++            }
++            if (now >= next) break;
++            const DWORD ms = (DWORD)((next - now) / 1000u);
++            if (WaitForSingleObject(s->gpu_event, ms > 2 ? 2 : (ms ? ms : 1)) == WAIT_OBJECT_0) {
++                const uint64_t t = ps3_lat_now();
++                ps3_lat_lock();
++                const LONG gp = InterlockedExchange(&s->gpu_probe, 0);
++                if (gp > 0) {
++                    ps3_lat_probe* p = &s->probe[gp - 1];
++                    if (p->stage == PS3_LAT_GPU) { p->t[PS3_LAT_GPU] = t; p->stage = PS3_LAT_NSTAMP; ps3_lat_finish((uint32_t)gp - 1); }
++                }
++                ps3_lat_unlock();
++            }
++        }
++    }
++    return 0;
++}
++#endif
++
++static inline int ps3_lat_init(void)
++{
++    ps3_lat_state* s = &g_ps3_lat;
++    int expect = 0;
++    if (!__atomic_compare_exchange_n(&s->on, &expect, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++        return expect == 2;
++    int on = 3;
++#ifdef _WIN32
++    const char* e = getenv("KZ2_LATENCY");
++    if (e && e[0] == '1') {
++        LARGE_INTEGER f; QueryPerformanceFrequency(&f); s->qpf = (uint64_t)f.QuadPart;
++        InitializeSRWLock(&s->lock);
++        s->start_s = 50; s->period_ms = 700; s->hold_ms = 120; s->mask = 0x0002;
++        ps3_lat_parse(getenv("KZ2_LATENCY_INJECT"), &s->start_s, &s->period_ms, &s->hold_ms, &s->mask);
++        s->gpu_event = CreateEventA(NULL, FALSE, FALSE, NULL);
++        s->probe = (ps3_lat_probe*)calloc(PS3_LAT_MAX, sizeof(ps3_lat_probe));
++        s->ft = (double*)calloc(PS3_LAT_FT, sizeof(double));
++        HANDLE h = s->gpu_event && s->probe && s->ft ? CreateThread(NULL, 0, ps3_lat_thread, NULL, 0, NULL) : NULL;
++        if (h) {
++            CloseHandle(h);
++            fprintf(stderr, "[latency] probe on (state %p): first press %.0f s after the first pad read, mask 0x%04X\n",
++                    (void*)s, s->start_s, (unsigned)s->mask);
++            on = 2;
++        }
++    }
++#endif
++    __atomic_store_n(&s->on, on, __ATOMIC_RELEASE);
++    return on == 2;
++}
++
++static inline int ps3_lat_on(void)
++{
++    const int on = __atomic_load_n(&g_ps3_lat.on, __ATOMIC_RELAXED);
++    if (__builtin_expect(on == 2, 0)) return 1;
++    if (__builtin_expect(on != 0, 1)) return 0;
++    return ps3_lat_init();
++}
++
++/* cellPadGetData, port 0, before the len/fresh decision: the injector's bits, as a device's. */
++static inline uint32_t ps3_lat_pad_mask(void)
++{
++    if (!ps3_lat_on()) return 0;
++    if (!g_ps3_lat.first_read_us) g_ps3_lat.first_read_us = ps3_lat_now();
++    return g_ps3_lat.inj_mask;
++}
++
++/* cellPadGetData, port 0, after the len decision: the read that hands the press to the game. */
++static inline void ps3_lat_pad_read(int len, uint32_t digital)
++{
++    if (!ps3_lat_on() || !g_ps3_lat.inj_wait_read || len <= 0) return;
++    ps3_lat_state* s = &g_ps3_lat;
++    if (!(digital & s->mask)) return;
++    ps3_lat_lock();
++    if (s->inj_wait_read) {
++        s->inj_wait_read = 0;
++        for (uint32_t k = 0; k < s->n_open; k++) {
++            ps3_lat_probe* p = &s->probe[s->open[k]];
++            if (p->stage != PS3_LAT_READ) continue;
++            p->t[PS3_LAT_READ] = ps3_lat_now();
++            p->flip = s->n_req + 1;
++            p->stage = PS3_LAT_REQ;
++        }
++    }
++    ps3_lat_unlock();
++}
++
++/* Advance every open probe waiting at `stage` whose flip has come (count >= its flip). */
++static inline void ps3_lat_flip_stage(int stage, uint32_t count)
++{
++    ps3_lat_state* s = &g_ps3_lat;
++    if (!s->n_open) return;
++    ps3_lat_lock();
++    const uint64_t t = ps3_lat_now();
++    for (uint32_t k = 0; k < s->n_open; k++) {
++        ps3_lat_probe* p = &s->probe[s->open[k]];
++        if (p->stage == stage && count >= p->flip) {
++            p->t[stage] = t; p->stage = stage + 1;
++            for (int w = 0; w < PS3_LAT_WALK_N; w++) {
++                if (stage == PS3_LAT_REQ) p->walk0[w] = s->walk_us[w];
++                if (stage == PS3_LAT_FIFO) p->walk_ms[w] = (double)(s->walk_us[w] - p->walk0[w]) / 1000.0;
++            }
++        }
++    }
++    ps3_lat_unlock();
++}
++
++/* cellGcmSys: the guest asked for a flip (and, for a direct flip, the drain is there too). */
++static inline void ps3_lat_flip_req(int direct)
++{
++    if (!ps3_lat_on()) return;
++    const uint32_t c = __atomic_add_fetch(&g_ps3_lat.n_req, 1, __ATOMIC_ACQ_REL);
++    ps3_lat_flip_stage(PS3_LAT_REQ, c);
++    if (direct) { const uint32_t f = __atomic_add_fetch(&g_ps3_lat.n_fifo, 1, __ATOMIC_ACQ_REL); ps3_lat_flip_stage(PS3_LAT_FIFO, f); }
++}
++/* cellGcmSys: the FIFO drain reached a queued flip. */
++static inline void ps3_lat_flip_fifo(void)
++{
++    if (!ps3_lat_on()) return;
++    const uint32_t f = __atomic_add_fetch(&g_ps3_lat.n_fifo, 1, __ATOMIC_ACQ_REL);
++    ps3_lat_flip_stage(PS3_LAT_FIFO, f);
++}
++/* The port's frame thread (port/kz2/main.cpp frame_clock): time in a FIFO drain or asleep (PS3_LAT_WALK_*). */
++static inline void ps3_lat_walker(int kind, uint64_t us)
++{
++    if (__atomic_load_n(&g_ps3_lat.on, __ATOMIC_RELAXED) != 2 || kind < 0 || kind >= PS3_LAT_WALK_N) return;
++    __atomic_add_fetch(&g_ps3_lat.walk_us[kind], us, __ATOMIC_RELAXED);
++}
++/* The kind of sleep that follows a drain pass that stopped for `why` (cellGcm_last_drain_why). */
++static inline int ps3_lat_walk_kind(const char* why)
++{
++    if (!why) return PS3_LAT_WALK_IDLE;
++    if (!strcmp(why, "flip")) return PS3_LAT_WALK_FLIP;
++    if (!strcmp(why, "park-wait") || !strcmp(why, "acquire")) return PS3_LAT_WALK_PARK;
++    return PS3_LAT_WALK_IDLE;
++}
++
++/* Live renderer: present start, Present call, Present return (with the frame's fence for the gpu stamp). */
++static inline void ps3_lat_present(int stage)
++{
++    if (!ps3_lat_on()) return;
++    ps3_lat_state* s = &g_ps3_lat;
++    if (stage == PS3_LAT_RET) {   /* frame times from the first press on, under the lock below */
++        ps3_lat_lock();
++        const uint64_t t = ps3_lat_now();
++        if (s->ft_prev > 1 && s->n_ft < PS3_LAT_FT) s->ft[s->n_ft++] = (double)(t - s->ft_prev) / 1000.0;
++        if (s->ft_prev) s->ft_prev = t;
++        ps3_lat_unlock();
++    }
++    ps3_lat_flip_stage(stage, __atomic_load_n(&s->n_fifo, __ATOMIC_ACQUIRE));
++}
++/* After ps3_lat_present(PS3_LAT_RET): the probe (index + 1) whose frame this is, if one now waits for its GPU
++ * stamp and no other does; the caller then arms the fence event (ID3D12Fence::SetEventOnCompletion). 0 = none. */
++static inline long ps3_lat_gpu_claim(void)
++{
++    if (!ps3_lat_on()) return 0;
++#ifdef _WIN32
++    ps3_lat_state* s = &g_ps3_lat;
++    if (!s->n_open || s->gpu_probe) return 0;
++    long claim = 0;
++    ps3_lat_lock();
++    for (uint32_t k = 0; k < s->n_open && !claim; k++)
++        if (s->probe[s->open[k]].stage == PS3_LAT_GPU) claim = (long)s->open[k] + 1;
++    if (claim) InterlockedExchange(&s->gpu_probe, claim);
++    ps3_lat_unlock();
++    return claim;
++#else
++    return 0;
++#endif
++}
++static inline void* ps3_lat_gpu_event(void)
++{
++#ifdef _WIN32
++    return g_ps3_lat.gpu_event;
++#else
++    return 0;
++#endif
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -18,6 +18,7 @@
+ #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
+ #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+ #include "ps3emu/log_first.h"
++#include "ps3emu/input_latency.h"   /* KZ2 patch 6037 */
+ 
+ /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
+  * wall-clock seconds. A loaded machine runs a title at a third of its usual
+@@ -1588,6 +1589,13 @@
+           }
+       } }
+ 
++    /* KZ2 patch 6037 (KZ2_LATENCY=1, off by default): the latency probe's injected press, a device's bits */
++    if (port_no == 0) {
++        const uint32_t lm = ps3_lat_pad_mask();
++        if (lm) { data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(lm & 0xFF);
++                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((lm >> 8) & 0xFF); }
++    }
++
+     /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
+      * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
+      * of polls and empty the file. A driver outside the process can then look
+@@ -1798,6 +1806,9 @@
+             else                        s_data_fresh[port_no] = 0;
+         }
+     }
++    if (port_no == 0)   /* KZ2 patch 6037: the read that hands the probe's press to the game */
++        ps3_lat_pad_read((int)data->len, (uint32_t)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
++                                         ((uint32_t)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8));
+ #ifdef _WIN32
+     /* KZ2 patch 4021 (diagnostic): KZ2_PAD_TRACE=1 logs what port 0 hands the game whenever it
+      * changes: digital words, left stick Y, the d-pad pressure words, which thread read it and how many reads came
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -23,6 +23,7 @@
+ static void gcm_note_pages_ea(u32 ea, u32 size);           /* patch 2033 */
+ #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
+ #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
++#include "../../include/ps3emu/input_latency.h"  /* KZ2 patch 6037 */
+ static unsigned long s_perf_rsx_tid, s_perf_gcm_tid;   /* RSX_PERF thread labels (patch 2007) */
+ static uintptr_t s_ps_end;                            /* RSX_PERF_SAMPLE: exe image end */
+ 
+@@ -1026,6 +1027,10 @@
+ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+ static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
+ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
++/* KZ2 patch 6037: why the last drain pass stopped ("caught-up", "flip", "park-wait", "acquire", ...), for the
++ * frame thread's latency probe (port/kz2/main.cpp). Written by the draining thread only. */
++static const char* volatile s_last_drain_why = "caught-up";
++const char* cellGcm_last_drain_why(void) { return s_last_drain_why; }
+ /* The park the walker is waiting on (0 = none), the `put` it saw there, and
+  * since when it has stood with that put: the jump-park grace in the walker. */
+ static u32 park_off, park_put;
+@@ -3080,6 +3085,7 @@
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
++                ps3_lat_flip_fifo();   /* KZ2 patch 6037 (KZ2_LATENCY=1) */
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+@@ -3371,7 +3377,7 @@
+             }
+         }
+                 }
+-                if (sem_blocked) { s_sema_blocked_pass = 1; break; }
++                if (sem_blocked) { s_sema_blocked_pass = 1; why = "acquire"; break; }   /* why: KZ2 patch 6037 */
+                 s_fifo_getoff += 4 + count * 4;
+                 continue;
+             }
+@@ -3640,6 +3646,7 @@
+      * on a JUMP-to-self the SPU has not patched yet): hand the GPU what it has
+      * recorded so far instead of letting it sit until the next sync point. */
+     if (strcmp(why, "flip") != 0 && rsx_live_draw_enabled()) rsx_live_draw_submit_pending();
++    s_last_drain_why = why;   /* KZ2 patch 6037 */
+ 
+     /* Publish progress: get chases put; ref advances at most ONE queued fence
+      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
+@@ -4017,6 +4024,7 @@
+     s_last_flip_time = get_timestamp_ns();
+     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
+                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
++    ps3_lat_flip_req(!in_fifo);   /* KZ2 patch 6037 (KZ2_LATENCY=1) */
+ 
+     /* Invoke via OPD resolution, not a raw call into guest code.
+      *
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -218,6 +218,7 @@
+ #include "rsx_vertex_formats.h"
+ #include "rsx_keycaps.h"   /* patch 2091 (KZ3 2039): keycap prompts */
+ #include "rsx_d3d12_device.h"   /* patch 2121 (KZ3 2099): WARP fallback */
++#include "ps3emu/input_latency.h"   /* KZ2 patch 6037: input-to-present probe */
+ #include <sys/stat.h>
+ 
+ #pragma comment(lib, "d3d12.lib")
+@@ -17534,10 +17535,15 @@
+             const char* e = getenv("LD_NO_PRESENT");
+             s_nopresent = (e && *e == '1') ? 1 : 0;
+         }
++        ps3_lat_present(PS3_LAT_CALL);   /* KZ2 patch 6037 (KZ2_LATENCY=1) */
+         const long long swap0 = rsx_perf_now();
+         const HRESULT present_hr = s_nopresent ? S_OK
+             : g.swap->lpVtbl->Present(g.swap, (UINT)s_interval, 0);
+         rsx_perf_add(RSX_PERF_SWAP_T, rsx_perf_now() - swap0);
++        ps3_lat_present(PS3_LAT_RET);    /* KZ2 patch 6037: and the frame's fence for the probe's gpu stamp */
++        if (ps3_lat_gpu_claim() &&
++            FAILED(g.fence->lpVtbl->SetEventOnCompletion(g.fence, g.fence_value, (HANDLE)ps3_lat_gpu_event())))
++            SetEvent((HANDLE)ps3_lat_gpu_event());
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);
+         else {
+@@ -18408,6 +18414,7 @@
+ /* RSX_PERF (patch 2007): whole present (flush + GPU wait + swap) per frame. */
+ void rsx_live_draw_present(u32 buffer_id)
+ {
++    ps3_lat_present(PS3_LAT_PRES);   /* KZ2 patch 6037 (KZ2_LATENCY=1) */
+     ld_pl_tick();                                   /* patch 2031 */
+     ld_pt_tick();                                   /* patch 2071 */
+     if (ld_pstat_on()) ld_pstat_flush_if_new_minute();   /* patch 2031: close the minute line on flips too */

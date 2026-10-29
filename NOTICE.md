@@ -57,6 +57,7 @@ ps3recomp.
 | Source | Use | Licence |
 |---|---|---|
 | [RPCS3](https://github.com/RPCS3/rpcs3) | reference for PS3 behaviour, read only; no RPCS3 code is included | GPL-2.0, not used as code |
+| [Killzone2_Blender](https://github.com/Tzeentchnet/Killzone2_Blender) by Tzeentchnet | format notes (its docs only) on the game archive, CORE payloads, skeletons and animation, each checked against our own reads before use in tools/core.py; no code is included | MIT, facts only |
 | [RPCS3 wiki](https://wiki.rpcs3.net/index.php?title=Killzone_2) | facts about the game's behaviour under emulation (settings, known issues) | CC BY-SA 4.0, facts only |
 
 Killzone and Killzone 2 are trademarks of Sony Interactive Entertainment. This project is not affiliated with or

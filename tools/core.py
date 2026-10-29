@@ -216,6 +216,171 @@ def lua51_chunk_len(d, p):
     return q - p
 
 
+# ---- RTTIBin<1.58> payload checks (Texture, Vertex/IndexArrayResource, ShaderResource, ES00, EA02) --------------------
+# Layouts from the format notes of Killzone2_Blender by Tzeentchnet (MIT, github.com/Tzeentchnet/Killzone2_Blender,
+# docs v0.5.3), written here independently and re-checked on every unique core of data_ps3.psarc (1,249 decoded, all
+# payloads below matched; numbers in the RE notes "Killzone2_Blender cross-check"). They turn the
+# vacuous "stored length minus fields" opaque check into a real one: a payload that does not fit its own header
+# raises DecodeError. The disc has no .corestream files: every Texture holds its whole payload.
+
+def _enum_num(s):
+    """'S3TC1 (19)' -> 19 (enum fields decode to 'Name (value)')."""
+    return int(s[s.rindex("(") + 1:-1])
+
+
+def _align(x, a):
+    return (x + a - 1) // a * a
+
+
+_TEX_RSX = {5: (0x85, 0xA5), 6: (0x85,), 19: (0x86,), 20: (0x87,), 21: (0x88,), 31: (0x9A,)}  # pixel format -> RSX format byte(s)
+
+
+def _tex_level_bytes(pf, w, h):
+    if pf == 19:
+        return max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 8
+    if pf in (20, 21):
+        return max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 16
+    if pf in (5, 6):
+        return w * h * 4
+    if pf == 31:
+        return w * h * 8
+    return None
+
+
+def check_texture(blob, F):
+    """Texture payload after the reflected fields: u32 allocation size (= payload + 128), u32 0x01050000, u32 payload
+    size, four state words (1, 0, 128, end of the logical data), 24-byte RSX descriptor (format, mips, dimension 2,
+    cube flag, ARGB remap, u16 width, height, depth 1, location 0, pad 0, u32 pitch, u32 offset 0), 80 bytes 0x50, then
+    the pixels: faces x align128(sum of mip sizes), largest mip first. Returns the layout; raises DecodeError."""
+    sf = F["Format"]
+    w, h, pf = sf["Width"], sf["Height"], _enum_num(sf["PixelFormat"])
+    typ, mips, cf = _enum_num(F["Type"]), F["NumSurfaces"], _enum_num(F["CreationFlags"])
+    if len(blob) < 132:
+        raise DecodeError(f"Texture payload {len(blob)} bytes, header needs 132")
+    alloc, const, payload = struct.unpack(">III", blob[:12])
+    st = struct.unpack(">IIII", blob[12:28])
+    rsx = blob[28:52]
+    faces = 6 if typ == 2 else 1
+    if const != 0x01050000 or alloc != payload + 128 or st[:3] != (1, 0, 128):
+        raise DecodeError("Texture header words (alloc/0x01050000/state) do not match")
+    if (rsx[1], rsx[2], rsx[3]) != (mips, 2, 1 if typ == 2 else 0) or struct.unpack(">HHH", rsx[8:14]) != (w, h, 1) \
+            or rsx[14:16] != bytes(2) or rsx[20:24] != bytes(4):
+        raise DecodeError("Texture RSX descriptor disagrees with the reflected fields")
+    if pf in _TEX_RSX and rsx[0] not in _TEX_RSX[pf]:
+        raise DecodeError(f"Texture pixel format {pf} with RSX format {rsx[0]:#x}")
+    if blob[52:132] != b"\x50" * 80:
+        raise DecodeError("Texture fill bytes are not 0x50")
+    if len(blob) - 132 != payload:
+        raise DecodeError(f"Texture payload {len(blob) - 132} bytes, header says {payload}")
+    lvl = [_tex_level_bytes(pf, max(1, w >> i), max(1, h >> i)) for i in range(mips)]
+    if None not in lvl and not (cf == 3 and pf == 5):  # dynamic RGBA8 is linear, one level, no formula
+        face = _align(sum(lvl), 128)
+        if payload != face * faces or st[3] not in (payload, face * (faces - 1) + sum(lvl)):
+            raise DecodeError(f"Texture payload {payload} != {faces} x align128({sum(lvl)})")
+    return dict(payload=payload, faces=faces, rsx_format=rsx[0], remap=rsx[4:8].hex(), pitch=struct.unpack(">I", rsx[16:20])[0])
+
+
+def check_vertex_array(blob, start):
+    """VertexArrayResource payload: align 4 (file offset `start`), i32 vertex count, i32 (= vertex count on the disc),
+    i32 stream count, per stream (i32 flags, i32 stride, i32 declaration count, 8-byte declarations: u32 semantic,
+    u8 offset, u8 storage, u8 components, u8 0), then per stream align 4 + count x stride bytes. Ends exactly at the
+    payload end. Semantic/storage codes are Killzone2_Blender's names (not decoded here)."""
+    p = (-start) % 4
+    try:
+        vc, dup, sc = struct.unpack(">iii", blob[p:p + 12])
+        p += 12
+        streams = []
+        for _ in range(sc):
+            fl, stride, nd = struct.unpack(">iii", blob[p:p + 12])
+            p += 12
+            decls = [struct.unpack(">IBBBB", blob[p + 8 * k:p + 8 * k + 8]) for k in range(nd)]
+            p += 8 * nd
+            streams.append((fl, stride, decls))
+    except struct.error:
+        raise DecodeError("VertexArrayResource header runs past the payload")
+    if vc < 0 or not 0 <= sc <= 64:
+        raise DecodeError("VertexArrayResource counts out of range")
+    for fl, stride, decls in streams:
+        p = _align(p + start, 4) - start + vc * stride
+    if p != len(blob):
+        raise DecodeError(f"VertexArrayResource streams end at {p}, payload is {len(blob)} bytes")
+    return dict(vertices=vc, vertices2=dup, streams=streams)
+
+
+def check_index_array(blob, start):
+    """IndexArrayResource payload: align 4, i32 index count, 8 bytes (always 00000001 00000002 on the disc), count u16
+    indices, zero padding to a 4-byte boundary of the file."""
+    p = (-start) % 4
+    try:
+        n, = struct.unpack(">i", blob[p:p + 4])
+    except struct.error:
+        raise DecodeError("IndexArrayResource header runs past the payload")
+    end = p + 12 + 2 * n
+    if n < 0 or end > len(blob) or _align(start + end, 4) - start != len(blob) or any(blob[end:]):
+        raise DecodeError(f"IndexArrayResource: {n} indices do not fit the {len(blob)}-byte payload")
+    return dict(indices=n, header=blob[p + 4:p + 12].hex())
+
+
+def check_shader(blob):
+    """ShaderResource payload after IBLRequirements: u32 size, then the compiled object, whose bytes 8..11 are 'SHO\\x08'."""
+    if len(blob) < 16 or struct.unpack(">I", blob[:4])[0] != len(blob) - 4 or blob[12:16] != b"SHO\x08":
+        raise DecodeError("ShaderResource payload is not size + SHO object")
+    return dict(size=len(blob) - 4)
+
+
+def check_es00(es):
+    """Skeleton.EdgeAnimSkeleton ('ES00'): u32 magic, u32 unknown, u32 total size (= length), u16 joints, u16 user
+    channels, u16, u16, six self-relative u32 offsets; fallback pose at +0x14 (48 bytes per joint, unit quaternion
+    first), parent u16 per joint at +0x18 (0xFFFF = root, parents come before children on the disc)."""
+    if not es:
+        return None
+    if es[:4] != b"ES00" or len(es) < 0x2C or struct.unpack(">I", es[8:12])[0] != len(es):
+        raise DecodeError("EdgeAnimSkeleton is not an ES00 blob of its own length")
+    nj = struct.unpack(">H", es[12:14])[0]
+    offs = struct.unpack(">6I", es[0x14:0x2C])
+    for k, v in enumerate(offs):
+        if v and 0x14 + 4 * k + v > len(es):
+            raise DecodeError(f"ES00 offset {k} points past the blob")
+    pose, par = 0x14 + offs[0], 0x18 + offs[1]
+    if pose + 48 * nj > len(es) or par + 2 * nj > len(es):
+        raise DecodeError("ES00 pose/parent arrays run past the blob")
+    parents = struct.unpack(f">{nj}H", es[par:par + 2 * nj])
+    if any(p != 0xFFFF and p >= j for j, p in enumerate(parents)):
+        raise DecodeError("ES00 parent index does not precede its child")
+    return dict(joints=nj, parents=parents)
+
+
+def check_ea02(ea, duration):
+    """SkeletonAnimationResource.EdgeAnimAnimation ('EA02'): f32 duration (= the reflected Duration), f32 sample
+    frequency (= (frames - 1) / duration), u16 header size, joints, frames, frame sets, evaluation size, 8 u16 channel
+    counts, u16 flags at 0x26 (0 for all 53,315 clips on the disc), self-relative offsets from 0x34. The frame-set
+    info table (u16 base frame, u16 intra frames) is increasing and ends with a sentinel at frames - 1."""
+    if len(ea) < 0x54 or ea[:4] != b"EA02":
+        raise DecodeError("EdgeAnimAnimation is not an EA02 clip")
+    dur, freq = struct.unpack(">ff", ea[4:12])
+    hs, nj, nf, nfs = struct.unpack(">HHHH", ea[12:20])
+    flags, = struct.unpack(">H", ea[0x26:0x28])
+    if abs(dur - duration) > 1e-4 * max(1.0, dur):
+        raise DecodeError(f"EA02 duration {dur} != reflected Duration {duration}")
+    if dur > 0 and nf > 1 and abs(freq - (nf - 1) / dur) > 1e-3 * max(1.0, freq):
+        raise DecodeError("EA02 sample frequency != (frames - 1) / duration")
+    info = 0x38 + struct.unpack(">I", ea[0x38:0x3C])[0]
+    if nfs < 1 or info + 4 * nfs > len(ea):
+        raise DecodeError("EA02 frame-set table out of range")
+    bases = [struct.unpack(">H", ea[info + 4 * k:info + 4 * k + 2])[0] for k in range(nfs)]
+    if bases != sorted(set(bases)) or bases[-1] != nf - 1:
+        raise DecodeError("EA02 frame-set base frames are not increasing up to the sentinel")
+    return dict(joints=nj, frames=nf, framesets=nfs, flags=flags, header=hs)
+
+
+def object_id_display(h):
+    """The form in which an external reference names an object: the 16-byte object id from the object list with each
+    4-byte group reversed (32 lower-case hex digits). 906 of 906 external references of the Blood Meridian cores
+    resolve to an object id of some core this way; none matches the plain hex. The function is its own inverse."""
+    b = bytes.fromhex(h)
+    return b"".join(b[i:i + 4][::-1] for i in range(0, 16, 4)).hex()
+
+
 class Core:
     def __init__(self, data, schema):
         self.s, self.r = schema, Reader(data)
@@ -343,7 +508,9 @@ class Core:
             obj["opaque"] = want - (r.p - obj["start"])
             obj["blob"] = r.raw(obj["opaque"])
         obj["end"] = r.p
-        if cname == "Texture" and "blob" in obj and len(obj["blob"]) >= 17:
+        if self.v158:
+            self.check_payload_158(obj, cname)
+        if cname == "Texture" and "blob" in obj and len(obj["blob"]) >= 17 and not self.v158:
             # streamed top mips: u32 data size at blob[9:13] counts the whole mip chain, the list-B token only the
             # part stored in the .core; the rest is in the .corestream, back to back in object order
             full = struct.unpack(">I", obj["blob"][9:13])[0]
@@ -357,6 +524,25 @@ class Core:
             obj["size_ok"] = (r.p - obj["start"]) == self.hashes[i][1]
         else:  # no stored length: the next object's header must start here (its tokens name object i+1 as owner)
             obj["size_ok"] = self.next_header_ok(r.p, i + 1)
+
+    def check_payload_158(self, obj, cname):
+        """Validate the opaque payloads whose layout is known (check_* above); the result goes to obj[...]. A payload
+        that does not fit its own header is a DecodeError, so the stored-length check is no longer vacuous for them."""
+        F = {n: v for _, n, _, _, v in obj["fields"]}
+        blob = obj.get("blob")
+        start = obj["end"] - len(blob) if blob is not None else 0
+        if cname == "Texture" and blob is not None:
+            obj["texture"] = check_texture(blob, F)
+        elif cname == "VertexArrayResource" and blob is not None:
+            obj["vertex_array"] = check_vertex_array(blob, start)
+        elif cname == "IndexArrayResource" and blob is not None:
+            obj["index_array"] = check_index_array(blob, start)
+        elif cname == "ShaderResource" and blob is not None:
+            obj["shader"] = check_shader(blob)
+        elif cname == "Skeleton" and "EdgeAnimSkeleton" in F:
+            obj["es00"] = check_es00(bytes(F["EdgeAnimSkeleton"]))
+        elif cname == "SkeletonAnimationResource" and "EdgeAnimAnimation" in F:
+            obj["ea02"] = check_ea02(bytes(F["EdgeAnimAnimation"]), F["Duration"])
 
     def script_end(self, e, i, trial):
         """End of a CoreScript/GameScript object whose Lua chunk ends at e: 2 or 3 zero bytes follow it (not

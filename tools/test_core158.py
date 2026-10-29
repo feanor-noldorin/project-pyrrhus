@@ -42,6 +42,104 @@ def check(name, cond):
     return cond
 
 
+def expect_error(label, fn, *a):
+    try:
+        fn(*a)
+    except core.DecodeError:
+        return check(label, True)
+    return check(label, False)
+
+
+def tex_blob(w=8, h=8, pf=19, mips=1, cube=False, cf=1):
+    """Synthetic Texture payload in the layout of Killzone2_Blender's notes (all values made up here)."""
+    lvl = [core._tex_level_bytes(pf, max(1, w >> i), max(1, h >> i)) for i in range(mips)]
+    face = core._align(sum(lvl), 128)
+    payload = face * (6 if cube else 1)
+    rsx_fmt = {19: 0x86, 5: 0x85}[pf]
+    rsx = bytes([rsx_fmt, mips, 2, 1 if cube else 0]) + bytes.fromhex("0000aae4") + struct.pack(">HHH", w, h, 1) + bytes(2) \
+        + bytes(4) + bytes(4)
+    return (struct.pack(">III", payload + 128, 0x01050000, payload) + struct.pack(">IIII", 1, 0, 128, payload - (face - sum(lvl)))
+            + rsx + b"\x50" * 80 + bytes(payload))
+
+
+def tex_fields(w=8, h=8, pf=19, mips=1, cube=False, cf=1):
+    return {"Format": {"Width": w, "Height": h, "PixelFormat": f"X ({pf})", "MemoryType": "SYSTEM_MEMORY (0)"},
+            "Type": "CubeMap (2)" if cube else "2D (0)", "NumSurfaces": mips, "CreationFlags": f"static ({cf})"}
+
+
+def payload_tests():
+    """RTTIBin<1.58> payload checks, synthetic bytes. Layouts: format notes of Killzone2_Blender by Tzeentchnet (MIT)."""
+    ok = True
+    # Texture: 2D DXT1 with a mip chain, a cubemap, and the failure modes
+    for label, kw in (("2D DXT1 8x8, 4 mips", dict(mips=4)), ("cubemap DXT1 16x16, 5 mips", dict(w=16, h=16, mips=5, cube=True)),
+                      ("2D RGBA8 4x4", dict(w=4, h=4, pf=5))):
+        info = core.check_texture(tex_blob(**kw), tex_fields(**kw))
+        ok &= check(f"Texture {label}: layout accepted, payload {info['payload']}", info["payload"] % 128 == 0 and info["faces"] == (6 if kw.get("cube") else 1))
+    good = tex_blob(mips=4)
+    ok &= expect_error("Texture with a wrong constant word rejected", core.check_texture, good[:4] + bytes(4) + good[8:], tex_fields(mips=4))
+    ok &= expect_error("Texture with a short payload rejected", core.check_texture, good[:-1], tex_fields(mips=4))
+    ok &= expect_error("Texture whose descriptor width differs rejected", core.check_texture, good, tex_fields(w=16, mips=4))
+    ok &= expect_error("Texture whose fill bytes differ rejected", core.check_texture, good[:60] + b"\x00" + good[61:], tex_fields(mips=4))
+    # VertexArrayResource: 2 streams, 3 vertices, second stream aligned
+    def vtx(start):
+        pad = (-start) % 4
+        b = bytes(pad) + struct.pack(">iii", 3, 3, 2)
+        b += struct.pack(">iii", 33, 6, 1) + struct.pack(">IBBBB", 0, 0, 1, 3, 0)          # stream 0: position 3 x s16 norm, stride 6
+        b += struct.pack(">iii", 33, 5, 1) + struct.pack(">IBBBB", 7, 0, 4, 4, 0)          # stream 1 declares 4 x u8, stride 5
+        for stride in (6, 5):
+            b += bytes((-(start + len(b))) % 4) + bytes(3 * stride)
+        return b
+    for start in (0, 1, 2, 3):
+        b = vtx(start)
+        info = core.check_vertex_array(b, start)
+        ok &= check(f"VertexArray at file offset %4 = {start}: 3 vertices, 2 streams", info["vertices"] == 3 and len(info["streams"]) == 2)
+    ok &= expect_error("VertexArray with a stray byte rejected", core.check_vertex_array, vtx(0) + b"\x00", 0)
+    ok &= expect_error("VertexArray with a truncated stream rejected", core.check_vertex_array, vtx(0)[:-1], 0)
+    # IndexArrayResource: 3 indices => 2 bytes of padding to 4; 6 indices => none
+    for n in (3, 6):
+        b = struct.pack(">i", n) + struct.pack(">II", 1, 2) + struct.pack(f">{n}H", *range(n)) + bytes(2 * (n % 2))
+        ok &= check(f"IndexArray with {n} indices accepted", core.check_index_array(b, 0)["indices"] == n)
+    ok &= expect_error("IndexArray with non-zero padding rejected", core.check_index_array,
+                       struct.pack(">i", 3) + struct.pack(">II", 1, 2) + struct.pack(">3H", 0, 1, 2) + b"\x00\x01", 0)
+    # ShaderResource
+    sh = b"\x00" * 8 + b"SHO\x08" + bytes(20)
+    ok &= check("ShaderResource size + SHO object accepted", core.check_shader(struct.pack(">I", len(sh)) + sh)["size"] == len(sh))
+    ok &= expect_error("ShaderResource with a wrong size rejected", core.check_shader, struct.pack(">I", len(sh) + 4) + sh)
+    # ES00: 2 joints, pose at +0x14, parents at +0x18
+    es = bytearray(0x2C + 2 * 48 + 4)
+    es[:4] = b"ES00"
+    struct.pack_into(">I", es, 8, len(es))
+    struct.pack_into(">H", es, 12, 2)
+    struct.pack_into(">I", es, 0x14, 0x2C - 0x14)                 # pose
+    struct.pack_into(">I", es, 0x18, 0x2C + 96 - 0x18)            # parents
+    for j in range(2):
+        struct.pack_into(">4f", es, 0x2C + 48 * j, 0, 0, 0, 1)
+    struct.pack_into(">2H", es, 0x2C + 96, 0xFFFF, 0)
+    ok &= check("ES00 two joints, parent before child", core.check_es00(bytes(es))["parents"] == (0xFFFF, 0))
+    bad = bytearray(es); struct.pack_into(">2H", bad, 0x2C + 96, 1, 0xFFFF)
+    ok &= expect_error("ES00 parent after child rejected", core.check_es00, bytes(bad))
+    ok &= expect_error("ES00 with a wrong total size rejected", core.check_es00, bytes(es) + b"\x00")
+    ok &= check("empty EdgeAnimSkeleton is accepted as none", core.check_es00(b"") is None)
+    # EA02: 5 frames over 2 s (frequency 2), two frame sets (base 0 and the sentinel at frame 4)
+    ea = bytearray(0x54 + 8)
+    ea[:4] = b"EA02"
+    struct.pack_into(">ff", ea, 4, 2.0, 2.0)
+    struct.pack_into(">HHHH", ea, 12, 0x60, 3, 5, 2)
+    struct.pack_into(">I", ea, 0x38, 0x54 - 0x38)
+    struct.pack_into(">HHHH", ea, 0x54, 0, 3, 4, 0)
+    ok &= check("EA02 header accepted", core.check_ea02(bytes(ea), 2.0)["framesets"] == 2)
+    ok &= expect_error("EA02 with a different Duration field rejected", core.check_ea02, bytes(ea), 3.0)
+    badf = bytearray(ea); struct.pack_into(">f", badf, 8, 5.0)
+    ok &= expect_error("EA02 with a wrong sample frequency rejected", core.check_ea02, bytes(badf), 2.0)
+    bads = bytearray(ea); struct.pack_into(">H", bads, 0x58, 3)
+    ok &= expect_error("EA02 without the sentinel frame set rejected", core.check_ea02, bytes(bads), 2.0)
+    # object ids: reversed 4-byte groups, self-inverse
+    h = "00112233445566778899aabbccddeeff"
+    ok &= check("object id display = 4-byte groups reversed", core.object_id_display(h) == "33221100" "77665544" "bbaa9988" "ffeeddcc")
+    ok &= check("object id display is its own inverse", core.object_id_display(core.object_id_display(h)) == h)
+    return ok
+
+
 def main():
     s = schema()
     ok = True
@@ -81,6 +179,7 @@ def main():
           + b"\x00\x00\x00\x00")           # upvalue names
     chunk = hdr + fn
     ok &= check("Lua 5.1 chunk length", core.lua51_chunk_len(b"xx" + chunk + b"yy", 2) == len(chunk))
+    ok &= payload_tests()
     # 1.73 header still uses the count m and 20-byte entries
     c = core.Core(build(magic=b"RTTIBin<1.73>"), s)
     ok &= check("1.73 header path unchanged", not c.v158 and c.nhash == 0 and len(c.hashes) == 1)
