@@ -32,6 +32,22 @@ EOF
   exit 1
 fi
 
+# Python for the sync step below (issue #9): python3, else python, else the Windows launcher `py -3`. Each candidate has
+# to run a Python 3.6+ (the step uses f-strings): on Windows `python3` is often the Microsoft Store alias, which prints a
+# message and exits 49, and `python` may be missing or a Python 2. Chosen before anything is copied.
+PYTHON=()
+for c in "python3" "python" "py -3"; do
+  read -r -a cand <<<"$c"
+  if command -v "${cand[0]}" >/dev/null 2>&1 &&
+     "${cand[@]}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' >/dev/null 2>&1; then
+    PYTHON=("${cand[@]}"); break
+  fi
+done
+if (( ${#PYTHON[@]} == 0 )); then
+  echo "ps3recomp-patched: no Python 3.6 or newer found (tried python3, python, py -3); install Python 3 and run again" >&2
+  exit 1
+fi
+
 # Build the patched tree in a scratch copy, then sync it into $PT replacing only files whose content changed, so
 # unchanged files keep their mtimes and the build recompiles only what the patch set really changed
 # (re-creating the whole tree forced a ~20 min full rebuild after every regeneration). A reverted or removed patch
@@ -50,7 +66,7 @@ for p in port/patches/*.patch; do
   echo "applied $p"
 done
 mkdir -p "$PT"
-python3 - "$NEW" "$PT" <<'PY'
+"${PYTHON[@]}" - "$NEW" "$PT" <<'PY'
 import filecmp, os, shutil, sys
 new, pt = sys.argv[1:]
 changed = removed = 0

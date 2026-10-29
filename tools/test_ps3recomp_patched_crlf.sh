@@ -42,9 +42,10 @@ check "$([[ "$out" != *applied* && ! -e "$R/work/ps3recomp-patched.new" ]] && ec
 # 2. The fix the message names (core.autocrlf false + re-checkout) gives LF again, and the patch applies.
 g config core.autocrlf false; renorm
 check "$(! has_cr "$S/a.txt" && echo 1)" "the message's commands restore LF line endings"
-if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys' >/dev/null 2>&1; then
-  # Windows without a python3 command (the Microsoft Store alias does not run): the script's sync step needs one.
-  echo "SKIP (part 2): no working python3 command here, which the script's sync step runs"
+py36='import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)'   # the script's own check
+if ! { python3 -c "$py36" || python -c "$py36" || py -3 -c "$py36"; } >/dev/null 2>&1; then
+  # No Python 3.6+ under any of the names the script tries (python3, python, py -3): its sync step needs one.
+  echo "SKIP (part 2): no Python 3.6 or newer here (tried python3, python, py -3), which the script's sync step runs"
 else
   set +e; out="$(bash "$R/tools/ps3recomp-patched.sh" 2>"$T/err")"; rc=$?; set -e
   check "$([[ $rc -eq 0 ]] && grep -q 'applied port/patches/0001-a.patch' <<<"$out" && echo 1)" \
