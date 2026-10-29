@@ -185,6 +185,24 @@ under Proton on Linux.
 
 If you try either route, open an issue with your Windows version, GPU and driver, how far it got, and the log.
 
+**Cloning on Windows: turn off git's line-ending conversion.** Git for Windows installs with `core.autocrlf=true`, which
+checks LF files out with CRLF line endings. The patches in `port/patches/` then stop applying part-way through the
+series (patch 1041 was the first in one test on Windows 11 with Git for Windows 2.46, issue #9). Clone without it, and
+turn it off in the submodule too:
+
+```sh
+git -c core.autocrlf=false clone --recurse-submodules https://github.com/undecuple/project-pyrrhus.git
+cd project-pyrrhus
+git config core.autocrlf false
+git -C third_party/ps3recomp config core.autocrlf false
+```
+
+An existing clone can be fixed the same way. After the two `config` lines, write the submodule's files out again with
+`git -C third_party/ps3recomp rm -r -q --cached .` and then `git -C third_party/ps3recomp reset -q --hard`. A plain
+checkout skips files that git considers unchanged, and the reset discards any edits in the submodule.
+`tools/ps3recomp-patched.sh` checks this before it copies anything and stops with these commands when it finds CRLF files
+in the submodule.
+
 ## Tests without the game
 
 ```sh

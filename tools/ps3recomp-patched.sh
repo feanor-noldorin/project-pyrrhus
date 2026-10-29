@@ -12,6 +12,26 @@ cd "$ROOT"
 SUB=third_party/ps3recomp
 PT="${KZ2_PATCHED_DIR:-${KZ2_OUT:-work}/ps3recomp-patched}"   # override for tests only
 
+# Line endings (issue #9): with Git for Windows' default core.autocrlf=true the submodule's files are stored with LF but
+# checked out with CRLF, and the patches' LF context then stops applying part-way through the series (patch 1041 was the
+# first). The submodule's own .gitattributes come from upstream, so the check is here: count the files whose index copy is
+# LF and whose working copy is CRLF, and stop before copying anything. Reads the index only (works with a read-only .git);
+# no git or no index: no check.
+crlf="$(git -C "$SUB" ls-files --eol 2>/dev/null | awk '$1 == "i/lf" && $2 == "w/crlf" { n++ } END { print n + 0 }')"
+if (( crlf > 0 )); then
+  cat >&2 <<EOF
+ps3recomp-patched: $crlf file(s) in $SUB are checked out with Windows (CRLF) line endings but stored with LF,
+so the patches would not apply. This is git's core.autocrlf (on by default in Git for Windows). Turn it off for
+this repository and the submodule, then write the submodule's files out again (this discards any edits in it;
+a plain checkout skips files git considers unchanged):
+  git config core.autocrlf false
+  git -C $SUB config core.autocrlf false
+  git -C $SUB rm -r -q --cached . && git -C $SUB reset -q --hard
+For a new clone: git -c core.autocrlf=false clone --recurse-submodules <url>, then the second line above.
+EOF
+  exit 1
+fi
+
 # Build the patched tree in a scratch copy, then sync it into $PT replacing only files whose content changed, so
 # unchanged files keep their mtimes and the build recompiles only what the patch set really changed
 # (re-creating the whole tree forced a ~20 min full rebuild after every regeneration). A reverted or removed patch

@@ -13,6 +13,7 @@ port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-
 ### Fixed
 - The first-run log no longer keeps the Windows user name when a path is written in its escaped form, with doubled backslashes (an error message, or a list or JSON of paths). Reported by @feanor-noldorin (#9).
 - `bump_version.py` keeps each file's line endings instead of writing Windows line endings when run on Windows. Reported by @feanor-noldorin (#9).
+- `tools/ps3recomp-patched.sh` stops before copying anything when git has checked the ps3recomp submodule out with Windows line endings (`core.autocrlf`, on by default in Git for Windows), and names the commands that fix it. Before, the patch series failed part-way through with a "patch does not apply" error. BUILDING.md has a note on cloning on Windows (#9).
 
 ## [0.1.2] - 2026-10-28 (pre-release)
 
