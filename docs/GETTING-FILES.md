@@ -4,7 +4,9 @@ The setup needs three things from your own copy of Killzone 2: the disc dump, th
 1.29 EBOOT. This page says what each one must look like and what the setup tells you when something is off. It does
 not say how to make the files, and nothing here is shipped or downloaded by this project. If you play the game in the
 PS3 emulator RPCS3, the setup can find all three in your RPCS3 install ("Use my RPCS3 install"); for installing the
-update and adding the game there, see RPCS3's documentation.
+update and adding the game there, see RPCS3's documentation. With the RPCS3 folder left empty, the setup looks in
+`%LOCALAPPDATA%\Programs\rpcs3`, `%APPDATA%\rpcs3`, and a folder named `RPCS3` in Documents, on the Desktop, in
+Downloads or at the root of a local drive (`C:\RPCS3`); anywhere else, pick the folder with `rpcs3.exe` yourself.
 
 ## The three inputs
 

@@ -89,6 +89,9 @@ def main():
     tmp = os.path.realpath(tmp0)
     home = Path(tmp) / "home"
     patches = [mock.patch.object(L.Path, "home", return_value=home),
+               # never the real Documents/Desktop/Downloads or drive roots of the machine running the test
+               mock.patch.object(L, "_user_folders", return_value=[], create=True),
+               mock.patch.object(L, "_fixed_drives", return_value=[], create=True),
                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "", "WINEHOMEDIR": "", "USERPROFILE": str(home)})]
     for p in patches:
         p.start()
@@ -101,6 +104,41 @@ def main():
         homerpcs, _ = tree(tmp, name="home/.config/rpcs3")
         c = ri.detect()
         check(c and c[0]["source"] == "linux-config" and c[0]["root"] == str(homerpcs), f"detect known place {c[:1]}")
+
+        # --- Windows: a portable RPCS3 in Documents/Desktop/Downloads or at a drive root (Windows faked on any host)
+        win = Path(tmp) / "win"
+        docs, dl, drive = win / "Docs", win / "Downloads", win / "D"
+        for d in (docs, dl, drive):
+            d.mkdir(parents=True)
+        wpatches = [mock.patch.object(L, "_is_windows", return_value=True),
+                    mock.patch.object(L, "_user_folders", return_value=[(str(docs), "windows-documents"),
+                                                                        (str(dl), "windows-downloads")], create=True),
+                    mock.patch.object(L, "_fixed_drives", return_value=[str(drive)], create=True),
+                    mock.patch.dict(os.environ, {"LOCALAPPDATA": str(win / "Local"), "APPDATA": str(win / "Roaming")})]
+        for p in wpatches:
+            p.start()
+        try:
+            check(ri.detect() == [], "windows: nothing in the known places gives nothing")
+            (dl / "RPCS3" / "screenshots").mkdir(parents=True)  # a folder named RPCS3 that is not RPCS3
+            check(ri.detect() == [], "windows: an RPCS3 folder without rpcs3.exe/vfs.yml/games.yml is skipped")
+            droot, _ = tree(str(drive), name="RPCS3")
+            c = ri.detect()
+            check([(x["source"], x["root"]) for x in c] == [("windows-drive-root", str(droot))],
+                  f"windows: portable RPCS3 at a drive root {c}")
+            droot2, _ = tree(str(docs), name="RPCS3")
+            c = ri.detect()
+            check([x["source"] for x in c] == ["windows-documents", "windows-drive-root"] and c[0]["root"] == str(droot2),
+                  f"windows: Documents before the drive root {c}")
+            lroot, _ = tree(str(win / "Local"), name="Programs/rpcs3")
+            c = ri.detect()
+            check(c and c[0]["source"] == "windows-localappdata" and c[0]["root"] == str(lroot),
+                  f"windows: the installer's place stays first {c[:1]}")
+            r = ri.resolve(str(droot), allow_outside=True)
+            check(r["ok"] and r["eboot"] == str(droot / "dev_hdd0/game" / T / "USRDIR/EBOOT.elf"),
+                  f"windows: the drive-root RPCS3 resolves ({r['status']})")
+        finally:
+            for p in reversed(wpatches):
+                p.stop()
 
         # --- a disc outside the chosen folder: asked first, nothing there opened before the yes
         opened = []

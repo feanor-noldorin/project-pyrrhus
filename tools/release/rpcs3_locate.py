@@ -144,6 +144,57 @@ def _wine_home():
     return v
 
 
+# The official Windows build is a portable zip, unpacked wherever the player likes. Beside the two installer places,
+# an "RPCS3" folder is looked for in Documents, Desktop and Downloads and at the root of each fixed drive. Only those
+# exact folders are checked (no listing or walking), and only one with rpcs3.exe, vfs.yml or games.yml is kept.
+_USER_FOLDERS = (("Personal", "Documents", "windows-documents"),
+                 ("Desktop", "Desktop", "windows-desktop"),
+                 ("{374DE290-123F-4565-9164-39C4925E467B}", "Downloads", "windows-downloads"))
+_MUST_LOOK_LIKE_RPCS3 = {"windows-documents", "windows-desktop", "windows-downloads", "windows-drive-root"}
+
+
+def _user_folders() -> list[tuple[str, str]]:
+    """(folder, source) for Documents, Desktop and Downloads where Windows has them (moved to OneDrive or another
+    drive, or a localised name), else under USERPROFILE."""
+    key = None
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")
+    except (ImportError, OSError):
+        pass
+    out, prof = [], os.environ.get("USERPROFILE")
+    try:
+        for value, default, src in _USER_FOLDERS:
+            p = None
+            if key is not None:
+                try:
+                    p = os.path.expandvars(winreg.QueryValueEx(key, value)[0])
+                except OSError:
+                    p = None
+            if not p and prof:
+                p = os.path.join(prof, default)
+            if p:
+                out.append((p, src))
+    finally:
+        if key is not None:
+            key.Close()
+    return out
+
+
+def _fixed_drives() -> list[str]:
+    """Roots of the fixed local drives (C:\\, D:\\, ...). Network, removable and optical drives are left out, so
+    nothing slow or asleep is touched."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        mask = k32.GetLogicalDrives()
+    except (ImportError, AttributeError, OSError):
+        return []
+    roots = [f"{chr(65 + i)}:\\" for i in range(26) if mask >> i & 1]
+    return [r for r in roots if k32.GetDriveTypeW(r) == 3]  # DRIVE_FIXED
+
+
 def _candidate_paths(hint):
     c = []
     if hint:
@@ -157,6 +208,8 @@ def _candidate_paths(hint):
             base = os.environ.get(var)
             if base:
                 c.append((Path(base).joinpath(*sub), src))
+        for base, src in _user_folders() + [(d, "windows-drive-root") for d in _fixed_drives()]:
+            c.append((Path(base) / "RPCS3", src))
     home = Path.home()
     if not _is_windows():
         xdg = os.environ.get("XDG_CONFIG_HOME")
@@ -209,7 +262,7 @@ def find_rpcs3(hint=None) -> list[dict]:
         except OSError:
             ok = False
         key = os.path.normcase(str(path))
-        if not ok or key in seen:
+        if not ok or key in seen or source in _MUST_LOOK_LIKE_RPCS3 and not is_rpcs3(path):
             continue
         seen.add(key)
         if source == "hint" and not is_rpcs3(path):

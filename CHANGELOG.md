@@ -9,6 +9,7 @@ port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-
 ### Changed
 - A frame waiting on a graphics job from the game's SPU code is resumed as soon as the job writes its result, instead of after a fixed 4 ms sleep. In our tests the time from a button press to the frame being handed to Windows went down by 4 to 5 ms (median), to about 59 ms; the screen's own delay comes on top and was not measured.
 - The release notes on GitHub list each change as its own bullet, with the fixes in a list of their own, instead of one long paragraph.
+- "Use my RPCS3 install" also finds a portable RPCS3 (the official Windows download is a zip) in a folder named `RPCS3` in Documents, on the Desktop, in Downloads or at the root of a local drive, such as `C:\RPCS3`. Only those folders are looked at, and only one with `rpcs3.exe`, `vfs.yml` or `games.yml` is offered. Picking the folder by hand works as before (#9).
 
 ### Fixed
 - The first-run log no longer keeps the Windows user name when a path is written in its escaped form, with doubled backslashes (an error message, or a list or JSON of paths). Reported by @feanor-noldorin (#9).
