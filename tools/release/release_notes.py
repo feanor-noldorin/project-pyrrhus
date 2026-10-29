@@ -7,7 +7,8 @@
 The shape follows Project Helghast's release notes (the Killzone 3 PC port, same author, MIT), with this project's
 wording:
   Project Pyrrhus X.Y.Z, a pre-release: partly playable, see docs/RELEASE-CRITERIA.md.
-  New in X.Y.Z: <the CHANGELOG entry's items as prose; "Fixed:" before the fixes>
+  New in X.Y.Z: <the CHANGELOG entry's new items, one bullet each>
+  Fixed: <its fixes, one bullet each; part of the list above for the first published release>
   If you have an earlier version, install this one over it: ...   (only when an earlier version was published)
   See CHANGELOG.md for the full list.
   <the fixed paragraph: the Windows installer and portable zip, what you need, none of it included>
@@ -82,16 +83,19 @@ def notes(version, entry, first=False):
     fixed = [sentence(t, blob) for s, t in entry["items"] if s == "Fixed"]
     major = int(version.split(".")[0])
     kind = "a pre-release" if major == 0 else "a release"
-    prose = " ".join(new)
-    if fixed:
-        # The first published release lists its fixes as part of what it does, not as fixes of an unpublished version.
-        prose += (" " if prose else "") + ("" if first else "Fixed: ") + " ".join(fixed)
+    # One bullet per item: 0.1.2's dozen items ran into one 6 KB paragraph as prose. The first published release lists
+    # its fixes as part of what it does, not as fixes of an unpublished version.
+    bullets = lambda items: "\n".join(f"- {t}" for t in items)
+    if first:
+        lists = [f"New in {version}:\n{bullets(new + fixed)}"]
+    else:
+        lists = ([f"New in {version}:\n{bullets(new)}"] if new else []) + ([f"Fixed:\n{bullets(fixed)}"] if fixed else [])
     over = [] if first else [
         "If you have an earlier version, install this one over it: run the new setup and pick the same folder. The first "
         "start then translates and builds the game again where this version changes how it is built."]
     return "\n\n".join([
         f"Project Pyrrhus {version}, {kind}: {STATUS}, see [docs/RELEASE-CRITERIA.md]({blob}/docs/RELEASE-CRITERIA.md).",
-        f"New in {version}: {prose}",
+        *lists,
         *over,
         f"See [CHANGELOG.md]({blob}/CHANGELOG.md) for the full list.",
         "Windows installer (Project-Pyrrhus-setup.exe, recommended) and portable zip. You need your own Killzone 2 disc "

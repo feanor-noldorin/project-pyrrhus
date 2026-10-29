@@ -86,26 +86,26 @@ def main():
             rc, out, err = run("--tag", "v0.1.1", "--root", str(first))
             fp = out.strip().split("\n\n")
             check(rc == 0 and len(fp) == 4 and "earlier version" not in out and "Fixed:" not in out
-                  and fp[1] == "New in 0.1.1: A new thing. A fixed thing.",
+                  and fp[1] == "New in 0.1.1:\n- A new thing.\n- A fixed thing.",
                   f"{layout}: the first published release has no install-over line and no Fixed label", (rc, err, fp))
             rc, out, err = run("--tag", "v0.2.0", "--root", t)
             paras = out.strip().split("\n\n")
-            check(rc == 0 and len(paras) == 5, f"{layout}: v0.2.0 gives five paragraphs", (rc, err, paras))
-            if len(paras) == 5:
+            check(rc == 0 and len(paras) == 6, f"{layout}: v0.2.0 gives six paragraphs", (rc, err, paras))
+            if len(paras) == 6:
                 check(paras[0] == "Project Pyrrhus 0.2.0, a pre-release: partly playable, see [docs/RELEASE-CRITERIA.md]"
                       "(https://github.com/undecuple/project-pyrrhus/blob/v0.2.0/docs/RELEASE-CRITERIA.md).",
                       f"{layout}: first line", paras[0])
-                check(paras[1] == "New in 0.2.0: A new thing, with a [link](https://github.com/undecuple/project-pyrrhus/blob/v0.2.0/docs/A.md). A long item that wraps onto a "
-                      "second line. A changed thing. Fixed: A fixed thing.", f"{layout}: the entry in prose, fixes last",
-                      paras[1])
-                check(paras[2].startswith("If you have an earlier version, install this one over it: "),
-                      f"{layout}: the upgrade line", paras[2])
-                check(paras[3] == "See [CHANGELOG.md](https://github.com/undecuple/project-pyrrhus/blob/v0.2.0/"
-                      "CHANGELOG.md) for the full list.", f"{layout}: the CHANGELOG pointer", paras[3])
+                check(paras[1] == "New in 0.2.0:\n- A new thing, with a [link](https://github.com/undecuple/project-pyrrhus/blob/v0.2.0/docs/A.md).\n- A long item that wraps onto a "
+                      "second line.\n- A changed thing.", f"{layout}: one bullet per new item", paras[1])
+                check(paras[2] == "Fixed:\n- A fixed thing.", f"{layout}: the fixes as their own list, last", paras[2])
+                check(paras[3].startswith("If you have an earlier version, install this one over it: "),
+                      f"{layout}: the upgrade line", paras[3])
+                check(paras[4] == "See [CHANGELOG.md](https://github.com/undecuple/project-pyrrhus/blob/v0.2.0/"
+                      "CHANGELOG.md) for the full list.", f"{layout}: the CHANGELOG pointer", paras[4])
                 for want in ("Windows installer", "portable zip", "BCUS98116", "1.29 update",
                              "decrypted EBOOT made from your own copy", "none of them is included or downloaded",
                              "SHA256SUMS", "what goes online", "blob/v0.2.0/docs/GETTING-FILES.md"):
-                    check(want in paras[4], f"{layout}: the fixed paragraph says {want}", paras[4])
+                    check(want in paras[5], f"{layout}: the fixed paragraph says {want}", paras[5])
             check(not re.search(r"\b(PM|lanes?|rounds?|D\d\d)\b", out), f"{layout}: public wording only", out)
             out_file = root / "o" / "notes.md"
             rc, _, _ = run("--tag", "v0.2.0", "--root", t, "--out", str(out_file))
@@ -117,7 +117,7 @@ def main():
             for bad in ("0.2.0", "v0.2", "v0.2.0-rc1", "latest"):
                 check(run("--tag", bad, "--root", t)[0] == 2, f"{layout}: tag {bad!r} is a usage error")
             rc, out, _ = run("--preview", "0.3.0", "--root", t)
-            check(rc == 0 and "New in 0.3.0: Next thing." in out, f"{layout}: --preview uses [Unreleased]", out)
+            check(rc == 0 and "New in 0.3.0:\n- Next thing." in out, f"{layout}: --preview uses [Unreleased]", out)
             rc, out, _ = run("--preview", "0.1.1", "--root", t)
             check(rc == 0 and "Next thing." in out, f"{layout}: --preview of an empty entry uses [Unreleased]", out)
             rc, out, _ = run("--preview", "0.2.0", "--root", t)

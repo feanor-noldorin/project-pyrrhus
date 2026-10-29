@@ -4,6 +4,11 @@ All notable changes for players, newest first, in the style of [Keep a Changelog
 port is a pre-release (partly playable): see [RELEASE-CRITERIA.md](docs/RELEASE-CRITERIA.md). Versions follow
 `vMAJOR.MINOR.PATCH`; every release stays a pre-release until `v1.0.0`.
 
+## [Unreleased]
+
+### Changed
+- The release notes on GitHub list each change as its own bullet, with the fixes in a list of their own, instead of one long paragraph.
+
 ## [0.1.2] - 2026-10-28 (pre-release)
 
 ### Added
